@@ -213,6 +213,11 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
+        match executor {
+            Executor::SingleThread => eprintln!("SingleThread"),
+            Executor::ThreadPool(pool) => eprintln!("ThreadPool"),
+        };
+
         let segment_ref = SegmentRef::new(segment);
         let termdict_composite_fut = executor.spawn(move || {
             let termdict_file = segment_ref.open_read(SegmentComponent::Terms)?;
