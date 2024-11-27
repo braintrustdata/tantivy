@@ -219,27 +219,45 @@ impl SegmentReader {
             Ok(CompositeFile::open(&termdict_file)?)
         })?;
 
-        let store_file = segment.open_read(SegmentComponent::Store)?;
+        let segment_ref = SegmentRef::new(segment);
+        let store_file_fut =
+            executor.spawn(move || Ok(segment_ref.open_read(SegmentComponent::Store)?))?;
 
         crate::fail_point!("SegmentReader::open#middle");
 
-        let postings_file = segment.open_read(SegmentComponent::Postings)?;
-        let postings_composite = CompositeFile::open(&postings_file)?;
+        let segment_ref = SegmentRef::new(segment);
+        let postings_composite_fut = executor.spawn(move || {
+            let postings_file = segment_ref.open_read(SegmentComponent::Postings)?;
+            Ok(CompositeFile::open(&postings_file)?)
+        })?;
 
-        let positions_composite = {
-            if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
-                CompositeFile::open(&positions_file)?
+        let segment_ref = SegmentRef::new(segment);
+        let positions_composite_fut = executor.spawn(move || {
+            if let Ok(positions_file) = segment_ref.open_read(SegmentComponent::Positions) {
+                Ok(CompositeFile::open(&positions_file)?)
             } else {
-                CompositeFile::empty()
+                Ok(CompositeFile::empty())
             }
-        };
+        })?;
 
         let schema = segment.schema();
 
-        let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
-        let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
-        let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
-        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        let fast_fields_readers_fut = executor.spawn({
+            let segment_ref = SegmentRef::new(segment);
+            let schema = schema.clone();
+            move || {
+                let fast_fields_data = segment_ref.open_read(SegmentComponent::FastFields)?;
+                Ok(FastFieldReaders::open(fast_fields_data, schema.clone())?)
+            }
+        })?;
+
+        let fieldnorm_readers_fut = executor.spawn({
+            let segment_ref = SegmentRef::new(segment);
+            move || {
+                let fieldnorm_data = segment_ref.open_read(SegmentComponent::FieldNorms)?;
+                Ok(FieldNormReaders::open(fieldnorm_data)?)
+            }
+        })?;
 
         let original_bitset = if segment.meta().has_deletes() {
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
@@ -262,14 +280,14 @@ impl SegmentReader {
             num_docs,
             max_doc,
             termdict_composite: termdict_composite_fut()?,
-            postings_composite,
-            fast_fields_readers,
-            fieldnorm_readers,
+            postings_composite: postings_composite_fut()?,
+            fast_fields_readers: fast_fields_readers_fut()?,
+            fieldnorm_readers: fieldnorm_readers_fut()?,
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
-            store_file,
+            store_file: store_file_fut()?,
             alive_bitset_opt,
-            positions_composite,
+            positions_composite: positions_composite_fut()?,
             schema,
         })
     }
