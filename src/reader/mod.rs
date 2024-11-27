@@ -222,10 +222,7 @@ impl InnerIndexReader {
         searcher_generation_counter: &Arc<AtomicU64>,
         searcher_generation_inventory: &Inventory<SearcherGeneration>,
     ) -> crate::Result<Arc<SearcherInner>> {
-        let start = std::time::Instant::now();
         let segment_readers = Self::open_segment_readers(index)?;
-        eprintln!("opened segment readers: {:?}", start.elapsed());
-
         let searcher_generation = Self::track_segment_readers_in_inventory(
             &segment_readers,
             searcher_generation_counter,

@@ -207,7 +207,7 @@ impl SegmentReader {
         })
     }
 
-    /// Open a new segment for reading and parallelize the file opening
+    /// Open a new segment for reading and parallelize the file opening.
     pub fn open_with_custom_alive_set_parallel(
         executor: &Executor,
         segment: &Segment,
@@ -607,6 +607,8 @@ impl fmt::Debug for SegmentReader {
     }
 }
 
+// This is a cheap trick to reference the segment in the `open_with_custom_alive_set_parallel`
+// function without having to copy the segment
 struct SegmentRef {
     segment: &'static Segment,
 }
