@@ -196,10 +196,10 @@ impl InnerIndexReader {
         // Prevents segment files from getting deleted while we are in the process of opening them
         let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
         let searchable_segments = index.searchable_segments()?;
-        let segment_readers = searchable_segments
-            .iter()
-            .map(SegmentReader::open)
-            .collect::<crate::Result<_>>()?;
+        let segment_readers = index.search_executor().map(
+            |segment| SegmentReader::open(segment),
+            searchable_segments.iter(),
+        )?;
         Ok(segment_readers)
     }
 

@@ -528,7 +528,6 @@ impl Index {
 
     /// Open the index using the provided directory
     pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
-        eprintln!("open index");
         let directory = directory.into();
         let directory = ManagedDirectory::wrap(directory)?;
         let inventory = SegmentMetaInventory::default();
