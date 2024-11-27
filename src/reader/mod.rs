@@ -196,8 +196,9 @@ impl InnerIndexReader {
         // Prevents segment files from getting deleted while we are in the process of opening them
         let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
         let searchable_segments = index.searchable_segments()?;
-        let segment_readers = index.search_executor().map(
-            |segment| SegmentReader::open(segment),
+        let executor = index.search_executor();
+        let segment_readers = executor.map(
+            |segment| SegmentReader::open_with_custom_alive_set_parallel(executor, segment, None),
             searchable_segments.iter(),
         )?;
         Ok(segment_readers)
@@ -223,7 +224,7 @@ impl InnerIndexReader {
     ) -> crate::Result<Arc<SearcherInner>> {
         let start = std::time::Instant::now();
         let segment_readers = Self::open_segment_readers(index)?;
-        eprintln!("open_segment_readers: {:?}", start.elapsed());
+        eprintln!("opened segment readers: {:?}", start.elapsed());
 
         let searcher_generation = Self::track_segment_readers_in_inventory(
             &segment_readers,

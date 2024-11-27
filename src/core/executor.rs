@@ -91,6 +91,49 @@ impl Executor {
             }
         }
     }
+
+    /// Spawn a task in the thread pool
+    pub fn spawn<OP, R>(&self, op: OP) -> crate::Result<impl Fn() -> crate::Result<R>>
+    where
+        R: Send + 'static,
+        OP: FnOnce() -> crate::Result<R> + Send + 'static,
+    {
+        let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
+        match self {
+            Executor::SingleThread => {
+                let res = op();
+                fruit_sender.send(res).map_err(|_| {
+                    TantivyError::InternalError(
+                        "Failed to send search task. It probably means all search \
+                     threads have panicked."
+                            .to_string(),
+                    )
+                })?;
+            }
+            Executor::ThreadPool(pool) => {
+                pool.spawn(move || {
+                    let res = op();
+                    match fruit_sender.send(res) {
+                        Ok(_) => (),
+                        Err(_) => error!(
+                            "Failed to send search task. It probably means all search \
+                     threads have panicked."
+                        ),
+                    }
+                });
+            }
+        };
+
+        Ok(move || {
+            fruit_receiver.recv().map_err(|_| {
+                TantivyError::InternalError(
+                    "Failed to send search task. It probably means all search \
+                     threads have panicked."
+                        .to_string(),
+                )
+            })?
+        })
+    }
 }
 
 #[cfg(test)]

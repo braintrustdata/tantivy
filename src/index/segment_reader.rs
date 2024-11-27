@@ -16,7 +16,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::{DocId, Opstamp};
+use crate::{DocId, Executor, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
 ///
@@ -195,6 +195,73 @@ impl SegmentReader {
             num_docs,
             max_doc,
             termdict_composite,
+            postings_composite,
+            fast_fields_readers,
+            fieldnorm_readers,
+            segment_id: segment.id(),
+            delete_opstamp: segment.meta().delete_opstamp(),
+            store_file,
+            alive_bitset_opt,
+            positions_composite,
+            schema,
+        })
+    }
+
+    /// Open a new segment for reading and parallelize the file opening
+    pub fn open_with_custom_alive_set_parallel(
+        executor: &Executor,
+        segment: &Segment,
+        custom_bitset: Option<AliveBitSet>,
+    ) -> crate::Result<SegmentReader> {
+        let segment_ref = SegmentRef::new(segment);
+        let termdict_composite_fut = executor.spawn(move || {
+            let termdict_file = segment_ref.open_read(SegmentComponent::Terms)?;
+            Ok(CompositeFile::open(&termdict_file)?)
+        })?;
+
+        let store_file = segment.open_read(SegmentComponent::Store)?;
+
+        crate::fail_point!("SegmentReader::open#middle");
+
+        let postings_file = segment.open_read(SegmentComponent::Postings)?;
+        let postings_composite = CompositeFile::open(&postings_file)?;
+
+        let positions_composite = {
+            if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
+                CompositeFile::open(&positions_file)?
+            } else {
+                CompositeFile::empty()
+            }
+        };
+
+        let schema = segment.schema();
+
+        let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
+        let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
+        let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
+        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+
+        let original_bitset = if segment.meta().has_deletes() {
+            let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
+            let alive_doc_data = alive_doc_file_slice.read_bytes()?;
+            Some(AliveBitSet::open(alive_doc_data))
+        } else {
+            None
+        };
+
+        let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
+
+        let max_doc = segment.meta().max_doc();
+        let num_docs = alive_bitset_opt
+            .as_ref()
+            .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
+            .unwrap_or(max_doc);
+
+        Ok(SegmentReader {
+            inv_idx_reader_cache: Default::default(),
+            num_docs,
+            max_doc,
+            termdict_composite: termdict_composite_fut()?,
             postings_composite,
             fast_fields_readers,
             fieldnorm_readers,
@@ -509,6 +576,26 @@ fn intersect_alive_bitset(
 impl fmt::Debug for SegmentReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SegmentReader({:?})", self.segment_id)
+    }
+}
+
+struct SegmentRef {
+    segment: &'static Segment,
+}
+
+impl SegmentRef {
+    fn new(segment: &Segment) -> Self {
+        let leaked_segment = unsafe { std::mem::transmute(segment) };
+        Self {
+            segment: leaked_segment,
+        }
+    }
+}
+
+impl std::ops::Deref for SegmentRef {
+    type Target = Segment;
+    fn deref(&self) -> &Self::Target {
+        self.segment
     }
 }
 
