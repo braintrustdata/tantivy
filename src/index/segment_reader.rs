@@ -276,13 +276,7 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        eprintln!(
-            "opened segment reader[before futures] in {:?}",
-            start.elapsed()
-        );
-        let start = std::time::Instant::now();
-
-        let res = SegmentReader {
+        Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -296,10 +290,7 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite: positions_composite_fut()?,
             schema,
-        };
-        eprintln!("opened segment reader in {:?}", start.elapsed());
-
-        Ok(res)
+        })
     }
 
     /// Returns a field reader associated with the field given in argument.
