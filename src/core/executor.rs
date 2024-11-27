@@ -96,7 +96,7 @@ impl Executor {
     pub fn spawn<OP, R>(&self, op: OP) -> crate::Result<impl Fn() -> crate::Result<R>>
     where
         R: Send + 'static,
-        OP: FnOnce() -> crate::Result<R> + Send + 'static,
+        OP: Fn() -> crate::Result<R> + Send + 'static,
     {
         let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
         match self {

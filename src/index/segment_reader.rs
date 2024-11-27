@@ -213,11 +213,7 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        match executor {
-            Executor::SingleThread => eprintln!("SingleThread"),
-            Executor::ThreadPool(pool) => eprintln!("ThreadPool"),
-        };
-
+        let start = std::time::Instant::now();
         let segment_ref = SegmentRef::new(segment);
         let termdict_composite_fut = executor.spawn(move || {
             let termdict_file = segment_ref.open_read(SegmentComponent::Terms)?;
@@ -280,7 +276,13 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        Ok(SegmentReader {
+        eprintln!(
+            "opened segment reader[before futures] in {:?}",
+            start.elapsed()
+        );
+        let start = std::time::Instant::now();
+
+        let res = SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -294,7 +296,10 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite: positions_composite_fut()?,
             schema,
-        })
+        };
+        eprintln!("opened segment reader in {:?}", start.elapsed());
+
+        Ok(res)
     }
 
     /// Returns a field reader associated with the field given in argument.
