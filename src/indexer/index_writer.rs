@@ -421,9 +421,11 @@ impl<D: Document> IndexWriter<D> {
 
         let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
+        let span = tracing::span!(tracing::Level::INFO, "index_writer_worker");
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
             .spawn(move || {
+                let _enter = span.enter();
                 loop {
                     let mut document_iterator = document_receiver_clone
                         .clone()
