@@ -334,7 +334,9 @@ impl SegmentUpdater {
         let (scheduled_result, sender) = FutureResult::create(
             "A segment_updater future did not succeed. This should never happen.",
         );
-        self.pool.spawn(|| {
+        let span = tracing::span!(tracing::Level::INFO, "segment_updater_thread");
+        self.pool.spawn(move || {
+            let _enter = span.enter();
             let task_result = task();
             let _ = sender.send(task_result);
         });
@@ -509,7 +511,10 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
+        let span = tracing::span!(tracing::Level::INFO, "merge_thread");
+
         self.merge_thread_pool.spawn(move || {
+            let _enter = span.enter();
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
