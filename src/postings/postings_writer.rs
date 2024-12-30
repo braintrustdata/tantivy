@@ -142,7 +142,7 @@ pub(crate) trait PostingsWriter: Send + Sync {
         token_stream.process(&mut |token: &Token| {
             // We skip all tokens with a len greater than u16.
             if token.text.len() > MAX_TOKEN_LEN {
-                warn!(
+                debug!(
                     "A token exceeding MAX_TOKEN_LEN ({}>{}) was dropped. Search for \
                      MAX_TOKEN_LEN in the documentation for more information.",
                     token.text.len(),
