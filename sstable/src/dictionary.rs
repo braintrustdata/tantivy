@@ -89,7 +89,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(TSSTable::delta_reader(data))
     }
 
-    pub(crate) fn sstable_delta_reader_block(
+    pub fn sstable_delta_reader_block(
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
@@ -397,10 +397,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
-    pub fn search<'a, A: Automaton + 'a>(
-        &'a self,
-        automaton: A,
-    ) -> StreamerBuilder<'a, TSSTable, A>
+    pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> StreamerBuilder<'a, TSSTable, A>
     where
         A::State: Clone,
     {
