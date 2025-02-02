@@ -90,10 +90,40 @@ fn column_dictionary_prefix_for_subpath(root_path: &str) -> String {
     format!("{}{}", root_path, JSON_PATH_SEGMENT_SEP as char)
 }
 
+fn read_all_columns_in_stream_with_name(
+    mut stream: sstable::Streamer<'_, RangeSSTable>,
+    column_data: &FileSlice,
+) -> io::Result<Vec<(String, DynamicColumnHandle)>> {
+    let mut results = Vec::new();
+    while stream.advance() {
+        let key_bytes: &[u8] = stream.key();
+        let Some(column_code) = key_bytes.last().copied() else {
+            return Err(io_invalid_data("Empty column name.".to_string()));
+        };
+        let column_type = ColumnType::try_from_code(column_code)
+            .map_err(|_| io_invalid_data(format!("Unknown column code `{column_code}`")))?;
+        let range = stream.value();
+
+        let column_name =
+                // The last two bytes are respectively the 0u8 separator and the column_type.
+                String::from_utf8_lossy(&key_bytes[..key_bytes.len() - 2]).to_string();
+
+        let file_slice = column_data.slice(range.start as usize..range.end as usize);
+        let dynamic_column_handle = DynamicColumnHandle {
+            file_slice,
+            column_type,
+        };
+        results.push((column_name, dynamic_column_handle));
+    }
+    Ok(results)
+}
+
 impl ColumnarReader {
     /// Opens a new Columnar file.
     pub fn open<F>(file_slice: F) -> io::Result<ColumnarReader>
-    where FileSlice: From<F> {
+    where
+        FileSlice: From<F>,
+    {
         Self::open_inner(file_slice.into())
     }
 
@@ -158,6 +188,17 @@ impl ColumnarReader {
         Ok(self.iter_columns()?.collect())
     }
 
+    fn stream_for_column_start_end(
+        &self,
+        start_key: &str,
+        end_key: &str,
+    ) -> sstable::StreamerBuilder<RangeSSTable> {
+        self.column_dictionary
+            .range()
+            .ge(start_key.as_bytes())
+            .lt(end_key.as_bytes())
+    }
+
     pub async fn read_columns_async(
         &self,
         column_name: &str,
@@ -206,6 +247,17 @@ impl ColumnarReader {
             .prefix_range(prefix.as_bytes())
             .into_stream()?;
         read_all_columns_in_stream(stream, &self.column_data, self.format_version)
+    }
+
+    pub fn read_columns_range(
+        &self,
+        start_key: &str,
+        end_key: &str,
+    ) -> io::Result<Vec<(String, DynamicColumnHandle)>> {
+        let stream = self
+            .stream_for_column_start_end(start_key, end_key)
+            .into_stream()?;
+        read_all_columns_in_stream_with_name(stream, &self.column_data)
     }
 
     /// Return the number of columns in the columnar.
