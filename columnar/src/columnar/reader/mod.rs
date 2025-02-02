@@ -73,10 +73,40 @@ fn read_all_columns_in_stream(
     Ok(results)
 }
 
+fn read_all_columns_in_stream_with_name(
+    mut stream: sstable::Streamer<'_, RangeSSTable>,
+    column_data: &FileSlice,
+) -> io::Result<Vec<(String, DynamicColumnHandle)>> {
+    let mut results = Vec::new();
+    while stream.advance() {
+        let key_bytes: &[u8] = stream.key();
+        let Some(column_code) = key_bytes.last().copied() else {
+            return Err(io_invalid_data("Empty column name.".to_string()));
+        };
+        let column_type = ColumnType::try_from_code(column_code)
+            .map_err(|_| io_invalid_data(format!("Unknown column code `{column_code}`")))?;
+        let range = stream.value();
+
+        let column_name =
+                // The last two bytes are respectively the 0u8 separator and the column_type.
+                String::from_utf8_lossy(&key_bytes[..key_bytes.len() - 2]).to_string();
+
+        let file_slice = column_data.slice(range.start as usize..range.end as usize);
+        let dynamic_column_handle = DynamicColumnHandle {
+            file_slice,
+            column_type,
+        };
+        results.push((column_name, dynamic_column_handle));
+    }
+    Ok(results)
+}
+
 impl ColumnarReader {
     /// Opens a new Columnar file.
     pub fn open<F>(file_slice: F) -> io::Result<ColumnarReader>
-    where FileSlice: From<F> {
+    where
+        FileSlice: From<F>,
+    {
         Self::open_inner(file_slice.into())
     }
 
@@ -153,6 +183,14 @@ impl ColumnarReader {
         start_key.push('\0');
         let mut end_key = column_name.to_string();
         end_key.push(1u8 as char);
+        self.stream_for_column_start_end(&start_key, &end_key)
+    }
+
+    fn stream_for_column_start_end(
+        &self,
+        start_key: &str,
+        end_key: &str,
+    ) -> sstable::StreamerBuilder<RangeSSTable> {
         self.column_dictionary
             .range()
             .ge(start_key.as_bytes())
@@ -177,6 +215,17 @@ impl ColumnarReader {
     pub fn read_columns(&self, column_name: &str) -> io::Result<Vec<DynamicColumnHandle>> {
         let stream = self.stream_for_column_range(column_name).into_stream()?;
         read_all_columns_in_stream(stream, &self.column_data)
+    }
+
+    pub fn read_columns_range(
+        &self,
+        start_key: &str,
+        end_key: &str,
+    ) -> io::Result<Vec<(String, DynamicColumnHandle)>> {
+        let stream = self
+            .stream_for_column_start_end(start_key, end_key)
+            .into_stream()?;
+        read_all_columns_in_stream_with_name(stream, &self.column_data)
     }
 
     /// Return the number of columns in the columnar.
