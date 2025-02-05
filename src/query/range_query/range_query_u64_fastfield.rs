@@ -22,7 +22,7 @@ pub struct FastFieldRangeWeight {
 
 impl FastFieldRangeWeight {
     /// Create a new FastFieldRangeWeight, using the u64 representation of any fast field.
-    pub(crate) fn new_u64_lenient(
+    pub fn new_u64_lenient(
         field: String,
         lower_bound: Bound<u64>,
         upper_bound: Bound<u64>,
