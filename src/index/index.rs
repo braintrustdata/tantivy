@@ -29,6 +29,7 @@ fn load_metas(
     inventory: &SegmentMetaInventory,
 ) -> crate::Result<IndexMeta> {
     let meta_data = directory.atomic_read(&META_FILEPATH)?;
+    eprintln!("[TANTIVY] load_metas: loaded meta data");
     let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
         error!("Meta data is not valid utf8.");
         DataCorruption::new(
@@ -36,6 +37,10 @@ fn load_metas(
             "Meta file does not contain valid utf8 file.".to_string(),
         )
     })?;
+    eprintln!(
+        "[TANTIVY] load_metas: deserializing meta data: {}",
+        meta_string
+    );
     IndexMeta::deserialize(&meta_string, inventory)
         .map_err(|e| {
             DataCorruption::new(

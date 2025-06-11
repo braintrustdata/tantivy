@@ -195,7 +195,12 @@ impl InnerIndexReader {
     fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
         // Prevents segment files from getting deleted while we are in the process of opening them
         let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
+        eprintln!("[TANTIVY] opening searchable segments");
         let searchable_segments = index.searchable_segments()?;
+        eprintln!(
+            "[TANTIVY] opened {} searchable segments",
+            searchable_segments.len()
+        );
         let executor = index.search_executor();
         let segment_readers = executor.map(
             |segment| SegmentReader::open_with_custom_alive_set_parallel(executor, segment, None),
