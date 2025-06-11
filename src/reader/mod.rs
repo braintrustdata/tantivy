@@ -222,12 +222,18 @@ impl InnerIndexReader {
         searcher_generation_counter: &Arc<AtomicU64>,
         searcher_generation_inventory: &Inventory<SearcherGeneration>,
     ) -> crate::Result<Arc<SearcherInner>> {
+        eprintln!("[TANTIVY] create_searcher: before open_segment_readers");
         let segment_readers = Self::open_segment_readers(index)?;
+        eprintln!(
+            "[TANTIVY] create_searcher: opened {} segment readers",
+            segment_readers.len()
+        );
         let searcher_generation = Self::track_segment_readers_in_inventory(
             &segment_readers,
             searcher_generation_counter,
             searcher_generation_inventory,
         );
+        eprintln!("[TANTIVY] create_searcher: tracked segment readers in inventory");
 
         let schema = index.schema();
         let searcher = Arc::new(SearcherInner::new(
@@ -237,8 +243,9 @@ impl InnerIndexReader {
             searcher_generation,
             doc_store_cache_num_blocks,
         )?);
-
+        eprintln!("[TANTIVY] create_searcher: created searcher");
         warming_state.warm_new_searcher_generation(&searcher.clone().into())?;
+        eprintln!("[TANTIVY] create_searcher: warmed searcher");
         Ok(searcher)
     }
 
@@ -251,7 +258,9 @@ impl InnerIndexReader {
             &self.searcher_generation_inventory,
         )?;
 
+        eprintln!("[TANTIVY] reload: before store searcher");
         self.searcher.store(searcher);
+        eprintln!("[TANTIVY] reload: after store searcher");
 
         Ok(())
     }
