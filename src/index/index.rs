@@ -28,6 +28,10 @@ fn load_metas(
     directory: &dyn Directory,
     inventory: &SegmentMetaInventory,
 ) -> crate::Result<IndexMeta> {
+    eprintln!(
+        "[TANTIVY] load_metas: loading meta data: {:?}",
+        META_FILEPATH
+    );
     let meta_data = directory.atomic_read(&META_FILEPATH)?;
     eprintln!("[TANTIVY] load_metas: loaded meta data");
     let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
