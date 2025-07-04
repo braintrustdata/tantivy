@@ -60,7 +60,7 @@ impl MultiValueIndex {
     /// Returns `[start, end)`, such that the values associated with
     /// the given document are `start..end`.
     #[inline]
-    pub(crate) fn range(&self, doc_id: DocId) -> Range<RowId> {
+    pub fn range(&self, doc_id: DocId) -> Range<RowId> {
         let start = self.start_index_column.get_val(doc_id);
         let end = self.start_index_column.get_val(doc_id + 1);
         start..end
