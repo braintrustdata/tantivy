@@ -91,7 +91,7 @@ impl MultiValueIndexV1 {
     /// Returns `[start, end)`, such that the values associated with
     /// the given document are `start..end`.
     #[inline]
-    pub(crate) fn range(&self, doc_id: DocId) -> Range<RowId> {
+    pub fn range(&self, doc_id: DocId) -> Range<RowId> {
         if doc_id >= self.num_docs() {
             return 0..0;
         }
