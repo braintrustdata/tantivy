@@ -621,9 +621,16 @@ impl<D: Document> IndexWriter<D> {
         let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
 
         for worker_handle in former_workers_join_handle {
-            let indexing_worker_result = worker_handle
-                .join()
-                .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
+            let indexing_worker_result = worker_handle.join().map_err(|e| {
+                let estr = if let Some(e) = e.downcast_ref::<&'static str>() {
+                    e.to_string()
+                } else if let Some(e) = e.downcast_ref::<String>() {
+                    e.clone()
+                } else {
+                    "Unknown error.".to_string()
+                };
+                TantivyError::ErrorInThread(estr)
+            })?;
             indexing_worker_result?;
             self.add_indexing_worker()?;
         }
