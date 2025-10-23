@@ -801,4 +801,104 @@ mod test {
         assert_eq!(vec![0u32, 2u32], docs);
         Ok(())
     }
+
+    #[test]
+    #[ignore] // This test demonstrates the actual deadlock in SegmentReader::open_with_custom_alive_set_parallel
+    fn test_parallel_segment_opening_deadlock() -> crate::Result<()> {
+        use std::sync::Arc;
+
+        // Create an index with multiple segments (more than thread pool size)
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+        let text_field = schema.get_field("text").unwrap();
+
+        // Use a small thread pool to make deadlock more likely
+        let executor = Arc::new(crate::Executor::multi_thread(4, "deadlock-test-")?);
+        let index = Index::create_in_ram(schema.clone());
+
+        // Create 8 segments (more than pool size of 4)
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            for seg_num in 0..8 {
+                // Add a few docs to each segment
+                for doc_num in 0..10 {
+                    index_writer
+                        .add_document(doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)))?;
+                }
+                // Commit to create a new segment
+                index_writer.commit()?;
+            }
+        }
+
+        // Get all segments
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 8, "Should have 8 segments");
+
+        // Now try to open all segments in parallel using the same executor
+        // This mimics what open_segment_readers() does
+        let executor_clone = executor.clone();
+        let result = executor.map(
+            |segment| {
+                // This calls open_with_custom_alive_set_parallel which:
+                // 1. Spawns 6 file-loading tasks via executor.spawn()
+                // 2. Immediately blocks waiting for them via fut()?
+                // Since we're already inside executor.map(), this is nested parallelism
+                SegmentReader::open_with_custom_alive_set_parallel(&executor_clone, segment, None)
+            },
+            segments.iter(),
+        );
+
+        // If you run this test with --ignored, it will deadlock here
+        // All 4 workers will be blocked in step 2 above, waiting for the 6 spawned tasks
+        // But those spawned tasks need workers to execute, and all workers are blocked!
+        result?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sequential_segment_opening_no_deadlock() -> crate::Result<()> {
+        use std::sync::Arc;
+
+        // Create an index with multiple segments
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+        let text_field = schema.get_field("text").unwrap();
+
+        let executor = Arc::new(crate::Executor::multi_thread(4, "safe-test-")?);
+        let index = Index::create_in_ram(schema.clone());
+
+        // Create 8 segments
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            for seg_num in 0..8 {
+                for doc_num in 0..5 {
+                    index_writer
+                        .add_document(doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)))?;
+                }
+                index_writer.commit()?;
+            }
+        }
+
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 8);
+
+        // Use the executor for outer parallelism, but use non-parallel segment opening
+        let result = executor.map(
+            |segment| {
+                // Use the non-parallel version - no nested executor calls!
+                SegmentReader::open(segment)
+            },
+            segments.iter(),
+        );
+
+        // This should complete successfully because we're not nesting executor calls
+        let segment_readers = result?;
+        assert_eq!(segment_readers.len(), 8);
+        println!("✓ Successfully opened {} segments without deadlock", segment_readers.len());
+
+        Ok(())
+    }
 }
