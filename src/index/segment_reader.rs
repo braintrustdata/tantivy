@@ -213,83 +213,137 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        let start = std::time::Instant::now();
-        let segment_ref = SegmentRef::new(segment);
-        let termdict_composite_fut = executor.spawn(move || {
-            let termdict_file = segment_ref.open_read(SegmentComponent::Terms)?;
-            Ok(CompositeFile::open(&termdict_file)?)
-        })?;
-
-        let segment_ref = SegmentRef::new(segment);
-        let store_file_fut =
-            executor.spawn(move || Ok(segment_ref.open_read(SegmentComponent::Store)?))?;
-
-        crate::fail_point!("SegmentReader::open#middle");
-
-        let segment_ref = SegmentRef::new(segment);
-        let postings_composite_fut = executor.spawn(move || {
-            let postings_file = segment_ref.open_read(SegmentComponent::Postings)?;
-            Ok(CompositeFile::open(&postings_file)?)
-        })?;
-
-        let segment_ref = SegmentRef::new(segment);
-        let positions_composite_fut = executor.spawn(move || {
-            if let Ok(positions_file) = segment_ref.open_read(SegmentComponent::Positions) {
-                Ok(CompositeFile::open(&positions_file)?)
-            } else {
-                Ok(CompositeFile::empty())
-            }
-        })?;
+        use std::sync::Mutex;
 
         let schema = segment.schema();
 
-        let fast_fields_readers_fut = executor.spawn({
-            let segment_ref = SegmentRef::new(segment);
-            let schema = schema.clone();
-            move || {
-                let fast_fields_data = segment_ref.open_read(SegmentComponent::FastFields)?;
-                Ok(FastFieldReaders::open(fast_fields_data, schema.clone())?)
+        // Helper macro to spawn a task that stores result in a Mutex
+        macro_rules! spawn_load {
+            ($scope:expr, $result:expr, $body:expr) => {
+                $scope.spawn(|_| {
+                    *$result.lock().unwrap() = Some($body);
+                });
+            };
+        }
+
+        // Use scope-based parallelism to avoid deadlock when called from within executor.map()
+        executor.install_and_scope(|| {
+            // Check if we have a thread pool available
+            if let Some(pool) = executor.thread_pool() {
+                // Use Rayon scope for work-stealing parallelism
+                let results = (
+                    Mutex::new(None), // termdict_composite
+                    Mutex::new(None), // store_file
+                    Mutex::new(None), // postings_composite
+                    Mutex::new(None), // positions_composite
+                    Mutex::new(None), // fast_fields_readers
+                    Mutex::new(None), // fieldnorm_readers
+                );
+
+                pool.scope(|scope| {
+                    // Spawn parallel file loading tasks
+                    spawn_load!(scope, &results.0, {
+                        let segment_ref = SegmentRef::new(segment);
+                        (|| -> crate::Result<_> {
+                            let file = segment_ref.open_read(SegmentComponent::Terms)?;
+                            Ok(CompositeFile::open(&file)?)
+                        })()
+                    });
+
+                    spawn_load!(scope, &results.1, {
+                        SegmentRef::new(segment).open_read(SegmentComponent::Store)
+                    });
+
+                    crate::fail_point!("SegmentReader::open#middle");
+
+                    spawn_load!(scope, &results.2, {
+                        let segment_ref = SegmentRef::new(segment);
+                        (|| -> crate::Result<_> {
+                            let file = segment_ref.open_read(SegmentComponent::Postings)?;
+                            Ok(CompositeFile::open(&file)?)
+                        })()
+                    });
+
+                    spawn_load!(scope, &results.3, {
+                        let segment_ref = SegmentRef::new(segment);
+                        (|| -> crate::Result<_> {
+                            if let Ok(file) = segment_ref.open_read(SegmentComponent::Positions) {
+                                Ok(CompositeFile::open(&file)?)
+                            } else {
+                                Ok(CompositeFile::empty())
+                            }
+                        })()
+                    });
+
+                    spawn_load!(scope, &results.4, {
+                        let segment_ref = SegmentRef::new(segment);
+                        (|| -> crate::Result<_> {
+                            let file = segment_ref.open_read(SegmentComponent::FastFields)?;
+                            Ok(FastFieldReaders::open(file, schema.clone())?)
+                        })()
+                    });
+
+                    spawn_load!(scope, &results.5, {
+                        let segment_ref = SegmentRef::new(segment);
+                        (|| -> crate::Result<_> {
+                            let file = segment_ref.open_read(SegmentComponent::FieldNorms)?;
+                            Ok(FieldNormReaders::open(file)?)
+                        })()
+                    });
+                });
+
+                // Extract all results
+                let (
+                    termdict_composite,
+                    store_file,
+                    postings_composite,
+                    positions_composite,
+                    fast_fields_readers,
+                    fieldnorm_readers,
+                ) = (
+                    results.0.into_inner().unwrap().unwrap()?,
+                    results.1.into_inner().unwrap().unwrap()?,
+                    results.2.into_inner().unwrap().unwrap()?,
+                    results.3.into_inner().unwrap().unwrap()?,
+                    results.4.into_inner().unwrap().unwrap()?,
+                    results.5.into_inner().unwrap().unwrap()?,
+                );
+
+                let original_bitset = if segment.meta().has_deletes() {
+                    let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
+                    let alive_doc_data = alive_doc_file_slice.read_bytes()?;
+                    Some(AliveBitSet::open(alive_doc_data))
+                } else {
+                    None
+                };
+
+                let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
+
+                let max_doc = segment.meta().max_doc();
+                let num_docs = alive_bitset_opt
+                    .as_ref()
+                    .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
+                    .unwrap_or(max_doc);
+
+                Ok(SegmentReader {
+                    inv_idx_reader_cache: Default::default(),
+                    num_docs,
+                    max_doc,
+                    termdict_composite,
+                    postings_composite,
+                    fast_fields_readers,
+                    fieldnorm_readers,
+                    segment_id: segment.id(),
+                    delete_opstamp: segment.meta().delete_opstamp(),
+                    store_file,
+                    alive_bitset_opt,
+                    positions_composite,
+                    schema,
+                })
+            } else {
+                // Single-threaded: just call the non-parallel version
+                SegmentReader::open(segment)
             }
-        })?;
-
-        let fieldnorm_readers_fut = executor.spawn({
-            let segment_ref = SegmentRef::new(segment);
-            move || {
-                let fieldnorm_data = segment_ref.open_read(SegmentComponent::FieldNorms)?;
-                Ok(FieldNormReaders::open(fieldnorm_data)?)
-            }
-        })?;
-
-        let original_bitset = if segment.meta().has_deletes() {
-            let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
-            let alive_doc_data = alive_doc_file_slice.read_bytes()?;
-            Some(AliveBitSet::open(alive_doc_data))
-        } else {
-            None
-        };
-
-        let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
-
-        let max_doc = segment.meta().max_doc();
-        let num_docs = alive_bitset_opt
-            .as_ref()
-            .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
-            .unwrap_or(max_doc);
-
-        Ok(SegmentReader {
-            inv_idx_reader_cache: Default::default(),
-            num_docs,
-            max_doc,
-            termdict_composite: termdict_composite_fut()?,
-            postings_composite: postings_composite_fut()?,
-            fast_fields_readers: fast_fields_readers_fut()?,
-            fieldnorm_readers: fieldnorm_readers_fut()?,
-            segment_id: segment.id(),
-            delete_opstamp: segment.meta().delete_opstamp(),
-            store_file: store_file_fut()?,
-            alive_bitset_opt,
-            positions_composite: positions_composite_fut()?,
-            schema,
         })
     }
 
@@ -823,8 +877,9 @@ mod test {
             for seg_num in 0..8 {
                 // Add a few docs to each segment
                 for doc_num in 0..10 {
-                    index_writer
-                        .add_document(doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)))?;
+                    index_writer.add_document(
+                        doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)),
+                    )?;
                 }
                 // Commit to create a new segment
                 index_writer.commit()?;
@@ -875,8 +930,9 @@ mod test {
             let mut index_writer = index.writer_for_tests()?;
             for seg_num in 0..8 {
                 for doc_num in 0..5 {
-                    index_writer
-                        .add_document(doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)))?;
+                    index_writer.add_document(
+                        doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)),
+                    )?;
                 }
                 index_writer.commit()?;
             }
@@ -897,7 +953,10 @@ mod test {
         // This should complete successfully because we're not nesting executor calls
         let segment_readers = result?;
         assert_eq!(segment_readers.len(), 8);
-        println!("✓ Successfully opened {} segments without deadlock", segment_readers.len());
+        println!(
+            "✓ Successfully opened {} segments without deadlock",
+            segment_readers.len()
+        );
 
         Ok(())
     }
