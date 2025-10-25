@@ -16,7 +16,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::{DocId, Executor, Opstamp};
+use crate::{DocId, Executor, Opstamp, TantivyError};
 
 /// Entry point to access all of the datastructures of the `Segment`
 ///
@@ -208,106 +208,90 @@ impl SegmentReader {
     }
 
     /// Open a new segment for reading and parallelize the file opening.
+    ///
+    /// Uses nested rayon::join for work-stealing parallelism, which is safe even when
+    /// called from within another parallel context (e.g., executor.map()).
     pub fn open_with_custom_alive_set_parallel(
         executor: &Executor,
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        use std::sync::Mutex;
-
         let schema = segment.schema();
 
-        // Helper macro to spawn a task that stores result in a Mutex
-        macro_rules! spawn_load {
-            ($scope:expr, $result:expr, $body:expr) => {
-                $scope.spawn(|_| {
-                    *$result.lock().unwrap() = Some($body);
-                });
-            };
-        }
-
-        // Use scope-based parallelism to avoid deadlock when called from within executor.map()
         executor.install_and_scope(|| {
-            // Check if we have a thread pool available
-            if let Some(pool) = executor.thread_pool() {
-                // Use Rayon scope for work-stealing parallelism
-                let results = (
-                    Mutex::new(None), // termdict_composite
-                    Mutex::new(None), // store_file
-                    Mutex::new(None), // postings_composite
-                    Mutex::new(None), // positions_composite
-                    Mutex::new(None), // fast_fields_readers
-                    Mutex::new(None), // fieldnorm_readers
-                );
-
-                pool.scope(|scope| {
-                    // Spawn parallel file loading tasks
-                    spawn_load!(scope, &results.0, {
-                        let segment_ref = SegmentRef::new(segment);
-                        (|| -> crate::Result<_> {
-                            let file = segment_ref.open_read(SegmentComponent::Terms)?;
-                            Ok(CompositeFile::open(&file)?)
-                        })()
-                    });
-
-                    spawn_load!(scope, &results.1, {
-                        SegmentRef::new(segment).open_read(SegmentComponent::Store)
-                    });
-
-                    crate::fail_point!("SegmentReader::open#middle");
-
-                    spawn_load!(scope, &results.2, {
-                        let segment_ref = SegmentRef::new(segment);
-                        (|| -> crate::Result<_> {
-                            let file = segment_ref.open_read(SegmentComponent::Postings)?;
-                            Ok(CompositeFile::open(&file)?)
-                        })()
-                    });
-
-                    spawn_load!(scope, &results.3, {
-                        let segment_ref = SegmentRef::new(segment);
-                        (|| -> crate::Result<_> {
-                            if let Ok(file) = segment_ref.open_read(SegmentComponent::Positions) {
-                                Ok(CompositeFile::open(&file)?)
-                            } else {
-                                Ok(CompositeFile::empty())
-                            }
-                        })()
-                    });
-
-                    spawn_load!(scope, &results.4, {
-                        let segment_ref = SegmentRef::new(segment);
-                        (|| -> crate::Result<_> {
-                            let file = segment_ref.open_read(SegmentComponent::FastFields)?;
-                            Ok(FastFieldReaders::open(file, schema.clone())?)
-                        })()
-                    });
-
-                    spawn_load!(scope, &results.5, {
-                        let segment_ref = SegmentRef::new(segment);
-                        (|| -> crate::Result<_> {
-                            let file = segment_ref.open_read(SegmentComponent::FieldNorms)?;
-                            Ok(FieldNormReaders::open(file)?)
-                        })()
-                    });
-                });
-
-                // Extract all results
+            if let Some(_pool) = executor.thread_pool() {
+                // Use nested rayon::join for work-stealing parallelism
+                // Structure: ((file1, file2), ((file3, file4), (file5, file6)))
                 let (
-                    termdict_composite,
-                    store_file,
-                    postings_composite,
-                    positions_composite,
-                    fast_fields_readers,
-                    fieldnorm_readers,
-                ) = (
-                    results.0.into_inner().unwrap().unwrap()?,
-                    results.1.into_inner().unwrap().unwrap()?,
-                    results.2.into_inner().unwrap().unwrap()?,
-                    results.3.into_inner().unwrap().unwrap()?,
-                    results.4.into_inner().unwrap().unwrap()?,
-                    results.5.into_inner().unwrap().unwrap()?,
+                    (termdict_composite, store_file),
+                    (
+                        (postings_composite, positions_composite),
+                        (fast_fields_readers, fieldnorm_readers),
+                    ),
+                ) = rayon::join(
+                    || {
+                        rayon::join(
+                            || {
+                                let segment_ref = SegmentRef::new(segment);
+                                let termdict_file =
+                                    segment_ref.open_read(SegmentComponent::Terms)?;
+                                Ok::<_, TantivyError>(CompositeFile::open(&termdict_file)?)
+                            },
+                            || {
+                                let segment_ref = SegmentRef::new(segment);
+                                Ok::<_, TantivyError>(segment_ref.open_read(SegmentComponent::Store)?)
+                            },
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                rayon::join(
+                                    || {
+                                        crate::fail_point!("SegmentReader::open#middle");
+                                        let segment_ref = SegmentRef::new(segment);
+                                        let postings_file =
+                                            segment_ref.open_read(SegmentComponent::Postings)?;
+                                        Ok::<_, TantivyError>(CompositeFile::open(&postings_file)?)
+                                    },
+                                    || {
+                                        let segment_ref = SegmentRef::new(segment);
+                                        if let Ok(positions_file) =
+                                            segment_ref.open_read(SegmentComponent::Positions)
+                                        {
+                                            Ok::<_, TantivyError>(CompositeFile::open(&positions_file)?)
+                                        } else {
+                                            Ok(CompositeFile::empty())
+                                        }
+                                    },
+                                )
+                            },
+                            || {
+                                rayon::join(
+                                    || {
+                                        let segment_ref = SegmentRef::new(segment);
+                                        let fast_fields_data =
+                                            segment_ref.open_read(SegmentComponent::FastFields)?;
+                                        Ok::<_, TantivyError>(FastFieldReaders::open(fast_fields_data, schema.clone())?)
+                                    },
+                                    || {
+                                        let segment_ref = SegmentRef::new(segment);
+                                        let fieldnorm_data =
+                                            segment_ref.open_read(SegmentComponent::FieldNorms)?;
+                                        Ok::<_, TantivyError>(FieldNormReaders::open(fieldnorm_data)?)
+                                    },
+                                )
+                            },
+                        )
+                    },
                 );
+
+                let termdict_composite = termdict_composite?;
+                let store_file = store_file?;
+                let postings_composite = postings_composite?;
+                let positions_composite = positions_composite?;
+                let fast_fields_readers = fast_fields_readers?;
+                let fieldnorm_readers = fieldnorm_readers?;
 
                 let original_bitset = if segment.meta().has_deletes() {
                     let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
@@ -857,7 +841,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // This test demonstrates the actual deadlock in SegmentReader::open_with_custom_alive_set_parallel
     fn test_parallel_segment_opening_deadlock() -> crate::Result<()> {
         use std::sync::Arc;
 
