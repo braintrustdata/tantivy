@@ -16,7 +16,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::{DocId, Executor, Opstamp};
+use crate::{DocId, Executor, Opstamp, TantivyError};
 
 /// Entry point to access all of the datastructures of the `Segment`
 ///
@@ -208,88 +208,125 @@ impl SegmentReader {
     }
 
     /// Open a new segment for reading and parallelize the file opening.
+    ///
+    /// Uses nested rayon::join for work-stealing parallelism, which is safe even when
+    /// called from within another parallel context (e.g., executor.map()).
     pub fn open_with_custom_alive_set_parallel(
         executor: &Executor,
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        let start = std::time::Instant::now();
-        let segment_ref = SegmentRef::new(segment);
-        let termdict_composite_fut = executor.spawn(move || {
-            let termdict_file = segment_ref.open_read(SegmentComponent::Terms)?;
-            Ok(CompositeFile::open(&termdict_file)?)
-        })?;
-
-        let segment_ref = SegmentRef::new(segment);
-        let store_file_fut =
-            executor.spawn(move || Ok(segment_ref.open_read(SegmentComponent::Store)?))?;
-
-        crate::fail_point!("SegmentReader::open#middle");
-
-        let segment_ref = SegmentRef::new(segment);
-        let postings_composite_fut = executor.spawn(move || {
-            let postings_file = segment_ref.open_read(SegmentComponent::Postings)?;
-            Ok(CompositeFile::open(&postings_file)?)
-        })?;
-
-        let segment_ref = SegmentRef::new(segment);
-        let positions_composite_fut = executor.spawn(move || {
-            if let Ok(positions_file) = segment_ref.open_read(SegmentComponent::Positions) {
-                Ok(CompositeFile::open(&positions_file)?)
-            } else {
-                Ok(CompositeFile::empty())
-            }
-        })?;
-
         let schema = segment.schema();
 
-        let fast_fields_readers_fut = executor.spawn({
-            let segment_ref = SegmentRef::new(segment);
-            let schema = schema.clone();
-            move || {
-                let fast_fields_data = segment_ref.open_read(SegmentComponent::FastFields)?;
-                Ok(FastFieldReaders::open(fast_fields_data, schema.clone())?)
-            }
-        })?;
+        executor.install_and_scope(|| {
+            let Some(_pool) = executor.thread_pool() else {
+                return SegmentReader::open(segment);
+            };
 
-        let fieldnorm_readers_fut = executor.spawn({
-            let segment_ref = SegmentRef::new(segment);
-            move || {
-                let fieldnorm_data = segment_ref.open_read(SegmentComponent::FieldNorms)?;
-                Ok(FieldNormReaders::open(fieldnorm_data)?)
-            }
-        })?;
+            // Use nested rayon::join for work-stealing parallelism
+            // Structure: ((file1, file2), ((file3, file4), (file5, file6)))
+            let (
+                (termdict_composite, store_file),
+                (
+                    (postings_composite, positions_composite),
+                    (fast_fields_readers, fieldnorm_readers),
+                ),
+            ) = rayon::join(
+                    || {
+                        rayon::join(
+                            || {
+                                let segment_ref = SegmentRef::new(segment);
+                                let termdict_file =
+                                    segment_ref.open_read(SegmentComponent::Terms)?;
+                                Ok::<_, TantivyError>(CompositeFile::open(&termdict_file)?)
+                            },
+                            || {
+                                let segment_ref = SegmentRef::new(segment);
+                                Ok::<_, TantivyError>(segment_ref.open_read(SegmentComponent::Store)?)
+                            },
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                rayon::join(
+                                    || {
+                                        crate::fail_point!("SegmentReader::open#middle");
+                                        let segment_ref = SegmentRef::new(segment);
+                                        let postings_file =
+                                            segment_ref.open_read(SegmentComponent::Postings)?;
+                                        Ok::<_, TantivyError>(CompositeFile::open(&postings_file)?)
+                                    },
+                                    || {
+                                        let segment_ref = SegmentRef::new(segment);
+                                        if let Ok(positions_file) =
+                                            segment_ref.open_read(SegmentComponent::Positions)
+                                        {
+                                            Ok::<_, TantivyError>(CompositeFile::open(&positions_file)?)
+                                        } else {
+                                            Ok(CompositeFile::empty())
+                                        }
+                                    },
+                                )
+                            },
+                            || {
+                                rayon::join(
+                                    || {
+                                        let segment_ref = SegmentRef::new(segment);
+                                        let fast_fields_data =
+                                            segment_ref.open_read(SegmentComponent::FastFields)?;
+                                        Ok::<_, TantivyError>(FastFieldReaders::open(fast_fields_data, schema.clone())?)
+                                    },
+                                    || {
+                                        let segment_ref = SegmentRef::new(segment);
+                                        let fieldnorm_data =
+                                            segment_ref.open_read(SegmentComponent::FieldNorms)?;
+                                        Ok::<_, TantivyError>(FieldNormReaders::open(fieldnorm_data)?)
+                                    },
+                                )
+                            },
+                        )
+                    },
+                );
 
-        let original_bitset = if segment.meta().has_deletes() {
-            let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
-            let alive_doc_data = alive_doc_file_slice.read_bytes()?;
-            Some(AliveBitSet::open(alive_doc_data))
-        } else {
-            None
-        };
+                let termdict_composite = termdict_composite?;
+                let store_file = store_file?;
+                let postings_composite = postings_composite?;
+                let positions_composite = positions_composite?;
+                let fast_fields_readers = fast_fields_readers?;
+                let fieldnorm_readers = fieldnorm_readers?;
 
-        let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
+                let original_bitset = if segment.meta().has_deletes() {
+                    let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
+                    let alive_doc_data = alive_doc_file_slice.read_bytes()?;
+                    Some(AliveBitSet::open(alive_doc_data))
+                } else {
+                    None
+                };
 
-        let max_doc = segment.meta().max_doc();
-        let num_docs = alive_bitset_opt
-            .as_ref()
-            .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
-            .unwrap_or(max_doc);
+                let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
-        Ok(SegmentReader {
-            inv_idx_reader_cache: Default::default(),
-            num_docs,
-            max_doc,
-            termdict_composite: termdict_composite_fut()?,
-            postings_composite: postings_composite_fut()?,
-            fast_fields_readers: fast_fields_readers_fut()?,
-            fieldnorm_readers: fieldnorm_readers_fut()?,
-            segment_id: segment.id(),
-            delete_opstamp: segment.meta().delete_opstamp(),
-            store_file: store_file_fut()?,
-            alive_bitset_opt,
-            positions_composite: positions_composite_fut()?,
-            schema,
+                let max_doc = segment.meta().max_doc();
+                let num_docs = alive_bitset_opt
+                    .as_ref()
+                    .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
+                    .unwrap_or(max_doc);
+
+            Ok(SegmentReader {
+                inv_idx_reader_cache: Default::default(),
+                num_docs,
+                max_doc,
+                termdict_composite,
+                postings_composite,
+                fast_fields_readers,
+                fieldnorm_readers,
+                segment_id: segment.id(),
+                delete_opstamp: segment.meta().delete_opstamp(),
+                store_file,
+                alive_bitset_opt,
+                positions_composite,
+                schema,
+            })
         })
     }
 
@@ -799,6 +836,110 @@ mod test {
         let searcher = index.reader()?.searcher();
         let docs: Vec<DocId> = searcher.segment_reader(0).doc_ids_alive().collect();
         assert_eq!(vec![0u32, 2u32], docs);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_segment_opening_deadlock() -> crate::Result<()> {
+        use std::sync::Arc;
+
+        // Create an index with multiple segments (more than thread pool size)
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+        let text_field = schema.get_field("text").unwrap();
+
+        // Use a small thread pool to make deadlock more likely
+        let executor = Arc::new(crate::Executor::multi_thread(4, "deadlock-test-")?);
+        let index = Index::create_in_ram(schema.clone());
+
+        // Create 8 segments (more than pool size of 4)
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            for seg_num in 0..8 {
+                // Add a few docs to each segment
+                for doc_num in 0..10 {
+                    index_writer.add_document(
+                        doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)),
+                    )?;
+                }
+                // Commit to create a new segment
+                index_writer.commit()?;
+            }
+        }
+
+        // Get all segments
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 8, "Should have 8 segments");
+
+        // Now try to open all segments in parallel using the same executor
+        // This mimics what open_segment_readers() does
+        let executor_clone = executor.clone();
+        let result = executor.map(
+            |segment| {
+                // This calls open_with_custom_alive_set_parallel which:
+                // 1. Spawns 6 file-loading tasks via executor.spawn()
+                // 2. Immediately blocks waiting for them via fut()?
+                // Since we're already inside executor.map(), this is nested parallelism
+                SegmentReader::open_with_custom_alive_set_parallel(&executor_clone, segment, None)
+            },
+            segments.iter(),
+        );
+
+        // If you run this test with --ignored, it will deadlock here
+        // All 4 workers will be blocked in step 2 above, waiting for the 6 spawned tasks
+        // But those spawned tasks need workers to execute, and all workers are blocked!
+        result?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sequential_segment_opening_no_deadlock() -> crate::Result<()> {
+        use std::sync::Arc;
+
+        // Create an index with multiple segments
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+        let text_field = schema.get_field("text").unwrap();
+
+        let executor = Arc::new(crate::Executor::multi_thread(4, "safe-test-")?);
+        let index = Index::create_in_ram(schema.clone());
+
+        // Create 8 segments
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            for seg_num in 0..8 {
+                for doc_num in 0..5 {
+                    index_writer.add_document(
+                        doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)),
+                    )?;
+                }
+                index_writer.commit()?;
+            }
+        }
+
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 8);
+
+        // Use the executor for outer parallelism, but use non-parallel segment opening
+        let result = executor.map(
+            |segment| {
+                // Use the non-parallel version - no nested executor calls!
+                SegmentReader::open(segment)
+            },
+            segments.iter(),
+        );
+
+        // This should complete successfully because we're not nesting executor calls
+        let segment_readers = result?;
+        assert_eq!(segment_readers.len(), 8);
+        println!(
+            "✓ Successfully opened {} segments without deadlock",
+            segment_readers.len()
+        );
+
         Ok(())
     }
 }
