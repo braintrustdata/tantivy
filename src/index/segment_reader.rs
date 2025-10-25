@@ -219,16 +219,19 @@ impl SegmentReader {
         let schema = segment.schema();
 
         executor.install_and_scope(|| {
-            if let Some(_pool) = executor.thread_pool() {
-                // Use nested rayon::join for work-stealing parallelism
-                // Structure: ((file1, file2), ((file3, file4), (file5, file6)))
-                let (
-                    (termdict_composite, store_file),
-                    (
-                        (postings_composite, positions_composite),
-                        (fast_fields_readers, fieldnorm_readers),
-                    ),
-                ) = rayon::join(
+            let Some(_pool) = executor.thread_pool() else {
+                return SegmentReader::open(segment);
+            };
+
+            // Use nested rayon::join for work-stealing parallelism
+            // Structure: ((file1, file2), ((file3, file4), (file5, file6)))
+            let (
+                (termdict_composite, store_file),
+                (
+                    (postings_composite, positions_composite),
+                    (fast_fields_readers, fieldnorm_readers),
+                ),
+            ) = rayon::join(
                     || {
                         rayon::join(
                             || {
@@ -309,25 +312,21 @@ impl SegmentReader {
                     .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
                     .unwrap_or(max_doc);
 
-                Ok(SegmentReader {
-                    inv_idx_reader_cache: Default::default(),
-                    num_docs,
-                    max_doc,
-                    termdict_composite,
-                    postings_composite,
-                    fast_fields_readers,
-                    fieldnorm_readers,
-                    segment_id: segment.id(),
-                    delete_opstamp: segment.meta().delete_opstamp(),
-                    store_file,
-                    alive_bitset_opt,
-                    positions_composite,
-                    schema,
-                })
-            } else {
-                // Single-threaded: just call the non-parallel version
-                SegmentReader::open(segment)
-            }
+            Ok(SegmentReader {
+                inv_idx_reader_cache: Default::default(),
+                num_docs,
+                max_doc,
+                termdict_composite,
+                postings_composite,
+                fast_fields_readers,
+                fieldnorm_readers,
+                segment_id: segment.id(),
+                delete_opstamp: segment.meta().delete_opstamp(),
+                store_file,
+                alive_bitset_opt,
+                positions_composite,
+                schema,
+            })
         })
     }
 
