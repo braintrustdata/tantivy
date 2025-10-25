@@ -161,6 +161,34 @@ impl Executor {
             })?
         })
     }
+
+    /// Install and run code in the thread pool, giving access to Rayon scope for nested parallelism.
+    ///
+    /// This method is safe to call from within executor.map() because it uses Rayon's install()
+    /// which properly manages the pool context, and the closure can use work-stealing scope.
+    ///
+    /// For single-threaded executor, just runs the closure directly.
+    pub fn install_and_scope<OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        match self {
+            Executor::SingleThread => op(),
+            Executor::ThreadPool(pool) => pool.install(op),
+        }
+    }
+
+    /// Get access to the underlying Rayon thread pool for scope-based operations.
+    ///
+    /// Returns None for single-threaded executor.
+    /// This is useful when you need direct access to Rayon's scope for nested parallelism.
+    pub fn thread_pool(&self) -> Option<&ThreadPool> {
+        match self {
+            Executor::SingleThread => None,
+            Executor::ThreadPool(pool) => Some(pool),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +301,140 @@ mod tests {
 
         let other_counter_val2 = other_counter.load(Ordering::SeqCst);
         assert!(other_counter_val2 <= other_counter_val + 6);
+    }
+
+    #[test]
+    #[ignore] // This test demonstrates a deadlock - run with --ignored to see it hang
+    fn test_nested_spawn_deadlock() {
+        // This reproduces the deadlock in production where:
+        // 1. executor.map() spawns jobs into a Rayon pool
+        // 2. Each job calls executor.spawn() which queues more work
+        // 3. Each job blocks waiting for its spawned work
+        // 4. All workers get blocked, nobody left to execute the spawned work
+        // Result: DEADLOCK
+
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let executor = Arc::new(Executor::multi_thread(4, "deadlock-test-").unwrap());
+
+        // Simulate 8 segments (more than pool size of 4)
+        let segments: Vec<usize> = (0..8).collect();
+
+        let executor_clone = executor.clone();
+        let result = executor.map(
+            |segment_id| {
+                // Simulate open_with_custom_alive_set_parallel:
+                // Spawn 3 file loads per segment
+                let fut1 = executor_clone.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(10));
+                    Ok(segment_id * 100 + 1)
+                })?;
+
+                let fut2 = executor_clone.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(10));
+                    Ok(segment_id * 100 + 2)
+                })?;
+
+                let fut3 = executor_clone.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(10));
+                    Ok(segment_id * 100 + 3)
+                })?;
+
+                // Block waiting for results (this is where deadlock happens)
+                let f1 = fut1()?;
+                let f2 = fut2()?;
+                let f3 = fut3()?;
+
+                Ok((f1, f2, f3))
+            },
+            segments.iter().copied(),
+        );
+
+        // If you run this test, it will hang forever
+        // With 4 workers and 8 segments × 3 spawns = 24 queued jobs,
+        // all 4 workers block on their first spawn, leaving nobody to execute the remaining 20 jobs
+        result.unwrap();
+    }
+
+    #[test]
+    fn test_sequential_inner_work_no_deadlock() {
+        // This shows that non-nested parallelism works fine
+        use std::time::Duration;
+
+        let executor = Executor::multi_thread(4, "safe-test-").unwrap();
+
+        let result = executor.map(
+            |segment_id| {
+                // Do work directly without spawning
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(format!("segment-{}", segment_id))
+            },
+            0..8,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 8);
+    }
+
+    #[test]
+    fn test_scope_based_nesting_works() {
+        // This demonstrates the FIX: use scope() instead of spawn() for nested parallelism
+        // scope() uses work-stealing so workers remain productive while waiting
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("fix-test-{}", i))
+            .build()
+            .unwrap();
+
+        let segments: Vec<usize> = (0..8).collect();
+
+        let results: Vec<_> = pool.install(|| {
+            segments
+                .iter()
+                .map(|&segment_id| {
+                    // Use scope for nested parallelism (doesn't block!)
+                    let f1 = Mutex::new(None);
+                    let f2 = Mutex::new(None);
+                    let f3 = Mutex::new(None);
+
+                    pool.scope(|s| {
+                        s.spawn(|_| {
+                            std::thread::sleep(Duration::from_millis(10));
+                            *f1.lock().unwrap() = Some(segment_id * 100 + 1);
+                        });
+
+                        s.spawn(|_| {
+                            std::thread::sleep(Duration::from_millis(10));
+                            *f2.lock().unwrap() = Some(segment_id * 100 + 2);
+                        });
+
+                        s.spawn(|_| {
+                            std::thread::sleep(Duration::from_millis(10));
+                            *f3.lock().unwrap() = Some(segment_id * 100 + 3);
+                        });
+
+                        // scope() uses work-stealing, so workers process other jobs while waiting
+                    });
+
+                    // Extract values to avoid lifetime issues
+                    let v1 = f1.lock().unwrap().unwrap();
+                    let v2 = f2.lock().unwrap().unwrap();
+                    let v3 = f3.lock().unwrap().unwrap();
+                    (v1, v2, v3)
+                })
+                .collect()
+        });
+
+        assert_eq!(results.len(), 8);
+        // Verify results are correct
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result.0, i * 100 + 1);
+            assert_eq!(result.1, i * 100 + 2);
+            assert_eq!(result.2, i * 100 + 3);
+        }
     }
 }
