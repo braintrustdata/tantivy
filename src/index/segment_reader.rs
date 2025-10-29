@@ -207,127 +207,19 @@ impl SegmentReader {
         })
     }
 
-    /// Open a new segment for reading and parallelize the file opening.
+    /// Open a new segment for reading.
     ///
-    /// Uses nested rayon::join for work-stealing parallelism, which is safe even when
-    /// called from within another parallel context (e.g., executor.map()).
+    /// Previously used nested parallelism (rayon::join) but this caused stack overflow
+    /// when opening many segments. Now just calls the sequential version.
+    /// Parallelism across segments (via executor.map) is sufficient.
     pub fn open_with_custom_alive_set_parallel(
-        executor: &Executor,
+        _executor: &Executor,
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        let schema = segment.schema();
-
-        executor.install_and_scope(|| {
-            let Some(_pool) = executor.thread_pool() else {
-                return SegmentReader::open(segment);
-            };
-
-            // Use nested rayon::join for work-stealing parallelism
-            // Structure: ((file1, file2), ((file3, file4), (file5, file6)))
-            let (
-                (termdict_composite, store_file),
-                (
-                    (postings_composite, positions_composite),
-                    (fast_fields_readers, fieldnorm_readers),
-                ),
-            ) = rayon::join(
-                    || {
-                        rayon::join(
-                            || {
-                                let segment_ref = SegmentRef::new(segment);
-                                let termdict_file =
-                                    segment_ref.open_read(SegmentComponent::Terms)?;
-                                Ok::<_, TantivyError>(CompositeFile::open(&termdict_file)?)
-                            },
-                            || {
-                                let segment_ref = SegmentRef::new(segment);
-                                Ok::<_, TantivyError>(segment_ref.open_read(SegmentComponent::Store)?)
-                            },
-                        )
-                    },
-                    || {
-                        rayon::join(
-                            || {
-                                rayon::join(
-                                    || {
-                                        crate::fail_point!("SegmentReader::open#middle");
-                                        let segment_ref = SegmentRef::new(segment);
-                                        let postings_file =
-                                            segment_ref.open_read(SegmentComponent::Postings)?;
-                                        Ok::<_, TantivyError>(CompositeFile::open(&postings_file)?)
-                                    },
-                                    || {
-                                        let segment_ref = SegmentRef::new(segment);
-                                        if let Ok(positions_file) =
-                                            segment_ref.open_read(SegmentComponent::Positions)
-                                        {
-                                            Ok::<_, TantivyError>(CompositeFile::open(&positions_file)?)
-                                        } else {
-                                            Ok(CompositeFile::empty())
-                                        }
-                                    },
-                                )
-                            },
-                            || {
-                                rayon::join(
-                                    || {
-                                        let segment_ref = SegmentRef::new(segment);
-                                        let fast_fields_data =
-                                            segment_ref.open_read(SegmentComponent::FastFields)?;
-                                        Ok::<_, TantivyError>(FastFieldReaders::open(fast_fields_data, schema.clone())?)
-                                    },
-                                    || {
-                                        let segment_ref = SegmentRef::new(segment);
-                                        let fieldnorm_data =
-                                            segment_ref.open_read(SegmentComponent::FieldNorms)?;
-                                        Ok::<_, TantivyError>(FieldNormReaders::open(fieldnorm_data)?)
-                                    },
-                                )
-                            },
-                        )
-                    },
-                );
-
-                let termdict_composite = termdict_composite?;
-                let store_file = store_file?;
-                let postings_composite = postings_composite?;
-                let positions_composite = positions_composite?;
-                let fast_fields_readers = fast_fields_readers?;
-                let fieldnorm_readers = fieldnorm_readers?;
-
-                let original_bitset = if segment.meta().has_deletes() {
-                    let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
-                    let alive_doc_data = alive_doc_file_slice.read_bytes()?;
-                    Some(AliveBitSet::open(alive_doc_data))
-                } else {
-                    None
-                };
-
-                let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
-
-                let max_doc = segment.meta().max_doc();
-                let num_docs = alive_bitset_opt
-                    .as_ref()
-                    .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
-                    .unwrap_or(max_doc);
-
-            Ok(SegmentReader {
-                inv_idx_reader_cache: Default::default(),
-                num_docs,
-                max_doc,
-                termdict_composite,
-                postings_composite,
-                fast_fields_readers,
-                fieldnorm_readers,
-                segment_id: segment.id(),
-                delete_opstamp: segment.meta().delete_opstamp(),
-                store_file,
-                alive_bitset_opt,
-                positions_composite,
-                schema,
-            })
-        })
+        // Don't parallelize component loading within a segment to avoid stack overflow
+        // The outer executor.map() already parallelizes across segments
+        Self::open_with_custom_alive_set(segment, custom_bitset)
     }
 
     /// Returns a field reader associated with the field given in argument.
