@@ -134,34 +134,6 @@ impl Executor {
             })?
         })
     }
-
-    /// Install and run code in the thread pool, giving access to Rayon scope for nested parallelism.
-    ///
-    /// This method is safe to call from within executor.map() because it uses Rayon's install()
-    /// which properly manages the pool context, and the closure can use work-stealing scope.
-    ///
-    /// For single-threaded executor, just runs the closure directly.
-    pub fn install_and_scope<OP, R>(&self, op: OP) -> R
-    where
-        OP: FnOnce() -> R + Send,
-        R: Send,
-    {
-        match self {
-            Executor::SingleThread => op(),
-            Executor::ThreadPool(pool) => pool.install(op),
-        }
-    }
-
-    /// Get access to the underlying Rayon thread pool for scope-based operations.
-    ///
-    /// Returns None for single-threaded executor.
-    /// This is useful when you need direct access to Rayon's scope for nested parallelism.
-    pub fn thread_pool(&self) -> Option<&ThreadPool> {
-        match self {
-            Executor::SingleThread => None,
-            Executor::ThreadPool(pool) => Some(pool),
-        }
-    }
 }
 
 #[cfg(test)]
