@@ -24,11 +24,12 @@ impl Executor {
 
     /// Creates an Executor that dispatches the tasks in a thread pool.
     pub fn multi_thread(num_threads: usize, prefix: &'static str) -> crate::Result<Executor> {
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .thread_name(move |num| format!("{prefix}{num}"))
-            .build()?;
-        Ok(Executor::ThreadPool(pool))
+        Ok(Executor::single_thread())
+        //let pool = ThreadPoolBuilder::new()
+        //    .num_threads(num_threads)
+        //    .thread_name(move |num| format!("{prefix}{num}"))
+        //    .build()?;
+        //Ok(Executor::ThreadPool(pool))
     }
 
     /// Perform a map in the thread pool.
