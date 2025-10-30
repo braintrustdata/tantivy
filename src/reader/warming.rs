@@ -134,9 +134,13 @@ impl WarmingStateInner {
             return Ok(false);
         }
         let weak_inner = Arc::downgrade(this);
+        let parent_span = tracing::Span::current();
         let handle = std::thread::Builder::new()
             .name("tantivy-warm-gc".to_owned())
-            .spawn(|| Self::gc_loop(weak_inner))
+            .spawn(move || {
+                let _parent_span_guard = parent_span.enter();
+                Self::gc_loop(weak_inner)
+            })
             .map_err(|_| {
                 TantivyError::SystemError("Failed to spawn warmer GC thread".to_owned())
             })?;
