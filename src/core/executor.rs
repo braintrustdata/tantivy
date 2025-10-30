@@ -53,13 +53,17 @@ impl Executor {
                 let num_fruits = args.len();
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
+                    let parent_span = tracing::Span::current();
                     pool.scope(|scope| {
+                        let _parent_span_guard = parent_span.enter();
                         for (idx, arg) in args.into_iter().enumerate() {
                             // We name references for f and fruit_sender_ref because we do not
                             // want these two to be moved into the closure.
                             let f_ref = &f;
                             let fruit_sender_ref = &fruit_sender;
+                            let parent_span = tracing::Span::current();
                             scope.spawn(move |_| {
+                                let _parent_span_guard = parent_span.enter();
                                 let fruit = f_ref(arg);
                                 if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
                                     error!(
@@ -112,7 +116,9 @@ impl Executor {
                 })?;
             }
             Executor::ThreadPool(pool) => {
+                let parent_span = tracing::Span::current();
                 pool.spawn(move || {
+                    let _parent_span_guard = parent_span.enter();
                     let res = op();
                     match fruit_sender.send(res) {
                         Ok(_) => (),
@@ -149,7 +155,13 @@ impl Executor {
     {
         match self {
             Executor::SingleThread => op(),
-            Executor::ThreadPool(pool) => pool.install(op),
+            Executor::ThreadPool(pool) => {
+                let parent_span = tracing::Span::current();
+                pool.install(move || {
+                    let _parent_span_guard = parent_span.enter();
+                    op()
+                })
+            },
         }
     }
 

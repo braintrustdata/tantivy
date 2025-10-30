@@ -223,6 +223,8 @@ impl SegmentReader {
                 return SegmentReader::open(segment);
             };
 
+            let parent_span = tracing::Span::current();
+
             // Use nested rayon::join for work-stealing parallelism
             // Structure: ((file1, file2), ((file3, file4), (file5, file6)))
             let (
@@ -235,12 +237,14 @@ impl SegmentReader {
                     || {
                         rayon::join(
                             || {
+                                let _parent_span_guard = parent_span.enter();
                                 let segment_ref = SegmentRef::new(segment);
                                 let termdict_file =
                                     segment_ref.open_read(SegmentComponent::Terms)?;
                                 Ok::<_, TantivyError>(CompositeFile::open(&termdict_file)?)
                             },
                             || {
+                                let _parent_span_guard = parent_span.enter();
                                 let segment_ref = SegmentRef::new(segment);
                                 Ok::<_, TantivyError>(segment_ref.open_read(SegmentComponent::Store)?)
                             },
@@ -251,6 +255,7 @@ impl SegmentReader {
                             || {
                                 rayon::join(
                                     || {
+                                        let _parent_span_guard = parent_span.enter();
                                         crate::fail_point!("SegmentReader::open#middle");
                                         let segment_ref = SegmentRef::new(segment);
                                         let postings_file =
@@ -258,6 +263,7 @@ impl SegmentReader {
                                         Ok::<_, TantivyError>(CompositeFile::open(&postings_file)?)
                                     },
                                     || {
+                                        let _parent_span_guard = parent_span.enter();
                                         let segment_ref = SegmentRef::new(segment);
                                         if let Ok(positions_file) =
                                             segment_ref.open_read(SegmentComponent::Positions)
@@ -272,16 +278,18 @@ impl SegmentReader {
                             || {
                                 rayon::join(
                                     || {
+                                        let _parent_span_guard = parent_span.enter();
                                         let segment_ref = SegmentRef::new(segment);
                                         let fast_fields_data =
                                             segment_ref.open_read(SegmentComponent::FastFields)?;
                                         Ok::<_, TantivyError>(FastFieldReaders::open(fast_fields_data, schema.clone())?)
                                     },
                                     || {
+                                        let _parent_span_guard = parent_span.enter();
                                         let segment_ref = SegmentRef::new(segment);
                                         let fieldnorm_data =
                                             segment_ref.open_read(SegmentComponent::FieldNorms)?;
-                                        Ok::<_, TantivyError>(FieldNormReaders::open(fieldnorm_data)?)
+                                        FieldNormReaders::open(fieldnorm_data)
                                     },
                                 )
                             },
