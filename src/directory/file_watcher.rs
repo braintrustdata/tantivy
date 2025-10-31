@@ -39,10 +39,12 @@ impl FileWatcher {
         let path = self.path.clone();
         let callbacks = self.callbacks.clone();
         let state = self.state.clone();
+        let parent_span = tracing::Span::current();
 
         thread::Builder::new()
             .name("thread-tantivy-meta-file-watcher".to_string())
             .spawn(move || {
+                let _parent_span_guard = parent_span.enter();
                 let mut current_checksum_opt = None;
 
                 while state.load(Ordering::SeqCst) == 1 {
