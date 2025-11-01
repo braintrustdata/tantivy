@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -225,6 +227,45 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// `OnCommitWithDelay` `ReloadPolicy`. Not implementing watch in a `Directory` only prevents
     /// the `OnCommitWithDelay` `ReloadPolicy` to work properly.
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
+
+    /// Async version of `get_file_handle`.
+    /// Default implementation calls the sync version.
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn FileHandle>, OpenReadError>> + Send + 'a>> {
+        Box::pin(async move { self.get_file_handle(path) })
+    }
+
+    /// Async version of `open_read`.
+    /// Default implementation calls the sync version.
+    fn open_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<FileSlice, OpenReadError>> + Send + 'a>> {
+        Box::pin(async move {
+            let file_handle = self.get_file_handle_async(path).await?;
+            Ok(FileSlice::new(file_handle))
+        })
+    }
+
+    /// Async version of `atomic_read`.
+    /// Default implementation calls the sync version.
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, OpenReadError>> + Send + 'a>> {
+        Box::pin(async move { self.atomic_read(path) })
+    }
+
+    /// Async version of `acquire_lock`.
+    /// Default implementation calls the sync version.
+    fn acquire_lock_async<'a>(
+        &'a self,
+        lock: &'a Lock,
+    ) -> Pin<Box<dyn Future<Output = Result<DirectoryLock, LockError>> + Send + 'a>> {
+        Box::pin(async move { self.acquire_lock(lock) })
+    }
 }
 
 /// DirectoryClone

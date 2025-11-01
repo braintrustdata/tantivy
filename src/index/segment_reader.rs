@@ -6,6 +6,7 @@ use std::{fmt, io};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
+use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
@@ -181,6 +182,101 @@ impl SegmentReader {
         } else {
             None
         };
+
+        let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
+
+        let max_doc = segment.meta().max_doc();
+        let num_docs = alive_bitset_opt
+            .as_ref()
+            .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
+            .unwrap_or(max_doc);
+
+        Ok(SegmentReader {
+            inv_idx_reader_cache: Default::default(),
+            num_docs,
+            max_doc,
+            termdict_composite,
+            postings_composite,
+            fast_fields_readers,
+            fieldnorm_readers,
+            segment_id: segment.id(),
+            delete_opstamp: segment.meta().delete_opstamp(),
+            store_file,
+            alive_bitset_opt,
+            positions_composite,
+            schema,
+        })
+    }
+
+    /// Async version of `open_with_custom_alive_set`.
+    pub async fn open_with_custom_alive_set_async(
+        segment: &Segment,
+        custom_bitset: Option<AliveBitSet>,
+    ) -> crate::Result<SegmentReader> {
+        let (
+            termdict_file,
+            store_file,
+            postings_file,
+            fast_fields_data,
+            fieldnorm_data,
+            positions_file_opt,
+        ) = futures::try_join!(
+            segment.open_read_async(SegmentComponent::Terms),
+            segment.open_read_async(SegmentComponent::Store),
+            segment.open_read_async(SegmentComponent::Postings),
+            segment.open_read_async(SegmentComponent::FastFields),
+            segment.open_read_async(SegmentComponent::FieldNorms),
+            async {
+                match segment.open_read_async(SegmentComponent::Positions).await {
+                    Ok(file) => Ok(Some(file)),
+                    Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            }
+        )?;
+
+        let schema = segment.schema();
+
+        crate::fail_point!("SegmentReader::open#middle");
+
+        let (
+            termdict_composite,
+            postings_composite,
+            positions_composite,
+            fast_fields_readers,
+            fieldnorm_readers,
+            original_bitset,
+        ) = futures::try_join!(
+            async {
+                Ok::<_, TantivyError>(CompositeFile::open_async(&termdict_file).await?)
+            },
+            async {
+                Ok::<_, TantivyError>(CompositeFile::open_async(&postings_file).await?)
+            },
+            async {
+                if let Some(positions_file) = positions_file_opt {
+                    Ok::<_, TantivyError>(CompositeFile::open_async(&positions_file).await?)
+                } else {
+                    Ok(CompositeFile::empty())
+                }
+            },
+            async {
+                Ok::<_, TantivyError>(
+                    FastFieldReaders::open_async(fast_fields_data, schema.clone()).await?
+                )
+            },
+            async { FieldNormReaders::open_async(fieldnorm_data).await },
+            async {
+                if segment.meta().has_deletes() {
+                    let alive_doc_file_slice =
+                        segment.open_read_async(SegmentComponent::Delete).await?;
+                    let alive_doc_data = alive_doc_file_slice.read_bytes_async().await?;
+                    Ok::<_, TantivyError>(Some(AliveBitSet::open(alive_doc_data)))
+                } else {
+                    Ok(None)
+                }
+            }
+        )?;
 
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 

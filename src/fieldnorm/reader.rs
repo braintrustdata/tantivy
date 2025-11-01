@@ -26,6 +26,14 @@ impl FieldNormReaders {
         })
     }
 
+    /// Async version of `open`.
+    pub async fn open_async(file: FileSlice) -> crate::Result<FieldNormReaders> {
+        let data = CompositeFile::open_async(&file).await?;
+        Ok(FieldNormReaders {
+            data: Arc::new(data),
+        })
+    }
+
     /// Returns the FieldNormReader for a specific field.
     pub fn get_field(&self, field: Field) -> crate::Result<Option<FieldNormReader>> {
         if let Some(file) = self.data.open_read(field) {
@@ -89,6 +97,12 @@ impl FieldNormReader {
     /// Opens a field norm reader given its file.
     pub fn open(fieldnorm_file: FileSlice) -> crate::Result<Self> {
         let data = fieldnorm_file.read_bytes()?;
+        Ok(FieldNormReader::new(data))
+    }
+
+    /// Async version of `open`.
+    pub async fn open_async(fieldnorm_file: FileSlice) -> crate::Result<Self> {
+        let data = fieldnorm_file.read_bytes_async().await?;
         Ok(FieldNormReader::new(data))
     }
 

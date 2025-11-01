@@ -46,6 +46,28 @@ fn load_metas(
         .map_err(From::from)
 }
 
+async fn load_metas_async(
+    directory: &dyn Directory,
+    inventory: &SegmentMetaInventory,
+) -> crate::Result<IndexMeta> {
+    let meta_data = directory.atomic_read_async(&META_FILEPATH).await?;
+    let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
+        error!("Meta data is not valid utf8.");
+        DataCorruption::new(
+            META_FILEPATH.to_path_buf(),
+            "Meta file does not contain valid utf8 file.".to_string(),
+        )
+    })?;
+    IndexMeta::deserialize(&meta_string, inventory)
+        .map_err(|e| {
+            DataCorruption::new(
+                META_FILEPATH.to_path_buf(),
+                format!("Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"),
+            )
+        })
+        .map_err(From::from)
+}
+
 /// Save the index meta file.
 /// This operation is atomic :
 /// Either
@@ -541,6 +563,11 @@ impl Index {
         load_metas(self.directory(), &self.inventory)
     }
 
+    /// Async version of `load_metas`.
+    pub async fn load_metas_async(&self) -> crate::Result<IndexMeta> {
+        load_metas_async(self.directory(), &self.inventory).await
+    }
+
     /// Open a new index writer. Attempts to acquire a lockfile.
     ///
     /// The lockfile should be deleted on drop, but it is possible
@@ -673,6 +700,21 @@ impl Index {
     /// `SegmentMeta` from the last commit.
     pub fn searchable_segment_metas(&self) -> crate::Result<Vec<SegmentMeta>> {
         Ok(self.load_metas()?.segments)
+    }
+
+    /// Async version of `searchable_segment_metas`.
+    pub async fn searchable_segment_metas_async(&self) -> crate::Result<Vec<SegmentMeta>> {
+        Ok(self.load_metas_async().await?.segments)
+    }
+
+    /// Async version of `searchable_segments`.
+    pub async fn searchable_segments_async(&self) -> crate::Result<Vec<Segment>> {
+        Ok(self
+            .searchable_segment_metas_async()
+            .await?
+            .into_iter()
+            .map(|segment_meta| self.segment(segment_meta))
+            .collect())
     }
 
     /// Returns the list of segment ids that are searchable.

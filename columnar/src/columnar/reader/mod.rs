@@ -129,6 +129,33 @@ impl ColumnarReader {
         })
     }
 
+    /// Async version of `open`.
+    pub async fn open_async<F>(file_slice: F) -> io::Result<ColumnarReader>
+    where
+        FileSlice: From<F>,
+    {
+        Self::open_inner_async(file_slice.into()).await
+    }
+
+    async fn open_inner_async(file_slice: FileSlice) -> io::Result<ColumnarReader> {
+        let (file_slice_without_sstable_len, footer_slice) = file_slice
+            .split_from_end(mem::size_of::<u64>() + 4 + format_version::VERSION_FOOTER_NUM_BYTES);
+        let footer_bytes = footer_slice.read_bytes_async().await?;
+        let sstable_len = u64::deserialize(&mut &footer_bytes[0..8])?;
+        let num_rows = u32::deserialize(&mut &footer_bytes[8..12])?;
+        let version_footer_bytes: [u8; format_version::VERSION_FOOTER_NUM_BYTES] =
+            footer_bytes[12..].try_into().unwrap();
+        let _version = format_version::parse_footer(version_footer_bytes)?;
+        let (column_data, sstable) =
+            file_slice_without_sstable_len.split_from_end(sstable_len as usize);
+        let column_dictionary = Dictionary::open_async(sstable).await?;
+        Ok(ColumnarReader {
+            column_dictionary,
+            column_data,
+            num_rows,
+        })
+    }
+
     pub fn num_rows(&self) -> RowId {
         self.num_rows
     }
