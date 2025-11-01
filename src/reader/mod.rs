@@ -283,16 +283,12 @@ impl InnerIndexReader {
         let searchable_segments = index.searchable_segments_async().await?;
 
         // Open all segments concurrently
-        let futures: Vec<_> = searchable_segments
-            .iter()
-            .map(|segment| SegmentReader::open_with_custom_alive_set_async(segment, None))
-            .collect();
-
-        // Wait for all segments to open
-        let mut segment_readers = Vec::with_capacity(futures.len());
-        for future in futures {
-            segment_readers.push(future.await?);
-        }
+        let segment_readers = futures::future::try_join_all(
+            searchable_segments
+                .iter()
+                .map(|segment| SegmentReader::open_with_custom_alive_set_async(segment, None)),
+        )
+        .await?;
 
         Ok(segment_readers)
     }
