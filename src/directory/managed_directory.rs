@@ -288,7 +288,6 @@ impl Directory for ManagedDirectory {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<FileSlice, OpenReadError>> + Send + 'a>,
     > {
-        let path_buf = path.to_path_buf();
         Box::pin(async move {
             let file_slice = self.directory.open_read_async(path).await?;
             let (footer, reader) = Footer::extract_footer_async(file_slice)
