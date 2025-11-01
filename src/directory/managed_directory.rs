@@ -291,7 +291,8 @@ impl Directory for ManagedDirectory {
         let path_buf = path.to_path_buf();
         Box::pin(async move {
             let file_slice = self.directory.open_read_async(path).await?;
-            let (footer, reader) = Footer::extract_footer(file_slice)
+            let (footer, reader) = Footer::extract_footer_async(file_slice)
+                .await
                 .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
             footer.is_compatible()?;
             Ok(reader)
