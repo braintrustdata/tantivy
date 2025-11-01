@@ -140,6 +140,13 @@ impl SegmentReader {
         StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
+    pub async fn get_store_reader_async(
+        &self,
+        cache_num_blocks: usize,
+    ) -> io::Result<StoreReader> {
+        StoreReader::open_async(self.store_file.clone(), cache_num_blocks).await
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)

@@ -319,13 +319,16 @@ impl InnerIndexReader {
         );
 
         let schema = index.schema();
-        let searcher = Arc::new(SearcherInner::new(
-            schema,
-            index.clone(),
-            segment_readers,
-            searcher_generation,
-            doc_store_cache_num_blocks,
-        )?);
+        let searcher = Arc::new(
+            SearcherInner::new_async(
+                schema,
+                index.clone(),
+                segment_readers,
+                searcher_generation,
+                doc_store_cache_num_blocks,
+            )
+            .await?,
+        );
 
         warming_state.warm_new_searcher_generation(&searcher.clone().into())?;
         Ok(searcher)
