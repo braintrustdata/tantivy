@@ -140,6 +140,7 @@ impl SegmentReader {
         StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
+    /// Async counterpart to [`SegmentReader::get_store_reader`].
     pub async fn get_store_reader_async(
         &self,
         cache_num_blocks: usize,

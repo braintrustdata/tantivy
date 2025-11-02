@@ -139,6 +139,7 @@ impl StoreReader {
         })
     }
 
+    /// Async counterpart to [`StoreReader::open`].
     pub async fn open_async(
         store_file: FileSlice,
         cache_num_blocks: usize,
