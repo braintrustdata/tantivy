@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io, thread};
@@ -275,8 +275,7 @@ pub trait DirectoryClone {
 }
 
 impl<T> DirectoryClone for T
-where
-    T: 'static + Directory + Clone,
+where T: 'static + Directory + Clone
 {
     fn box_clone(&self) -> Box<dyn Directory> {
         Box::new(self.clone())

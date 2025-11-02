@@ -141,7 +141,10 @@ impl SegmentReader {
     }
 
     /// Async counterpart to [`SegmentReader::get_store_reader`].
-    pub async fn get_store_reader_async(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
+    pub async fn get_store_reader_async(
+        &self,
+        cache_num_blocks: usize,
+    ) -> io::Result<StoreReader> {
         StoreReader::open_async(self.store_file.clone(), cache_num_blocks).await
     }
 
@@ -252,8 +255,12 @@ impl SegmentReader {
             fieldnorm_readers,
             original_bitset,
         ) = futures::try_join!(
-            async { Ok::<_, TantivyError>(CompositeFile::open_async(&termdict_file).await?) },
-            async { Ok::<_, TantivyError>(CompositeFile::open_async(&postings_file).await?) },
+            async {
+                Ok::<_, TantivyError>(CompositeFile::open_async(&termdict_file).await?)
+            },
+            async {
+                Ok::<_, TantivyError>(CompositeFile::open_async(&postings_file).await?)
+            },
             async {
                 if let Some(positions_file) = positions_file_opt {
                     Ok::<_, TantivyError>(CompositeFile::open_async(&positions_file).await?)
@@ -263,7 +270,7 @@ impl SegmentReader {
             },
             async {
                 Ok::<_, TantivyError>(
-                    FastFieldReaders::open_async(fast_fields_data, schema.clone()).await?,
+                    FastFieldReaders::open_async(fast_fields_data, schema.clone()).await?
                 )
             },
             async { FieldNormReaders::open_async(fieldnorm_data).await },

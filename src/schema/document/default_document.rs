@@ -33,9 +33,7 @@ impl Document for TantivyDocument {
 
 impl DocumentDeserialize for TantivyDocument {
     fn deserialize<'de, D>(mut deserializer: D) -> Result<Self, DeserializeError>
-    where
-        D: DocumentDeserializer<'de>,
-    {
+    where D: DocumentDeserializer<'de> {
         let mut field_values = Vec::with_capacity(deserializer.size_hint());
 
         while let Some((field, value)) = deserializer.next_field()? {
@@ -99,9 +97,7 @@ impl TantivyDocument {
 
     /// Adding a facet to the document.
     pub fn add_facet<F>(&mut self, field: Field, path: F)
-    where
-        Facet: From<F>,
-    {
+    where Facet: From<F> {
         let facet = Facet::from(path);
         let value = OwnedValue::Facet(facet);
         self.add_field_value(field, value);
