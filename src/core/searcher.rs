@@ -3,8 +3,11 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 use crate::collector::Collector;
-use futures::future::try_join_all;
+#[cfg(feature = "quickwit")]
+use crate::collector::SegmentCollector;
 use crate::core::Executor;
+#[cfg(feature = "quickwit")]
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
@@ -12,6 +15,9 @@ use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
 use crate::{DocAddress, Index, Opstamp, SegmentId, TrackedObject};
+#[cfg(feature = "quickwit")]
+use crate::{TantivyError, TERMINATED};
+use futures::future::try_join_all;
 
 /// Identifies the searcher generation accessed by a [`Searcher`].
 ///
@@ -151,6 +157,81 @@ impl Searcher {
             total_doc_freq += u64::from(doc_freq);
         }
         Ok(total_doc_freq)
+    }
+
+    /// Minimal asynchronous search entry point.
+    #[cfg(feature = "quickwit")]
+    pub async fn search_async<C: Collector>(
+        &self,
+        query: &dyn Query,
+        collector: &C,
+    ) -> crate::Result<C::Fruit> {
+        let requires_scoring = collector.requires_scoring();
+        let enabled_scoring = if requires_scoring {
+            EnableScoring::enabled_from_searcher(self)
+        } else {
+            EnableScoring::disabled_from_searcher(self)
+        };
+        let weight = query.weight(enabled_scoring)?;
+        let async_weight = weight.as_async_weight().ok_or_else(|| {
+            TantivyError::InvalidArgument("Weight does not support async search".to_string())
+        })?;
+        let mut fruits = Vec::new();
+        for (segment_ord, segment_reader) in self.segment_readers().iter().cloned().enumerate() {
+            let mut segment_collector =
+                collector.for_segment(segment_ord as u32, &segment_reader)?;
+            let mut scorer = async_weight
+                .scorer_async(segment_reader.clone(), 1.0)
+                .await?;
+            let alive_bitset_opt = segment_reader.alive_bitset().cloned();
+            if requires_scoring {
+                let scorer_mut = scorer.as_mut();
+                let mut doc = scorer_mut.doc();
+                match alive_bitset_opt {
+                    Some(alive_bitset) => {
+                        while doc != TERMINATED {
+                            let score = scorer_mut.score();
+                            if alive_bitset.is_alive(doc) {
+                                segment_collector.collect(doc, score);
+                            }
+                            doc = scorer_mut.advance();
+                        }
+                    }
+                    None => {
+                        while doc != TERMINATED {
+                            let score = scorer_mut.score();
+                            segment_collector.collect(doc, score);
+                            doc = scorer_mut.advance();
+                        }
+                    }
+                }
+            } else {
+                let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+                let scorer_mut = scorer.as_mut();
+                match alive_bitset_opt {
+                    Some(alive_bitset) => loop {
+                        let num_items = scorer_mut.fill_buffer(&mut buffer);
+                        for doc in buffer[..num_items].iter().copied() {
+                            if alive_bitset.is_alive(doc) {
+                                segment_collector.collect(doc, 0.0);
+                            }
+                        }
+                        if num_items != buffer.len() {
+                            break;
+                        }
+                    },
+                    None => loop {
+                        let num_items = scorer_mut.fill_buffer(&mut buffer);
+                        segment_collector.collect_block(&buffer[..num_items]);
+                        if num_items != buffer.len() {
+                            break;
+                        }
+                    },
+                }
+            }
+            fruits.push(segment_collector.harvest());
+        }
+        collector.merge_fruits(fruits)
     }
 
     /// Return the list of segment readers
@@ -309,9 +390,9 @@ impl SearcherInner {
             generation.segments(),
             "Set of segments referenced by this Searcher and its SearcherGeneration must match"
         );
-        let store_reader_futures = segment_readers
-            .iter()
-            .map(|segment_reader| segment_reader.get_store_reader_async(doc_store_cache_num_blocks));
+        let store_reader_futures = segment_readers.iter().map(|segment_reader| {
+            segment_reader.get_store_reader_async(doc_store_cache_num_blocks)
+        });
         let store_readers = try_join_all(store_reader_futures).await?;
 
         Ok(SearcherInner {
@@ -332,5 +413,118 @@ impl fmt::Debug for Searcher {
             .map(SegmentReader::segment_id)
             .collect::<Vec<_>>();
         write!(f, "Searcher({segment_ids:?})")
+    }
+}
+
+#[cfg(all(test, feature = "quickwit"))]
+mod tests {
+    use futures::executor::block_on;
+
+    use crate::collector::{Collector, SegmentCollector};
+    use crate::query::TermQuery;
+    use crate::schema::{IndexRecordOption, Schema, TEXT};
+    use crate::{doc, DocAddress, Index, Term};
+
+    #[test]
+    fn test_search_async_term_query_count() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(text_field => "hello world"))?;
+            writer.add_document(doc!(text_field => "goodbye world"))?;
+            writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let term_query = TermQuery::new(
+            Term::from_field_text(text_field, "hello"),
+            IndexRecordOption::Basic,
+        );
+        let docs = block_on(searcher.search_async(&term_query, &DocIdsCollector))?;
+        assert_eq!(docs, vec![DocAddress::new(0, 0)]);
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct DocIdsCollector;
+
+    impl Collector for DocIdsCollector {
+        type Fruit = Vec<DocAddress>;
+
+        type Child = DocIdsSegmentCollector;
+
+        fn for_segment(
+            &self,
+            segment_local_id: crate::SegmentOrdinal,
+            _segment: &crate::SegmentReader,
+        ) -> crate::Result<Self::Child> {
+            Ok(DocIdsSegmentCollector {
+                segment_ord: segment_local_id,
+                docs: Vec::new(),
+            })
+        }
+
+        fn requires_scoring(&self) -> bool {
+            false
+        }
+
+        fn merge_fruits(
+            &self,
+            segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+        ) -> crate::Result<Self::Fruit> {
+            Ok(segment_fruits.into_iter().flatten().collect())
+        }
+    }
+
+    struct DocIdsSegmentCollector {
+        segment_ord: crate::SegmentOrdinal,
+        docs: Vec<DocAddress>,
+    }
+
+    impl SegmentCollector for DocIdsSegmentCollector {
+        type Fruit = Vec<DocAddress>;
+
+        fn collect(&mut self, doc: crate::DocId, _score: crate::Score) {
+            self.docs.push(DocAddress::new(self.segment_ord, doc));
+        }
+
+        fn collect_block(&mut self, docs: &[crate::DocId]) {
+            self.docs.extend(
+                docs.iter()
+                    .copied()
+                    .map(|doc| DocAddress::new(self.segment_ord, doc)),
+            );
+        }
+
+        fn harvest(self) -> Self::Fruit {
+            self.docs
+        }
+    }
+
+    #[test]
+    fn test_search_async_multiple_docs() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(text_field => "hello world"))?;
+            writer.add_document(doc!(text_field => "hello rust"))?;
+            writer.add_document(doc!(text_field => "goodbye world"))?;
+            writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let term_query = TermQuery::new(
+            Term::from_field_text(text_field, "hello"),
+            IndexRecordOption::Basic,
+        );
+        let docs = block_on(searcher.search_async(&term_query, &DocIdsCollector))?;
+        assert_eq!(docs, vec![DocAddress::new(0, 0), DocAddress::new(0, 1)]);
+        Ok(())
     }
 }

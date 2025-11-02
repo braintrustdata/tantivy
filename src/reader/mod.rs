@@ -120,7 +120,8 @@ impl IndexReaderBuilder {
             self.index,
             warming_state,
             searcher_generation_inventory,
-        ).await?;
+        )
+        .await?;
         let inner_reader_arc = Arc::new(inner_reader);
         let watch_handle_opt: Option<WatchHandle> = match self.reload_policy {
             ReloadPolicy::Manual => {
@@ -248,7 +249,8 @@ impl InnerIndexReader {
             &warming_state,
             &searcher_generation_counter,
             &searcher_generation_inventory,
-        ).await?;
+        )
+        .await?;
         Ok(InnerIndexReader {
             doc_store_cache_num_blocks,
             index,

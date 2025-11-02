@@ -82,7 +82,9 @@ impl<'a> Value<'a> for &'a OwnedValue {
 
 impl ValueDeserialize for OwnedValue {
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
-    where D: ValueDeserializer<'de> {
+    where
+        D: ValueDeserializer<'de>,
+    {
         struct Visitor;
 
         impl ValueVisitor for Visitor {
@@ -136,7 +138,9 @@ impl ValueDeserialize for OwnedValue {
             }
 
             fn visit_array<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-            where A: ArrayAccess<'de> {
+            where
+                A: ArrayAccess<'de>,
+            {
                 let mut elements = Vec::with_capacity(access.size_hint());
 
                 while let Some(value) = access.next_element()? {
@@ -147,7 +151,9 @@ impl ValueDeserialize for OwnedValue {
             }
 
             fn visit_object<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
-            where A: ObjectAccess<'de> {
+            where
+                A: ObjectAccess<'de>,
+            {
                 let mut elements = BTreeMap::new();
 
                 while let Some((key, value)) = access.next_entry()? {
@@ -166,7 +172,9 @@ impl Eq for OwnedValue {}
 
 impl serde::Serialize for OwnedValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         match *self {
             OwnedValue::Null => serializer.serialize_unit(),
             OwnedValue::Str(ref v) => serializer.serialize_str(v),
@@ -196,7 +204,9 @@ impl serde::Serialize for OwnedValue {
 
 impl<'de> serde::Deserialize<'de> for OwnedValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         struct ValueVisitor;
 
         impl<'de> serde::de::Visitor<'de> for ValueVisitor {
@@ -231,12 +241,16 @@ impl<'de> serde::Deserialize<'de> for OwnedValue {
             }
 
             fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where E: serde::de::Error {
+            where
+                E: serde::de::Error,
+            {
                 Ok(OwnedValue::Null)
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where A: SeqAccess<'de> {
+            where
+                A: SeqAccess<'de>,
+            {
                 let mut elements = Vec::with_capacity(seq.size_hint().unwrap_or_default());
 
                 while let Some(value) = seq.next_element()? {
@@ -247,7 +261,9 @@ impl<'de> serde::Deserialize<'de> for OwnedValue {
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where A: MapAccess<'de> {
+            where
+                A: MapAccess<'de>,
+            {
                 let mut object = BTreeMap::new();
 
                 while let Some((key, value)) = map.next_entry()? {

@@ -1,8 +1,12 @@
+use std::any::Any;
+
 use super::Scorer;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
 use crate::query::Explanation;
 use crate::{DocId, DocSet, Score, TERMINATED};
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
 
 /// Iterates through all of the documents and scores matched by the DocSet
 /// `DocSet`.
@@ -63,7 +67,7 @@ pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
 /// for a given set of segments.
 ///
 /// See [`Query`](crate::query::Query).
-pub trait Weight: Send + Sync + 'static {
+pub trait Weight: Any + Send + Sync + 'static {
     /// Returns the scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score.
@@ -130,4 +134,19 @@ pub trait Weight: Send + Sync + 'static {
         for_each_pruning_scorer(scorer.as_mut(), threshold, callback);
         Ok(())
     }
+
+    #[cfg(feature = "quickwit")]
+    #[allow(unused_variables)]
+    fn as_async_weight(&self) -> Option<&dyn AsyncWeight> {
+        None
+    }
+}
+
+#[cfg(feature = "quickwit")]
+pub trait AsyncWeight: Weight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: SegmentReader,
+        boost: Score,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Scorer>>>;
 }

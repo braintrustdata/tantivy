@@ -65,6 +65,8 @@ pub use self::term_query::TermQuery;
 pub use self::union::Union;
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
+#[cfg(feature = "quickwit")]
+pub use self::weight::AsyncWeight;
 pub use self::weight::Weight;
 
 #[cfg(test)]

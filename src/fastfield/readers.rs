@@ -30,7 +30,10 @@ impl FastFieldReaders {
         Ok(FastFieldReaders { columnar, schema })
     }
 
-    pub(crate) async fn open_async(fast_field_file: FileSlice, schema: Schema) -> io::Result<FastFieldReaders> {
+    pub(crate) async fn open_async(
+        fast_field_file: FileSlice,
+        schema: Schema,
+    ) -> io::Result<FastFieldReaders> {
         let columnar = Arc::new(ColumnarReader::open_async(fast_field_file).await?);
         Ok(FastFieldReaders { columnar, schema })
     }

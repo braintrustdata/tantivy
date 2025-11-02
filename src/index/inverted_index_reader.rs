@@ -149,6 +149,24 @@ impl InvertedIndexReader {
         )
     }
 
+    #[cfg(feature = "quickwit")]
+    pub async fn read_block_postings_from_terminfo_async(
+        &self,
+        term_info: &TermInfo,
+        requested_option: IndexRecordOption,
+    ) -> io::Result<BlockSegmentPostings> {
+        let postings_data = self
+            .postings_file_slice
+            .slice(term_info.postings_range.clone());
+        BlockSegmentPostings::open_async(
+            term_info.doc_freq,
+            postings_data,
+            self.record_option,
+            requested_option,
+        )
+        .await
+    }
+
     /// Returns a posting object given a `term_info`.
     /// This method is for an advanced usage only.
     ///
@@ -171,6 +189,32 @@ impl InvertedIndexReader {
             } else {
                 None
             }
+        };
+        Ok(SegmentPostings::from_block_postings(
+            block_postings,
+            position_reader,
+        ))
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub async fn read_postings_from_terminfo_async(
+        &self,
+        term_info: &TermInfo,
+        option: IndexRecordOption,
+    ) -> io::Result<SegmentPostings> {
+        let option = option.downgrade(self.record_option);
+        let block_postings = self
+            .read_block_postings_from_terminfo_async(term_info, option)
+            .await?;
+        let position_reader = if option.has_positions() {
+            let positions_data = self
+                .positions_file_slice
+                .read_bytes_slice_async(term_info.positions_range.clone())
+                .await?;
+            let position_reader = PositionReader::open(positions_data)?;
+            Some(position_reader)
+        } else {
+            None
         };
         Ok(SegmentPostings::from_block_postings(
             block_postings,
@@ -204,6 +248,21 @@ impl InvertedIndexReader {
             .transpose()
     }
 
+    #[cfg(feature = "quickwit")]
+    pub async fn read_postings_async(
+        &self,
+        term: &Term,
+        option: IndexRecordOption,
+    ) -> io::Result<Option<SegmentPostings>> {
+        match self.get_term_info_async(term).await? {
+            Some(term_info) => self
+                .read_postings_from_terminfo_async(&term_info, option)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn read_postings_no_deletes(
         &self,
         term: &Term,
@@ -212,6 +271,21 @@ impl InvertedIndexReader {
         self.get_term_info(term)?
             .map(|term_info| self.read_postings_from_terminfo(&term_info, option))
             .transpose()
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub(crate) async fn read_postings_no_deletes_async(
+        &self,
+        term: &Term,
+        option: IndexRecordOption,
+    ) -> io::Result<Option<SegmentPostings>> {
+        match self.get_term_info_async(term).await? {
+            Some(term_info) => self
+                .read_postings_from_terminfo_async(&term_info, option)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Returns the number of documents containing the term.

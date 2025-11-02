@@ -6,9 +6,13 @@ use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
 use crate::query::weight::{for_each_docset_buffered, for_each_scorer};
+#[cfg(feature = "quickwit")]
+use crate::query::AsyncWeight;
 use crate::query::{Explanation, Scorer, Weight};
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, Term};
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
 
 pub struct TermWeight {
     term: Term,
@@ -21,6 +25,10 @@ impl Weight for TermWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         let term_scorer = self.specialized_scorer(reader, boost)?;
         Ok(Box::new(term_scorer))
+    }
+    #[cfg(feature = "quickwit")]
+    fn as_async_weight(&self) -> Option<&dyn AsyncWeight> {
+        Some(self)
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -88,6 +96,56 @@ impl Weight for TermWeight {
         let scorer = self.specialized_scorer(reader, 1.0)?;
         crate::query::boolean_query::block_wand_single_scorer(scorer, threshold, callback);
         Ok(())
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl TermWeight {
+    pub(crate) async fn specialized_scorer_async(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> crate::Result<TermScorer> {
+        let field = self.term.field();
+        let inverted_index = reader.inverted_index(field)?;
+        let fieldnorm_reader_opt = if self.scoring_enabled {
+            reader.fieldnorms_readers().get_field(field)?
+        } else {
+            None
+        };
+        let fieldnorm_reader =
+            fieldnorm_reader_opt.unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1));
+        let similarity_weight = self.similarity_weight.boost_by(boost);
+        let postings_opt = inverted_index
+            .read_postings_async(&self.term, self.index_record_option)
+            .await?;
+        if let Some(segment_postings) = postings_opt {
+            Ok(TermScorer::new(
+                segment_postings,
+                fieldnorm_reader,
+                similarity_weight,
+            ))
+        } else {
+            Ok(TermScorer::new(
+                SegmentPostings::empty(),
+                fieldnorm_reader,
+                similarity_weight,
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl AsyncWeight for TermWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: SegmentReader,
+        boost: Score,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Scorer>>> {
+        Box::pin(async move {
+            let scorer = self.specialized_scorer_async(&reader, boost).await?;
+            Ok(Box::new(scorer) as Box<dyn Scorer>)
+        })
     }
 }
 
