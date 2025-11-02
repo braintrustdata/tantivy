@@ -166,13 +166,12 @@ pub trait Collector: Sync + Send {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
 
+    /// Returns an async-aware variant of this collector when available.
     #[cfg(feature = "quickwit")]
     #[allow(unused_variables)]
     fn as_async_collector(
         &self,
-    ) -> Option<
-        &(dyn AsyncCollector<Fruit = Self::Fruit, Child = Self::Child> + '_),
-    > {
+    ) -> Option<&(dyn AsyncCollector<Fruit = Self::Fruit, Child = Self::Child> + '_)> {
         None
     }
 
@@ -407,18 +406,24 @@ where
 }
 
 #[cfg(feature = "quickwit")]
+/// Async counterpart to [`Collector`].
 pub trait AsyncCollector: Sync + Send {
+    /// Result type produced by the collector.
     type Fruit: Fruit;
+    /// Type of per-segment collector state.
     type Child: SegmentCollector;
 
+    /// Returns `true` if scoring is required.
     fn requires_scoring(&self) -> bool;
 
+    /// Creates a per-segment collector asynchronously.
     fn for_segment_async(
         &self,
         segment_local_id: SegmentOrdinal,
         segment: &SegmentReader,
     ) -> LocalBoxFuture<'_, crate::Result<Self::Child>>;
 
+    /// Merges per-segment results asynchronously.
     fn merge_fruits_async(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,

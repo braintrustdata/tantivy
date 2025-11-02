@@ -9,14 +9,14 @@ use crate::core::Executor;
 #[cfg(feature = "quickwit")]
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
-use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
+use crate::query::{Bm25StatisticsProvider, EnableScoring, Query, Weight};
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
-use crate::{DocAddress, Index, Opstamp, SegmentId, TrackedObject};
 #[cfg(feature = "quickwit")]
-use crate::{TantivyError, TERMINATED};
+use crate::TERMINATED;
+use crate::{DocAddress, Index, Opstamp, SegmentId, TrackedObject};
 use futures::future::try_join_all;
 
 /// Identifies the searcher generation accessed by a [`Searcher`].
@@ -166,20 +166,65 @@ impl Searcher {
         query: &dyn Query,
         collector: &C,
     ) -> crate::Result<C::Fruit> {
-        if let Some(custom_async_collector) = collector.as_async_collector() {
-            self.search_async_with_async_collector(query, custom_async_collector)
-                .await
+        self.search_async_internal(query, collector, None).await
+    }
+
+    /// Async search with a custom [Bm25StatisticsProvider].
+    #[cfg(feature = "quickwit")]
+    pub async fn search_with_statistics_provider_async<C: Collector>(
+        &self,
+        query: &dyn Query,
+        collector: &C,
+        statistics_provider: &dyn Bm25StatisticsProvider,
+    ) -> crate::Result<C::Fruit> {
+        self.search_async_internal(query, collector, Some(statistics_provider))
+            .await
+    }
+
+    #[cfg(feature = "quickwit")]
+    async fn search_async_internal<C: Collector>(
+        &self,
+        query: &dyn Query,
+        collector: &C,
+        statistics_provider: Option<&dyn Bm25StatisticsProvider>,
+    ) -> crate::Result<C::Fruit> {
+        let requires_scoring = collector.requires_scoring();
+        let enabled_scoring = if requires_scoring {
+            if let Some(statistics_provider) = statistics_provider {
+                EnableScoring::enabled_from_statistics_provider(statistics_provider, self)
+            } else {
+                EnableScoring::enabled_from_searcher(self)
+            }
         } else {
-            let adapter = SyncCollectorAdapter::new(collector);
-            self.search_async_with_async_collector(query, &adapter).await
+            EnableScoring::disabled_from_searcher(self)
+        };
+
+        let weight = query.weight(enabled_scoring)?;
+        if weight.as_async_weight().is_none() {
+            return if let Some(statistics_provider) = statistics_provider {
+                self.search_with_statistics_provider(query, collector, statistics_provider)
+            } else {
+                self.search(query, collector)
+            };
         }
+
+        if let Some(custom_async_collector) = collector.as_async_collector() {
+            return self
+                .search_async_with_async_collector(custom_async_collector, weight, requires_scoring)
+                .await;
+        }
+
+        let adapter = SyncCollectorAdapter::new(collector);
+        self.search_async_with_async_collector(&adapter, weight, requires_scoring)
+            .await
     }
 
     #[cfg(feature = "quickwit")]
     async fn search_async_with_async_collector<FruitT, Child>(
         &self,
-        query: &dyn Query,
         collector: &(dyn AsyncCollector<Fruit = FruitT, Child = Child> + '_),
+        weight: Box<dyn Weight>,
+        requires_scoring: bool,
     ) -> crate::Result<FruitT>
     where
         FruitT: crate::collector::Fruit,
@@ -187,17 +232,10 @@ impl Searcher {
     {
         use futures::stream::{FuturesUnordered, TryStreamExt};
 
-        let requires_scoring = collector.requires_scoring();
-        let enabled_scoring = if requires_scoring {
-            EnableScoring::enabled_from_searcher(self)
-        } else {
-            EnableScoring::disabled_from_searcher(self)
-        };
-        let weight = query.weight(enabled_scoring)?;
-        let async_weight = weight.as_async_weight().ok_or_else(|| {
-            TantivyError::InvalidArgument("Weight does not support async search".to_string())
-        })?;
-        let mut tasks = FuturesUnordered::new();
+        let async_weight = weight
+            .as_async_weight()
+            .expect("checked for async support in caller");
+        let tasks = FuturesUnordered::new();
         for (segment_ord, segment_reader) in self.segment_readers().iter().cloned().enumerate() {
             let collector_ref = collector;
             tasks.push(async move {
