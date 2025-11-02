@@ -4,7 +4,7 @@ use std::{fmt, io};
 
 use crate::collector::Collector;
 #[cfg(feature = "quickwit")]
-use crate::collector::SegmentCollector;
+use crate::collector::{AsyncCollector, SegmentCollector, SyncCollectorAdapter};
 use crate::core::Executor;
 #[cfg(feature = "quickwit")]
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
@@ -166,6 +166,27 @@ impl Searcher {
         query: &dyn Query,
         collector: &C,
     ) -> crate::Result<C::Fruit> {
+        if let Some(custom_async_collector) = collector.as_async_collector() {
+            self.search_async_with_async_collector(query, custom_async_collector)
+                .await
+        } else {
+            let adapter = SyncCollectorAdapter::new(collector);
+            self.search_async_with_async_collector(query, &adapter).await
+        }
+    }
+
+    #[cfg(feature = "quickwit")]
+    async fn search_async_with_async_collector<FruitT, Child>(
+        &self,
+        query: &dyn Query,
+        collector: &(dyn AsyncCollector<Fruit = FruitT, Child = Child> + '_),
+    ) -> crate::Result<FruitT>
+    where
+        FruitT: crate::collector::Fruit,
+        Child: SegmentCollector,
+    {
+        use futures::stream::{FuturesUnordered, TryStreamExt};
+
         let requires_scoring = collector.requires_scoring();
         let enabled_scoring = if requires_scoring {
             EnableScoring::enabled_from_searcher(self)
@@ -176,62 +197,67 @@ impl Searcher {
         let async_weight = weight.as_async_weight().ok_or_else(|| {
             TantivyError::InvalidArgument("Weight does not support async search".to_string())
         })?;
-        let mut fruits = Vec::new();
+        let mut tasks = FuturesUnordered::new();
         for (segment_ord, segment_reader) in self.segment_readers().iter().cloned().enumerate() {
-            let mut segment_collector =
-                collector.for_segment(segment_ord as u32, &segment_reader)?;
-            let mut scorer = async_weight
-                .scorer_async(segment_reader.clone(), 1.0)
-                .await?;
-            let alive_bitset_opt = segment_reader.alive_bitset().cloned();
-            if requires_scoring {
-                let scorer_mut = scorer.as_mut();
-                let mut doc = scorer_mut.doc();
-                match alive_bitset_opt {
-                    Some(alive_bitset) => {
-                        while doc != TERMINATED {
-                            let score = scorer_mut.score();
-                            if alive_bitset.is_alive(doc) {
+            let collector_ref = collector;
+            tasks.push(async move {
+                let mut segment_collector = collector_ref
+                    .for_segment_async(segment_ord as u32, &segment_reader)
+                    .await?;
+                let mut scorer = async_weight
+                    .scorer_async(segment_reader.clone(), 1.0)
+                    .await?;
+                let alive_bitset_opt = segment_reader.alive_bitset().cloned();
+                if requires_scoring {
+                    let scorer_mut = scorer.as_mut();
+                    let mut doc = scorer_mut.doc();
+                    match alive_bitset_opt {
+                        Some(alive_bitset) => {
+                            while doc != TERMINATED {
+                                let score = scorer_mut.score();
+                                if alive_bitset.is_alive(doc) {
+                                    segment_collector.collect(doc, score);
+                                }
+                                doc = scorer_mut.advance();
+                            }
+                        }
+                        None => {
+                            while doc != TERMINATED {
+                                let score = scorer_mut.score();
                                 segment_collector.collect(doc, score);
-                            }
-                            doc = scorer_mut.advance();
-                        }
-                    }
-                    None => {
-                        while doc != TERMINATED {
-                            let score = scorer_mut.score();
-                            segment_collector.collect(doc, score);
-                            doc = scorer_mut.advance();
-                        }
-                    }
-                }
-            } else {
-                let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-                let scorer_mut = scorer.as_mut();
-                match alive_bitset_opt {
-                    Some(alive_bitset) => loop {
-                        let num_items = scorer_mut.fill_buffer(&mut buffer);
-                        for doc in buffer[..num_items].iter().copied() {
-                            if alive_bitset.is_alive(doc) {
-                                segment_collector.collect(doc, 0.0);
+                                doc = scorer_mut.advance();
                             }
                         }
-                        if num_items != buffer.len() {
-                            break;
-                        }
-                    },
-                    None => loop {
-                        let num_items = scorer_mut.fill_buffer(&mut buffer);
-                        segment_collector.collect_block(&buffer[..num_items]);
-                        if num_items != buffer.len() {
-                            break;
-                        }
-                    },
+                    }
+                } else {
+                    let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+                    let scorer_mut = scorer.as_mut();
+                    match alive_bitset_opt {
+                        Some(alive_bitset) => loop {
+                            let num_items = scorer_mut.fill_buffer(&mut buffer);
+                            for doc in buffer[..num_items].iter().copied() {
+                                if alive_bitset.is_alive(doc) {
+                                    segment_collector.collect(doc, 0.0);
+                                }
+                            }
+                            if num_items != buffer.len() {
+                                break;
+                            }
+                        },
+                        None => loop {
+                            let num_items = scorer_mut.fill_buffer(&mut buffer);
+                            segment_collector.collect_block(&buffer[..num_items]);
+                            if num_items != buffer.len() {
+                                break;
+                            }
+                        },
+                    }
                 }
-            }
-            fruits.push(segment_collector.harvest());
+                crate::Result::Ok(segment_collector.harvest())
+            });
         }
-        collector.merge_fruits(fruits)
+        let fruits: Vec<<Child as SegmentCollector>::Fruit> = tasks.try_collect().await?;
+        collector.merge_fruits_async(fruits).await
     }
 
     /// Return the list of segment readers

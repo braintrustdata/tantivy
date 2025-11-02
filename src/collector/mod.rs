@@ -83,6 +83,9 @@
 
 use downcast_rs::impl_downcast;
 
+#[cfg(feature = "quickwit")]
+use futures::future::{ready, LocalBoxFuture};
+
 use crate::{DocId, Score, SegmentOrdinal, SegmentReader};
 
 mod count_collector;
@@ -162,6 +165,16 @@ pub trait Collector: Sync + Send {
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit>;
+
+    #[cfg(feature = "quickwit")]
+    #[allow(unused_variables)]
+    fn as_async_collector(
+        &self,
+    ) -> Option<
+        &(dyn AsyncCollector<Fruit = Self::Fruit, Child = Self::Child> + '_),
+    > {
+        None
+    }
 
     /// Created a segment collector and
     fn collect_segment(
@@ -390,6 +403,64 @@ where
             self.1.merge_fruits(two_fruits)?,
             self.2.merge_fruits(three_fruits)?,
         ))
+    }
+}
+
+#[cfg(feature = "quickwit")]
+pub trait AsyncCollector: Sync + Send {
+    type Fruit: Fruit;
+    type Child: SegmentCollector;
+
+    fn requires_scoring(&self) -> bool;
+
+    fn for_segment_async(
+        &self,
+        segment_local_id: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> LocalBoxFuture<'_, crate::Result<Self::Child>>;
+
+    fn merge_fruits_async(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> LocalBoxFuture<'_, crate::Result<Self::Fruit>>;
+}
+
+#[cfg(feature = "quickwit")]
+pub(crate) struct SyncCollectorAdapter<'a, C: Collector> {
+    collector: &'a C,
+}
+
+#[cfg(feature = "quickwit")]
+impl<'a, C: Collector> SyncCollectorAdapter<'a, C> {
+    pub(crate) fn new(collector: &'a C) -> Self {
+        Self { collector }
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl<'a, C: Collector> AsyncCollector for SyncCollectorAdapter<'a, C> {
+    type Fruit = C::Fruit;
+    type Child = C::Child;
+
+    fn requires_scoring(&self) -> bool {
+        self.collector.requires_scoring()
+    }
+
+    fn for_segment_async(
+        &self,
+        segment_local_id: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> LocalBoxFuture<'_, crate::Result<Self::Child>> {
+        let res = self.collector.for_segment(segment_local_id, segment);
+        Box::pin(ready(res))
+    }
+
+    fn merge_fruits_async(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> LocalBoxFuture<'_, crate::Result<Self::Fruit>> {
+        let res = self.collector.merge_fruits(segment_fruits);
+        Box::pin(ready(res))
     }
 }
 
