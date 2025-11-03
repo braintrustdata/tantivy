@@ -64,6 +64,7 @@ sketches-ddsketch = { version = "0.2.1", features = ["use_serde"] }
 futures-util = { version = "0.3.28", optional = true }
 futures = "0.3.21"
 fnv = "1.0.7"
+tokio = { version = "1.40.0", features = ["rt", "sync"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -115,7 +116,7 @@ zstd-compression = ["zstd"]
 failpoints = ["fail", "fail/failpoints"]
 unstable = [] # useful for benches.
 
-quickwit = ["sstable", "futures-util"]
+quickwit = ["sstable", "futures-util", "tokio"]
 
 # Compares only the hash of a string when indexing data. 
 # Increases indexing speed, but may lead to extremely rare missing terms, when there's a hash collision.

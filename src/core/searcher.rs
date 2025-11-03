@@ -228,86 +228,90 @@ impl Searcher {
     ) -> crate::Result<FruitT>
     where
         FruitT: crate::collector::Fruit,
-        Child: SegmentCollector,
+        Child: SegmentCollector + Send + 'static,
     {
+        use tracing::Instrument;
+
         let async_weight = weight
             .as_async_weight()
             .expect("checked for async support in caller");
 
-        // Clone data needed for spawning
-        let async_weight = Arc::new(async_weight);
-        let collector = Arc::new(collector);
-
-        let mut handles = Vec::new();
+        // Create all segment collectors and scorers first (these need the non-'static collector reference)
+        let mut segment_tasks = Vec::new();
         for (segment_ord, segment_reader) in self.segment_readers().iter().cloned().enumerate() {
-            let async_weight = async_weight.clone();
-            let collector = collector.clone();
+            let segment_collector = collector
+                .for_segment_async(segment_ord as u32, &segment_reader)
+                .await?;
+            let scorer = async_weight
+                .scorer_async(segment_reader.clone(), 1.0)
+                .await?;
+            segment_tasks.push((segment_collector, scorer, segment_reader));
+        }
 
-            // Spawn each segment search on a separate tokio task for true parallelism
-            let handle = tokio::spawn(async move {
-                let mut segment_collector = collector
-                    .for_segment_async(segment_ord as u32, &segment_reader)
-                    .await?;
-                let mut scorer = async_weight
-                    .scorer_async(segment_reader.clone(), 1.0)
-                    .await?;
-                let alive_bitset_opt = segment_reader.alive_bitset().cloned();
-                if requires_scoring {
-                    let scorer_mut = scorer.as_mut();
-                    let mut doc = scorer_mut.doc();
-                    match alive_bitset_opt {
-                        Some(alive_bitset) => {
-                            while doc != TERMINATED {
-                                let score = scorer_mut.score();
-                                if alive_bitset.is_alive(doc) {
+        // Now spawn each segment task for parallel execution
+        let mut handles = Vec::new();
+        for (mut segment_collector, mut scorer, segment_reader) in segment_tasks {
+            let handle = tokio::spawn(
+                async move {
+                    let alive_bitset_opt = segment_reader.alive_bitset().cloned();
+                    if requires_scoring {
+                        let scorer_mut = scorer.as_mut();
+                        let mut doc = scorer_mut.doc();
+                        match alive_bitset_opt {
+                            Some(alive_bitset) => {
+                                while doc != TERMINATED {
+                                    let score = scorer_mut.score();
+                                    if alive_bitset.is_alive(doc) {
+                                        segment_collector.collect(doc, score);
+                                    }
+                                    doc = scorer_mut.advance();
+                                }
+                            }
+                            None => {
+                                while doc != TERMINATED {
+                                    let score = scorer_mut.score();
                                     segment_collector.collect(doc, score);
-                                }
-                                doc = scorer_mut.advance();
-                            }
-                        }
-                        None => {
-                            while doc != TERMINATED {
-                                let score = scorer_mut.score();
-                                segment_collector.collect(doc, score);
-                                doc = scorer_mut.advance();
-                            }
-                        }
-                    }
-                } else {
-                    let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-                    let scorer_mut = scorer.as_mut();
-                    match alive_bitset_opt {
-                        Some(alive_bitset) => loop {
-                            let num_items = scorer_mut.fill_buffer(&mut buffer);
-                            for doc in buffer[..num_items].iter().copied() {
-                                if alive_bitset.is_alive(doc) {
-                                    segment_collector.collect(doc, 0.0);
+                                    doc = scorer_mut.advance();
                                 }
                             }
-                            if num_items != buffer.len() {
-                                break;
-                            }
-                        },
-                        None => loop {
-                            let num_items = scorer_mut.fill_buffer(&mut buffer);
-                            segment_collector.collect_block(&buffer[..num_items]);
-                            if num_items != buffer.len() {
-                                break;
-                            }
-                        },
+                        }
+                    } else {
+                        let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+                        let scorer_mut = scorer.as_mut();
+                        match alive_bitset_opt {
+                            Some(alive_bitset) => loop {
+                                let num_items = scorer_mut.fill_buffer(&mut buffer);
+                                for doc in buffer[..num_items].iter().copied() {
+                                    if alive_bitset.is_alive(doc) {
+                                        segment_collector.collect(doc, 0.0);
+                                    }
+                                }
+                                if num_items != buffer.len() {
+                                    break;
+                                }
+                            },
+                            None => loop {
+                                let num_items = scorer_mut.fill_buffer(&mut buffer);
+                                segment_collector.collect_block(&buffer[..num_items]);
+                                if num_items != buffer.len() {
+                                    break;
+                                }
+                            },
+                        }
                     }
+                    segment_collector.harvest()
                 }
-                crate::Result::Ok(segment_collector.harvest())
-            });
+                .instrument(tracing::info_span!("segment_search")),
+            );
             handles.push(handle);
         }
 
-        // Wait for all spawned tasks to complete
+        // Wait for all parallel tasks to complete
         let mut fruits = Vec::new();
         for handle in handles {
             let fruit = handle.await.map_err(|e| {
                 crate::TantivyError::InternalError(format!("Task join error: {}", e))
-            })??;
+            })?;
             fruits.push(fruit);
         }
 
