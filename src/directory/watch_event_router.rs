@@ -81,9 +81,11 @@ impl WatchCallbackList {
             let _ = sender.send(Ok(()));
             return result;
         }
+        let parent_span = tracing::Span::current();
         let spawn_res = std::thread::Builder::new()
             .name("watch-callbacks".to_string())
             .spawn(move || {
+                let _parent_span_guard = parent_span.enter();
                 for callback in callbacks {
                     callback.call();
                 }
