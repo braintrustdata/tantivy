@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{fmt, io};
+use tracing::instrument;
 
 use crate::collector::Collector;
 #[cfg(feature = "quickwit")]
@@ -171,6 +172,7 @@ impl Searcher {
 
     /// Async search with a custom [Bm25StatisticsProvider].
     #[cfg(feature = "quickwit")]
+    #[instrument(skip(self, query, collector, statistics_provider))]
     pub async fn search_with_statistics_provider_async<C: Collector>(
         &self,
         query: &dyn Query,
@@ -182,6 +184,7 @@ impl Searcher {
     }
 
     #[cfg(feature = "quickwit")]
+    #[instrument(skip(self, query, collector, statistics_provider))]
     async fn search_async_internal<C: Collector>(
         &self,
         query: &dyn Query,
@@ -201,10 +204,13 @@ impl Searcher {
 
         let weight = query.weight(enabled_scoring)?;
         if weight.as_async_weight().is_none() {
+            eprintln!("NO ASYNC WEIGHT FOR THIS QUERY: {:?}", query);
             return if let Some(statistics_provider) = statistics_provider {
-                self.search_with_statistics_provider(query, collector, statistics_provider)
+                tracing::info_span!("synchronous search with statistics").in_scope(|| {
+                    self.search_with_statistics_provider(query, collector, statistics_provider)
+                })
             } else {
-                self.search(query, collector)
+                tracing::info_span!("synchronous search").in_scope(|| self.search(query, collector))
             };
         }
 
@@ -220,6 +226,7 @@ impl Searcher {
     }
 
     #[cfg(feature = "quickwit")]
+    #[instrument(skip(self, collector, weight))]
     async fn search_async_with_async_collector<FruitT, Child>(
         &self,
         collector: &(dyn AsyncCollector<Fruit = FruitT, Child = Child> + '_),

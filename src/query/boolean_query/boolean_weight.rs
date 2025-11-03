@@ -12,6 +12,10 @@ use crate::query::{
     Union, Weight,
 };
 use crate::{DocId, Score};
+#[cfg(feature = "quickwit")]
+use crate::query::AsyncWeight;
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
@@ -268,6 +272,107 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "quickwit")]
+    fn as_async_weight(&self) -> Option<&dyn AsyncWeight> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
+    async fn per_occur_scorers_async(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
+        let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
+        for (occur, subweight) in &self.weights {
+            let sub_scorer: Box<dyn Scorer> = if let Some(async_weight) = subweight.as_async_weight() {
+                async_weight.scorer_async(reader.clone(), boost).await?
+            } else {
+                subweight.scorer(reader, boost)?
+            };
+            per_occur_scorers
+                .entry(*occur)
+                .or_insert_with(Vec::new)
+                .push(sub_scorer);
+        }
+        Ok(per_occur_scorers)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl<TScoreCombiner: ScoreCombiner + Sync> AsyncWeight for BooleanWeight<TScoreCombiner> {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: SegmentReader,
+        boost: Score,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Scorer>>> {
+        Box::pin(async move {
+            if self.weights.is_empty() {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+            } else if self.weights.len() == 1 {
+                let &(occur, ref weight) = &self.weights[0];
+                if occur == Occur::Must || occur == Occur::Should {
+                    return if let Some(async_weight) = weight.as_async_weight() {
+                        async_weight.scorer_async(reader, boost).await
+                    } else {
+                        weight.scorer(&reader, boost)
+                    };
+                }
+            }
+
+            let mut per_occur_scorers = self.per_occur_scorers_async(&reader, boost).await?;
+            let _reader = &reader;
+            let should_scorer_opt: Option<Box<dyn Scorer>> =
+                per_occur_scorers.get_mut(&Occur::Should).map(|scorers| {
+                    into_box_scorer(
+                        scorer_union(std::mem::take(scorers), &self.score_combiner_fn),
+                        &self.score_combiner_fn,
+                    )
+                });
+            let exclude_scorer_opt: Option<Box<dyn Scorer>> =
+                per_occur_scorers.get_mut(&Occur::MustNot).and_then(|scorers| {
+                    if scorers.is_empty() {
+                        None
+                    } else {
+                        let scorer = into_box_scorer(
+                            scorer_union(std::mem::take(scorers), || DoNothingCombiner),
+                            || DoNothingCombiner,
+                        );
+                        Some(scorer)
+                    }
+                });
+
+            if let Some(should_scorer) = should_scorer_opt {
+                let positive_scorer: Box<dyn Scorer> = if let Some(must_clauses) = per_occur_scorers.get_mut(&Occur::Must)
+                {
+                    let must_scorer = intersect_scorers(std::mem::take(must_clauses));
+                    Box::new(RequiredOptionalScorer::<Box<dyn Scorer>, Box<dyn Scorer>, TScoreCombiner>::new(must_scorer, should_scorer))
+                } else {
+                    should_scorer
+                };
+
+                if let Some(exclude_scorer) = exclude_scorer_opt {
+                    Ok(Box::new(Exclude::new(positive_scorer, exclude_scorer)) as Box<dyn Scorer>)
+                } else {
+                    Ok(positive_scorer)
+                }
+            } else {
+                if let Some(must_clauses) = per_occur_scorers.get_mut(&Occur::Must) {
+                    let positive_scorer = intersect_scorers(std::mem::take(must_clauses));
+                    if let Some(exclude_scorer) = exclude_scorer_opt {
+                        Ok(Box::new(Exclude::new(positive_scorer, exclude_scorer)) as Box<dyn Scorer>)
+                    } else {
+                        Ok(positive_scorer)
+                    }
+                } else {
+                    Ok(Box::new(EmptyScorer) as Box<dyn Scorer>)
+                }
+            }
+        })
     }
 }
 
