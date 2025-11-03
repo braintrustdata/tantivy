@@ -10,6 +10,10 @@ use super::fast_field_range_query::RangeDocSet;
 use super::map_bound;
 use crate::query::{ConstScorer, EmptyScorer, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError};
+#[cfg(feature = "quickwit")]
+use crate::query::AsyncWeight;
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
 
 /// `FastFieldRangeWeight` uses the fast field to execute range queries.
 #[derive(Clone, Debug)]
@@ -101,6 +105,47 @@ impl Weight for FastFieldRangeWeight {
         let explanation = Explanation::new("Const", scorer.score());
 
         Ok(explanation)
+    }
+
+    #[cfg(feature = "quickwit")]
+    fn as_async_weight(&self) -> Option<&dyn AsyncWeight> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl AsyncWeight for FastFieldRangeWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: SegmentReader,
+        boost: Score,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Scorer>>> {
+        Box::pin(async move {
+            let fast_field_reader = reader.fast_fields();
+            let column_type_opt: Option<[ColumnType; 1]> =
+                self.column_type_opt.map(|column_type| [column_type]);
+            let column_type_opt_ref: Option<&[ColumnType]> = column_type_opt
+                .as_ref()
+                .map(|column_types| column_types.as_slice());
+            let Some((column, _)) =
+                fast_field_reader.u64_lenient_for_type_async(column_type_opt_ref, &self.field).await?
+            else {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+            };
+            #[allow(clippy::reversed_empty_ranges)]
+            let value_range = bound_to_value_range(
+                &self.lower_bound,
+                &self.upper_bound,
+                column.min_value(),
+                column.max_value(),
+            )
+            .unwrap_or(1..=0); // empty range
+            if value_range.is_empty() {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
+            }
+            let docset = RangeDocSet::new(value_range, column);
+            Ok(Box::new(ConstScorer::new(docset, boost)) as Box<dyn Scorer>)
+        })
     }
 }
 

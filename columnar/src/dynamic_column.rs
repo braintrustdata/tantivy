@@ -275,6 +275,30 @@ impl DynamicColumnHandle {
                 let column = crate::column::open_column_u64::<u64>(column_bytes)?;
                 Ok(Some(column))
             }
+            _ => Ok(None),
+        }
+    }
+
+    pub async fn open_u64_lenient_async(&self) -> io::Result<Option<Column<u64>>> {
+        let column_bytes = self.file_slice.read_bytes_async().await?;
+        match self.column_type {
+            ColumnType::Str | ColumnType::Bytes => {
+                let column: BytesColumn = crate::column::open_column_bytes(column_bytes)?;
+                Ok(Some(column.term_ord_column))
+            }
+            ColumnType::IpAddr => {
+                let column = crate::column::open_column_u128_as_compact_u64(column_bytes)?;
+                Ok(Some(column))
+            }
+            ColumnType::Bool
+            | ColumnType::I64
+            | ColumnType::U64
+            | ColumnType::F64
+            | ColumnType::DateTime => {
+                let column = crate::column::open_column_u64::<u64>(column_bytes)?;
+                Ok(Some(column))
+            }
+            _ => Ok(None),
         }
     }
 
