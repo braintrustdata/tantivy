@@ -171,9 +171,11 @@ impl DedicatedThreadBlockCompressorImpl {
             SyncSender<BlockCompressorMessage>,
             Receiver<BlockCompressorMessage>,
         ) = sync_channel(3);
+        let parent_span = tracing::Span::current();
         let join_handle = thread::Builder::new()
             .name("docstore-compressor-thread".to_string())
             .spawn(move || {
+                let _parent_span_guard = parent_span.enter();
                 while let Ok(packet) = rx.recv() {
                     match packet {
                         BlockCompressorMessage::CompressBlockAndWrite {
