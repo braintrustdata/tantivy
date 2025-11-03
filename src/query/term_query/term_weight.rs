@@ -107,7 +107,7 @@ impl TermWeight {
         boost: Score,
     ) -> crate::Result<TermScorer> {
         let field = self.term.field();
-        let inverted_index = reader.inverted_index(field)?;
+        let inverted_index = reader.inverted_index_async(field).await?;
         let fieldnorm_reader_opt = if self.scoring_enabled {
             reader.fieldnorms_readers().get_field(field)?
         } else {

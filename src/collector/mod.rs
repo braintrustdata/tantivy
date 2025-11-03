@@ -98,13 +98,17 @@ mod multi_collector;
 pub use self::multi_collector::{FruitHandle, MultiCollector, MultiFruit};
 
 mod top_collector;
+pub use self::top_collector::{ComparableDoc, TopCollector};
 
 mod top_score_collector;
-pub use self::top_collector::ComparableDoc;
-pub use self::top_score_collector::{TopDocs, TopNComputer};
+pub use self::top_score_collector::{
+    FastFieldConvertCollector, ScorerByFastFieldReader, ScorerByField, TopDocs, TopNComputer,
+};
 
 mod custom_score_top_collector;
-pub use self::custom_score_top_collector::{CustomScorer, CustomSegmentScorer};
+pub use self::custom_score_top_collector::{
+    CustomScoreTopCollector, CustomScorer, CustomSegmentScorer,
+};
 
 mod tweak_score_top_collector;
 pub use self::tweak_score_top_collector::{ScoreSegmentTweaker, ScoreTweaker};
@@ -417,11 +421,11 @@ pub trait AsyncCollector: Sync + Send {
     fn requires_scoring(&self) -> bool;
 
     /// Creates a per-segment collector asynchronously.
-    fn for_segment_async(
-        &self,
+    fn for_segment_async<'a>(
+        &'a self,
         segment_local_id: SegmentOrdinal,
-        segment: &SegmentReader,
-    ) -> BoxFuture<'_, crate::Result<Self::Child>>;
+        segment: &'a SegmentReader,
+    ) -> BoxFuture<'a, crate::Result<Self::Child>>;
 
     /// Merges per-segment results asynchronously.
     fn merge_fruits_async(
@@ -451,11 +455,11 @@ impl<'a, C: Collector> AsyncCollector for SyncCollectorAdapter<'a, C> {
         self.collector.requires_scoring()
     }
 
-    fn for_segment_async(
-        &self,
+    fn for_segment_async<'b>(
+        &'b self,
         segment_local_id: SegmentOrdinal,
-        segment: &SegmentReader,
-    ) -> BoxFuture<'_, crate::Result<Self::Child>> {
+        segment: &'b SegmentReader,
+    ) -> BoxFuture<'b, crate::Result<Self::Child>> {
         let res = self.collector.for_segment(segment_local_id, segment);
         Box::pin(ready(res))
     }

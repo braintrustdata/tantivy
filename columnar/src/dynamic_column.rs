@@ -241,6 +241,12 @@ impl DynamicColumnHandle {
         self.open_internal(column_bytes)
     }
 
+    #[cfg(feature = "quickwit")]
+    pub async fn open_async(&self) -> io::Result<DynamicColumn> {
+        let column_bytes: OwnedBytes = self.file_slice.read_bytes_async().await?;
+        self.open_internal(column_bytes)
+    }
+
     #[doc(hidden)]
     pub fn file_slice(&self) -> &FileSlice {
         &self.file_slice

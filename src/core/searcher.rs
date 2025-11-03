@@ -185,6 +185,40 @@ impl Searcher {
 
     #[cfg(feature = "quickwit")]
     #[instrument(skip(self, query, collector, statistics_provider))]
+    pub async fn search_with_async_collector_and_statistics<C>(
+        &self,
+        query: &dyn Query,
+        collector: &C,
+        statistics_provider: &dyn Bm25StatisticsProvider,
+    ) -> crate::Result<<C as AsyncCollector>::Fruit>
+    where
+        C: Collector + AsyncCollector,
+        <C as Collector>::Fruit: Send,
+        <C as AsyncCollector>::Fruit: Send,
+        <C as Collector>::Child: Send + 'static,
+        <C as AsyncCollector>::Child: Send + 'static,
+    {
+        let requires_scoring = AsyncCollector::requires_scoring(collector);
+        let enabled_scoring = if requires_scoring {
+            EnableScoring::enabled_from_statistics_provider(statistics_provider, self)
+        } else {
+            EnableScoring::disabled_from_searcher(self)
+        };
+
+        let weight = query.weight(enabled_scoring)?;
+        if weight.as_async_weight().is_none() {
+            return Err(crate::TantivyError::InternalError(format!(
+                "Query does not support async search: {:?}",
+                query
+            )));
+        }
+
+        self.search_async_with_async_collector(collector, weight, requires_scoring)
+            .await
+    }
+
+    #[cfg(feature = "quickwit")]
+    #[instrument(skip(self, query, collector, statistics_provider))]
     async fn search_async_internal<C: Collector>(
         &self,
         query: &dyn Query,

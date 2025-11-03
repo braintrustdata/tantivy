@@ -2,9 +2,14 @@ use crate::collector::top_collector::{TopCollector, TopSegmentCollector};
 use crate::collector::{Collector, SegmentCollector};
 use crate::{DocAddress, DocId, Score, SegmentReader};
 
-pub(crate) struct CustomScoreTopCollector<TCustomScorer, TScore = Score> {
-    custom_scorer: TCustomScorer,
-    collector: TopCollector<TScore>,
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
+#[cfg(feature = "quickwit")]
+use crate::collector::AsyncCollector;
+
+pub struct CustomScoreTopCollector<TCustomScorer, TScore = Score> {
+    pub custom_scorer: TCustomScorer,
+    pub collector: TopCollector<TScore>,
 }
 
 impl<TCustomScorer, TScore> CustomScoreTopCollector<TCustomScorer, TScore>
@@ -43,6 +48,17 @@ pub trait CustomScorer<TScore>: Sync {
     fn segment_scorer(&self, segment_reader: &SegmentReader) -> crate::Result<Self::Child>;
 }
 
+#[cfg(feature = "quickwit")]
+pub trait AsyncCustomScorer<TScore>: Sync {
+    /// Type of the associated [`CustomSegmentScorer`].
+    type Child: CustomSegmentScorer<TScore> + Send;
+    /// Builds a child scorer for a specific segment asynchronously.
+    fn segment_scorer_async<'a>(
+        &'a self,
+        segment_reader: &'a SegmentReader,
+    ) -> BoxFuture<'a, crate::Result<Self::Child>>;
+}
+
 impl<TCustomScorer, TScore> Collector for CustomScoreTopCollector<TCustomScorer, TScore>
 where
     TCustomScorer: CustomScorer<TScore> + Send + Sync,
@@ -71,6 +87,42 @@ where
 
     fn merge_fruits(&self, segment_fruits: Vec<Self::Fruit>) -> crate::Result<Self::Fruit> {
         self.collector.merge_fruits(segment_fruits)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl<TCustomScorer, TScore> AsyncCollector for CustomScoreTopCollector<TCustomScorer, TScore>
+where
+    TCustomScorer: AsyncCustomScorer<TScore> + Send + Sync,
+    TScore: 'static + PartialOrd + Clone + Send + Sync,
+{
+    type Fruit = Vec<(TScore, DocAddress)>;
+    type Child = CustomScoreTopSegmentCollector<TCustomScorer::Child, TScore>;
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn for_segment_async<'a>(
+        &'a self,
+        segment_local_id: u32,
+        segment_reader: &'a SegmentReader,
+    ) -> BoxFuture<'a, crate::Result<Self::Child>> {
+        Box::pin(async move {
+            let segment_collector = self.collector.for_segment(segment_local_id, segment_reader);
+            let segment_scorer = self.custom_scorer.segment_scorer_async(segment_reader).await?;
+            Ok(CustomScoreTopSegmentCollector {
+                segment_collector,
+                segment_scorer,
+            })
+        })
+    }
+
+    fn merge_fruits_async(
+        &self,
+        segment_fruits: Vec<Self::Fruit>,
+    ) -> BoxFuture<'_, crate::Result<Self::Fruit>> {
+        Box::pin(async move { self.collector.merge_fruits(segment_fruits) })
     }
 }
 

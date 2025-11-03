@@ -116,7 +116,7 @@ zstd-compression = ["zstd"]
 failpoints = ["fail", "fail/failpoints"]
 unstable = [] # useful for benches.
 
-quickwit = ["sstable", "futures-util", "tokio"]
+quickwit = ["sstable", "futures-util", "tokio", "columnar/quickwit"]
 
 # Compares only the hash of a string when indexing data. 
 # Increases indexing speed, but may lead to extremely rare missing terms, when there's a hash collision.

@@ -17,14 +17,19 @@ use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::query::Weight;
 use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
-struct FastFieldConvertCollector<
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
+#[cfg(feature = "quickwit")]
+use crate::collector::AsyncCollector;
+
+pub struct FastFieldConvertCollector<
     TCollector: Collector<Fruit = Vec<(u64, DocAddress)>>,
     TFastValue: FastValue,
 > {
     pub collector: TCollector,
     pub field: String,
     pub fast_value: std::marker::PhantomData<TFastValue>,
-    order: Order,
+    pub order: Order,
 }
 
 impl<TCollector, TFastValue> Collector for FastFieldConvertCollector<TCollector, TFastValue>
@@ -81,6 +86,72 @@ where
             })
             .collect::<Vec<_>>();
         Ok(transformed_result)
+    }
+
+}
+
+#[cfg(feature = "quickwit")]
+impl<TCollector, TFastValue> AsyncCollector for FastFieldConvertCollector<TCollector, TFastValue>
+where
+    TCollector: Collector<Fruit = Vec<(u64, DocAddress)>> + AsyncCollector<Fruit = Vec<(u64, DocAddress)>>,
+    <TCollector as Collector>::Child: SegmentCollector,
+    <TCollector as AsyncCollector>::Child: SegmentCollector,
+    <TCollector as Collector>::Child: Send,
+    <TCollector as AsyncCollector>::Child: Send,
+    TFastValue: FastValue,
+{
+    type Fruit = Vec<(TFastValue, DocAddress)>;
+    type Child = <TCollector as AsyncCollector>::Child;
+
+    fn requires_scoring(&self) -> bool {
+        Collector::requires_scoring(&self.collector)
+    }
+
+    fn for_segment_async<'a>(
+        &'a self,
+        segment_local_id: SegmentOrdinal,
+        segment: &'a SegmentReader,
+    ) -> BoxFuture<'a, crate::Result<Self::Child>> {
+        Box::pin(async move {
+            let schema = segment.schema();
+            let field = schema.get_field(&self.field)?;
+            let field_entry = schema.get_field_entry(field);
+            if !field_entry.is_fast() {
+                return Err(TantivyError::SchemaError(format!(
+                    "Field {:?} is not a fast field.",
+                    field_entry.name()
+                )));
+            }
+            let schema_type = TFastValue::to_type();
+            let requested_type = field_entry.field_type().value_type();
+            if schema_type != requested_type {
+                return Err(TantivyError::SchemaError(format!(
+                    "Field {:?} is of type {schema_type:?}!={requested_type:?}",
+                    field_entry.name()
+                )));
+            }
+            self.collector.for_segment_async(segment_local_id, segment).await
+        })
+    }
+
+    fn merge_fruits_async(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> BoxFuture<'_, crate::Result<Self::Fruit>> {
+        Box::pin(async move {
+            let raw_result = self.collector.merge_fruits_async(segment_fruits).await?;
+            let transformed_result = raw_result
+                .into_iter()
+                .map(|(score, doc_address)| {
+                    if self.order.is_desc() {
+                        (TFastValue::from_u64(score), doc_address)
+                    } else {
+                        (TFastValue::from_u64(u64::MAX - score), doc_address)
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(transformed_result)
+        })
     }
 }
 
@@ -140,9 +211,9 @@ impl fmt::Debug for TopDocs {
     }
 }
 
-struct ScorerByFastFieldReader {
-    sort_column: Arc<dyn ColumnValues<u64>>,
-    order: Order,
+pub struct ScorerByFastFieldReader {
+    pub sort_column: Arc<dyn ColumnValues<u64>>,
+    pub order: Order,
 }
 
 impl CustomSegmentScorer<u64> for ScorerByFastFieldReader {
@@ -156,9 +227,9 @@ impl CustomSegmentScorer<u64> for ScorerByFastFieldReader {
     }
 }
 
-struct ScorerByField {
-    field: String,
-    order: Order,
+pub struct ScorerByField {
+    pub field: String,
+    pub order: Order,
 }
 
 impl CustomScorer<u64> for ScorerByField {
@@ -182,6 +253,32 @@ impl CustomScorer<u64> for ScorerByField {
         Ok(ScorerByFastFieldReader {
             sort_column: sort_column.first_or_default_col(default_value),
             order: self.order.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl crate::collector::custom_score_top_collector::AsyncCustomScorer<u64> for ScorerByField {
+    type Child = ScorerByFastFieldReader;
+
+    fn segment_scorer_async<'a>(
+        &'a self,
+        segment_reader: &'a SegmentReader,
+    ) -> BoxFuture<'a, crate::Result<Self::Child>> {
+        Box::pin(async move {
+            let sort_column_opt = segment_reader.fast_fields().u64_lenient_async(&self.field).await?;
+            let (sort_column, _sort_column_type) =
+                sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
+                    field_name: self.field.clone(),
+                })?;
+            let mut default_value = 0u64;
+            if self.order.is_asc() {
+                default_value = u64::MAX;
+            }
+            Ok(ScorerByFastFieldReader {
+                sort_column: sort_column.first_or_default_col(default_value),
+                order: self.order.clone(),
+            })
         })
     }
 }
@@ -315,7 +412,7 @@ impl TopDocs {
         self,
         field: impl ToString,
         order: Order,
-    ) -> impl Collector<Fruit = Vec<(u64, DocAddress)>> {
+    ) -> CustomScoreTopCollector<ScorerByField, u64> {
         CustomScoreTopCollector::new(
             ScorerByField {
                 field: field.to_string(),
@@ -398,7 +495,10 @@ impl TopDocs {
         self,
         fast_field: impl ToString,
         order: Order,
-    ) -> impl Collector<Fruit = Vec<(TFastValue, DocAddress)>>
+    ) -> FastFieldConvertCollector<
+        CustomScoreTopCollector<ScorerByField, u64>,
+        TFastValue,
+    >
     where
         TFastValue: FastValue,
     {
@@ -699,6 +799,40 @@ impl Collector for TopDocs {
             })
             .collect();
         Ok(fruit)
+    }
+
+    #[cfg(feature = "quickwit")]
+    fn as_async_collector(
+        &self,
+    ) -> Option<&(dyn AsyncCollector<Fruit = Self::Fruit, Child = Self::Child> + '_)> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl AsyncCollector for TopDocs {
+    type Fruit = Vec<(Score, DocAddress)>;
+    type Child = TopScoreSegmentCollector;
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn for_segment_async<'a>(
+        &'a self,
+        segment_local_id: SegmentOrdinal,
+        reader: &'a SegmentReader,
+    ) -> BoxFuture<'a, crate::Result<Self::Child>> {
+        let result = self.for_segment(segment_local_id, reader);
+        Box::pin(async move { result })
+    }
+
+    fn merge_fruits_async(
+        &self,
+        child_fruits: Vec<Vec<(Score, DocAddress)>>,
+    ) -> BoxFuture<'_, crate::Result<Self::Fruit>> {
+        let result = self.merge_fruits(child_fruits);
+        Box::pin(async move { result })
     }
 }
 

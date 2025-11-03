@@ -211,6 +211,17 @@ impl FastFieldReaders {
         Ok(dynamic_column.into())
     }
 
+    #[cfg(feature = "quickwit")]
+    pub async fn str_async(&self, field_name: &str) -> crate::Result<Option<StrColumn>> {
+        let Some(dynamic_column_handle) =
+            self.dynamic_column_handle(field_name, ColumnType::Str)?
+        else {
+            return Ok(None);
+        };
+        let dynamic_column = dynamic_column_handle.open_async().await?;
+        Ok(dynamic_column.into())
+    }
+
     /// Returns a `bytes` column.
     pub fn bytes(&self, field_name: &str) -> crate::Result<Option<BytesColumn>> {
         let Some(dynamic_column_handle) =
