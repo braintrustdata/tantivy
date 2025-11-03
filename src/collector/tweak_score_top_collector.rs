@@ -38,7 +38,7 @@ pub trait ScoreSegmentTweaker<TScore>: 'static {
 /// the score at a segment scale.
 pub trait ScoreTweaker<TScore>: Sync {
     /// Type of the associated [`ScoreSegmentTweaker`].
-    type Child: ScoreSegmentTweaker<TScore>;
+    type Child: ScoreSegmentTweaker<TScore> + Send;
 
     /// Builds a child tweaker for a specific segment. The child scorer is associated with
     /// a specific segment.
@@ -89,7 +89,7 @@ impl<TSegmentScoreTweaker, TScore> SegmentCollector
     for TopTweakedScoreSegmentCollector<TSegmentScoreTweaker, TScore>
 where
     TScore: 'static + PartialOrd + Clone + Send + Sync,
-    TSegmentScoreTweaker: 'static + ScoreSegmentTweaker<TScore>,
+    TSegmentScoreTweaker: 'static + ScoreSegmentTweaker<TScore> + Send,
 {
     type Fruit = Vec<(TScore, DocAddress)>;
 
@@ -106,7 +106,7 @@ where
 impl<F, TScore, TSegmentScoreTweaker> ScoreTweaker<TScore> for F
 where
     F: 'static + Send + Sync + Fn(&SegmentReader) -> TSegmentScoreTweaker,
-    TSegmentScoreTweaker: ScoreSegmentTweaker<TScore>,
+    TSegmentScoreTweaker: ScoreSegmentTweaker<TScore> + Send,
 {
     type Child = TSegmentScoreTweaker;
 

@@ -37,7 +37,7 @@ pub trait CustomSegmentScorer<TScore>: 'static {
 /// the score at a segment scale.
 pub trait CustomScorer<TScore>: Sync {
     /// Type of the associated [`CustomSegmentScorer`].
-    type Child: CustomSegmentScorer<TScore>;
+    type Child: CustomSegmentScorer<TScore> + Send;
     /// Builds a child scorer for a specific segment. The child scorer is associated with
     /// a specific segment.
     fn segment_scorer(&self, segment_reader: &SegmentReader) -> crate::Result<Self::Child>;
@@ -86,7 +86,7 @@ where
 impl<T, TScore> SegmentCollector for CustomScoreTopSegmentCollector<T, TScore>
 where
     TScore: 'static + PartialOrd + Clone + Send + Sync,
-    T: 'static + CustomSegmentScorer<TScore>,
+    T: 'static + CustomSegmentScorer<TScore> + Send,
 {
     type Fruit = Vec<(TScore, DocAddress)>;
 
@@ -103,7 +103,7 @@ where
 impl<F, TScore, T> CustomScorer<TScore> for F
 where
     F: 'static + Send + Sync + Fn(&SegmentReader) -> T,
-    T: CustomSegmentScorer<TScore>,
+    T: CustomSegmentScorer<TScore> + Send,
 {
     type Child = T;
 

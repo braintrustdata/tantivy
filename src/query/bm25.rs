@@ -12,7 +12,7 @@ const B: Score = 0.75;
 ///
 /// The standard implementation is a [Searcher] but you can also
 /// create your own to adjust the statistics.
-pub trait Bm25StatisticsProvider {
+pub trait Bm25StatisticsProvider: Sync {
     /// The total number of tokens in a given field across all documents in
     /// the index.
     fn total_num_tokens(&self, field: Field) -> crate::Result<u64>;

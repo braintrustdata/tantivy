@@ -18,7 +18,7 @@ use super::metric::{
 use crate::aggregation::bucket::TermMissingAgg;
 use crate::aggregation::metric::TopHitsSegmentCollector;
 
-pub(crate) trait SegmentAggregationCollector: CollectorClone + Debug {
+pub(crate) trait SegmentAggregationCollector: CollectorClone + Debug + Send {
     fn add_intermediate_aggregation_result(
         self: Box<Self>,
         agg_with_accessor: &AggregationsWithAccessor,

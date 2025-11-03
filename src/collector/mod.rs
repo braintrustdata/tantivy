@@ -84,7 +84,7 @@
 use downcast_rs::impl_downcast;
 
 #[cfg(feature = "quickwit")]
-use futures::future::{ready, LocalBoxFuture};
+use futures::future::{ready, BoxFuture};
 
 use crate::{DocId, Score, SegmentOrdinal, SegmentReader};
 
@@ -277,7 +277,7 @@ impl<TCollector: Collector> Collector for Option<TCollector> {
 ///
 /// `.collect(doc, score)` will be called for every documents
 /// matching the query.
-pub trait SegmentCollector: 'static {
+pub trait SegmentCollector: Send + 'static {
     /// `Fruit` is the type for the result of our collection.
     /// e.g. `usize` for the `Count` collector.
     type Fruit: Fruit;
@@ -421,13 +421,13 @@ pub trait AsyncCollector: Sync + Send {
         &self,
         segment_local_id: SegmentOrdinal,
         segment: &SegmentReader,
-    ) -> LocalBoxFuture<'_, crate::Result<Self::Child>>;
+    ) -> BoxFuture<'_, crate::Result<Self::Child>>;
 
     /// Merges per-segment results asynchronously.
     fn merge_fruits_async(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
-    ) -> LocalBoxFuture<'_, crate::Result<Self::Fruit>>;
+    ) -> BoxFuture<'_, crate::Result<Self::Fruit>>;
 }
 
 #[cfg(feature = "quickwit")]
@@ -455,7 +455,7 @@ impl<'a, C: Collector> AsyncCollector for SyncCollectorAdapter<'a, C> {
         &self,
         segment_local_id: SegmentOrdinal,
         segment: &SegmentReader,
-    ) -> LocalBoxFuture<'_, crate::Result<Self::Child>> {
+    ) -> BoxFuture<'_, crate::Result<Self::Child>> {
         let res = self.collector.for_segment(segment_local_id, segment);
         Box::pin(ready(res))
     }
@@ -463,7 +463,7 @@ impl<'a, C: Collector> AsyncCollector for SyncCollectorAdapter<'a, C> {
     fn merge_fruits_async(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
-    ) -> LocalBoxFuture<'_, crate::Result<Self::Fruit>> {
+    ) -> BoxFuture<'_, crate::Result<Self::Fruit>> {
         let res = self.collector.merge_fruits(segment_fruits);
         Box::pin(ready(res))
     }

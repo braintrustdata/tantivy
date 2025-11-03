@@ -143,7 +143,7 @@ pub trait Weight: Any + Send + Sync + 'static {
 }
 
 #[cfg(feature = "quickwit")]
-pub trait AsyncWeight: Weight {
+pub trait AsyncWeight: Weight + Send + Sync {
     fn scorer_async<'a>(
         &'a self,
         reader: SegmentReader,

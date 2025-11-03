@@ -67,7 +67,7 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
     }
 }
 
-pub trait BoxableSegmentCollector {
+pub trait BoxableSegmentCollector: Send {
     fn collect(&mut self, doc: u32, score: Score);
     fn collect_block(&mut self, docs: &[DocId]) {
         for &doc in docs {
