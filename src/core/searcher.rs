@@ -230,16 +230,22 @@ impl Searcher {
         FruitT: crate::collector::Fruit,
         Child: SegmentCollector,
     {
-        use futures::stream::{FuturesUnordered, TryStreamExt};
-
         let async_weight = weight
             .as_async_weight()
             .expect("checked for async support in caller");
-        let tasks = FuturesUnordered::new();
+
+        // Clone data needed for spawning
+        let async_weight = Arc::new(async_weight);
+        let collector = Arc::new(collector);
+
+        let mut handles = Vec::new();
         for (segment_ord, segment_reader) in self.segment_readers().iter().cloned().enumerate() {
-            let collector_ref = collector;
-            tasks.push(async move {
-                let mut segment_collector = collector_ref
+            let async_weight = async_weight.clone();
+            let collector = collector.clone();
+
+            // Spawn each segment search on a separate tokio task for true parallelism
+            let handle = tokio::spawn(async move {
+                let mut segment_collector = collector
                     .for_segment_async(segment_ord as u32, &segment_reader)
                     .await?;
                 let mut scorer = async_weight
@@ -293,8 +299,18 @@ impl Searcher {
                 }
                 crate::Result::Ok(segment_collector.harvest())
             });
+            handles.push(handle);
         }
-        let fruits: Vec<<Child as SegmentCollector>::Fruit> = tasks.try_collect().await?;
+
+        // Wait for all spawned tasks to complete
+        let mut fruits = Vec::new();
+        for handle in handles {
+            let fruit = handle.await.map_err(|e| {
+                crate::TantivyError::InternalError(format!("Task join error: {}", e))
+            })??;
+            fruits.push(fruit);
+        }
+
         collector.merge_fruits_async(fruits).await
     }
 
