@@ -277,17 +277,29 @@ impl Searcher {
             .as_async_weight()
             .expect("checked for async support in caller");
 
-        // Create all segment collectors and scorers first (these need the non-'static collector reference)
-        let mut segment_tasks = Vec::new();
-        for (segment_ord, segment_reader) in self.segment_readers().iter().cloned().enumerate() {
-            let segment_collector = collector
-                .for_segment_async(segment_ord as u32, &segment_reader)
-                .await?;
-            let scorer = async_weight
-                .scorer_async(segment_reader.clone(), 1.0)
-                .await?;
-            segment_tasks.push((segment_collector, scorer, segment_reader));
-        }
+        // Create all segment collectors and scorers concurrently
+        // We can't use tokio::spawn here because of lifetime constraints,
+        // but try_join_all will poll all futures concurrently
+        let segment_futures: Vec<_> = self
+            .segment_readers()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(segment_ord, segment_reader)| {
+                let segment_reader_clone = segment_reader.clone();
+                async move {
+                    let segment_collector = collector
+                        .for_segment_async(segment_ord as u32, &segment_reader)
+                        .await?;
+                    let scorer = async_weight.scorer_async(segment_reader_clone, 1.0).await?;
+                    Ok::<_, crate::TantivyError>((segment_collector, scorer, segment_reader))
+                }
+            })
+            .collect();
+
+        let segment_tasks = futures::future::try_join_all(segment_futures)
+            .instrument(tracing::info_span!("prepare_segment_tasks"))
+            .await?;
 
         // Now spawn each segment task for parallel execution
         let mut handles = Vec::new();
