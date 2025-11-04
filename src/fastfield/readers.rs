@@ -1,6 +1,7 @@
 use std::io;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
+use tracing::{instrument, Instrument};
 
 use columnar::{
     BytesColumn, Column, ColumnType, ColumnValues, ColumnarReader, DynamicColumn,
@@ -30,7 +31,10 @@ impl FastFieldReaders {
         Ok(FastFieldReaders { columnar, schema })
     }
 
-    pub(crate) async fn open_async(fast_field_file: FileSlice, schema: Schema) -> io::Result<FastFieldReaders> {
+    pub(crate) async fn open_async(
+        fast_field_file: FileSlice,
+        schema: Schema,
+    ) -> io::Result<FastFieldReaders> {
         let columnar = Arc::new(ColumnarReader::open_async(fast_field_file).await?);
         Ok(FastFieldReaders { columnar, schema })
     }
@@ -212,13 +216,16 @@ impl FastFieldReaders {
     }
 
     #[cfg(feature = "quickwit")]
+    #[instrument(skip(self))]
     pub async fn str_async(&self, field_name: &str) -> crate::Result<Option<StrColumn>> {
         let Some(dynamic_column_handle) =
             self.dynamic_column_handle(field_name, ColumnType::Str)?
         else {
             return Ok(None);
         };
-        let dynamic_column = dynamic_column_handle.open_async().await?;
+        let dynamic_column = dynamic_column_handle.open_async()
+            .instrument(tracing::info_span!("open_async"))
+            .await?;
         Ok(dynamic_column.into())
     }
 
@@ -308,6 +315,7 @@ impl FastFieldReaders {
     }
 
     #[doc(hidden)]
+    #[instrument(skip(self, type_white_list_opt))]
     pub async fn u64_lenient_for_type_async(
         &self,
         type_white_list_opt: Option<&[ColumnType]>,
@@ -316,13 +324,22 @@ impl FastFieldReaders {
         let Some(resolved_field_name) = self.resolve_field(field_name)? else {
             return Ok(None);
         };
-        for col in self.columnar.read_columns_async(&resolved_field_name).await? {
+        let cols = self
+            .columnar
+            .read_columns_async(&resolved_field_name)
+            .instrument(tracing::info_span!("read_columns_async", field=%resolved_field_name))
+            .await?;
+        for col in cols {
             if let Some(type_white_list) = type_white_list_opt {
                 if !type_white_list.contains(&col.column_type()) {
                     continue;
                 }
             }
-            if let Some(col_u64) = col.open_u64_lenient_async().await? {
+            if let Some(col_u64) = col
+                .open_u64_lenient_async()
+                .instrument(tracing::info_span!("open_u64_lenient_async"))
+                .await?
+            {
                 return Ok(Some((col_u64, col.column_type())));
             }
         }
@@ -369,6 +386,7 @@ impl FastFieldReaders {
     }
 
     #[doc(hidden)]
+    #[instrument(skip(self))]
     pub async fn u64_lenient_async(
         &self,
         field_name: &str,

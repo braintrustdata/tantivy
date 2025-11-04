@@ -265,8 +265,11 @@ impl crate::collector::custom_score_top_collector::AsyncCustomScorer<u64> for Sc
         &'a self,
         segment_reader: &'a SegmentReader,
     ) -> BoxFuture<'a, crate::Result<Self::Child>> {
+        use tracing::Instrument;
         Box::pin(async move {
-            let sort_column_opt = segment_reader.fast_fields().u64_lenient_async(&self.field).await?;
+            let sort_column_opt = segment_reader.fast_fields().u64_lenient_async(&self.field)
+                .instrument(tracing::info_span!("u64_lenient_async", field=%self.field))
+                .await?;
             let (sort_column, _sort_column_type) =
                 sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
                     field_name: self.field.clone(),
@@ -279,7 +282,7 @@ impl crate::collector::custom_score_top_collector::AsyncCustomScorer<u64> for Sc
                 sort_column: sort_column.first_or_default_col(default_value),
                 order: self.order.clone(),
             })
-        })
+        }.instrument(tracing::info_span!("segment_scorer_async")))
     }
 }
 

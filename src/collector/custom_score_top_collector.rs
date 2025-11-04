@@ -108,14 +108,17 @@ where
         segment_local_id: u32,
         segment_reader: &'a SegmentReader,
     ) -> BoxFuture<'a, crate::Result<Self::Child>> {
+        use tracing::Instrument;
         Box::pin(async move {
             let segment_collector = self.collector.for_segment(segment_local_id, segment_reader);
-            let segment_scorer = self.custom_scorer.segment_scorer_async(segment_reader).await?;
+            let segment_scorer = self.custom_scorer.segment_scorer_async(segment_reader)
+                .instrument(tracing::info_span!("custom_scorer_segment_scorer_async"))
+                .await?;
             Ok(CustomScoreTopSegmentCollector {
                 segment_collector,
                 segment_scorer,
             })
-        })
+        }.instrument(tracing::info_span!("for_segment_async", segment_ord=%segment_local_id)))
     }
 
     fn merge_fruits_async(
