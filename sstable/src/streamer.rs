@@ -140,6 +140,12 @@ where
         let delta_reader = self.delta_reader()?;
         self.into_stream_given_delta_reader(delta_reader)
     }
+
+    #[cfg(feature = "quickwit")]
+    pub async fn into_stream_async(self) -> io::Result<Streamer<'a, TSSTable, A>> {
+        let delta_reader = self.delta_reader_async().await?;
+        self.into_stream_given_delta_reader(delta_reader)
+    }
 }
 
 /// `Streamer` acts as a cursor over a range of terms of a segment.

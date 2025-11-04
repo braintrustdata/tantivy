@@ -153,7 +153,7 @@ impl Searcher {
     pub async fn doc_freq_async(&self, term: &Term) -> crate::Result<u64> {
         let mut total_doc_freq = 0;
         for segment_reader in &self.inner.segment_readers {
-            let inverted_index = segment_reader.inverted_index(term.field())?;
+            let inverted_index = segment_reader.inverted_index_async(term.field()).await?;
             let doc_freq = inverted_index.doc_freq_async(term).await?;
             total_doc_freq += u64::from(doc_freq);
         }

@@ -89,6 +89,17 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(TSSTable::delta_reader(data))
     }
 
+    #[cfg(feature = "quickwit")]
+    pub(crate) async fn sstable_delta_reader_for_key_range_async(
+        &self,
+        key_range: impl RangeBounds<[u8]>,
+        limit: Option<u64>,
+    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+        let slice = self.file_slice_for_range(key_range, limit);
+        let data = slice.read_bytes_async().await?;
+        Ok(TSSTable::delta_reader(data))
+    }
+
     pub fn sstable_delta_reader_block(
         &self,
         block_addr: BlockAddr,
@@ -440,6 +451,11 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// A stream of all the sorted terms.
     pub fn stream(&self) -> io::Result<Streamer<TSSTable>> {
         self.range().into_stream()
+    }
+
+    #[cfg(feature = "quickwit")]
+    pub async fn stream_async(&self) -> io::Result<Streamer<TSSTable>> {
+        self.range().into_stream_async().await
     }
 
     /// Returns a search builder, to stream all of the terms

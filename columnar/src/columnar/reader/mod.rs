@@ -255,6 +255,19 @@ impl ColumnarReader {
         read_all_columns_in_stream_with_name(stream, &self.column_data)
     }
 
+    #[cfg(feature = "quickwit")]
+    pub async fn read_columns_range_async(
+        &self,
+        start_key: &str,
+        end_key: &str,
+    ) -> io::Result<Vec<(String, DynamicColumnHandle)>> {
+        let stream = self
+            .stream_for_column_start_end(start_key, end_key)
+            .into_stream_async()
+            .await?;
+        read_all_columns_in_stream_with_name(stream, &self.column_data)
+    }
+
     /// Return the number of columns in the columnar.
     pub fn num_columns(&self) -> usize {
         self.column_dictionary.num_terms()

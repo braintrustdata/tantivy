@@ -450,12 +450,15 @@ impl SegmentReader {
             DataCorruption::comment_only(error_msg)
         })?;
 
-        let inv_idx_reader = Arc::new(InvertedIndexReader::new(
-            TermDictionary::open_async(termdict_file).await?,
-            postings_file,
-            positions_file,
-            record_option,
-        )?);
+        let inv_idx_reader = Arc::new(
+            InvertedIndexReader::new_async(
+                TermDictionary::open_async(termdict_file).await?,
+                postings_file,
+                positions_file,
+                record_option,
+            )
+            .await?,
+        );
 
         self.inv_idx_reader_cache
             .write()

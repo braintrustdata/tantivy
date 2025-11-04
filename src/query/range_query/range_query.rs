@@ -16,6 +16,10 @@ use crate::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query,
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 use crate::termdict::{TermDictionary, TermStreamer};
 use crate::{DateTime, DocId, Score};
+#[cfg(feature = "quickwit")]
+use crate::query::AsyncWeight;
+#[cfg(feature = "quickwit")]
+use futures::future::BoxFuture;
 
 /// `RangeQuery` matches all documents that have at least one term within a defined range.
 ///
@@ -416,6 +420,26 @@ impl RangeWeight {
         }
         term_stream_builder.into_stream()
     }
+
+    #[cfg(feature = "quickwit")]
+    async fn term_range_async<'a>(&self, term_dict: &'a TermDictionary) -> io::Result<TermStreamer<'a>> {
+        use std::ops::Bound::*;
+        let mut term_stream_builder = term_dict.range();
+        term_stream_builder = match self.lower_bound {
+            Included(ref term_val) => term_stream_builder.ge(term_val),
+            Excluded(ref term_val) => term_stream_builder.gt(term_val),
+            Unbounded => term_stream_builder,
+        };
+        term_stream_builder = match self.upper_bound {
+            Included(ref term_val) => term_stream_builder.le(term_val),
+            Excluded(ref term_val) => term_stream_builder.lt(term_val),
+            Unbounded => term_stream_builder,
+        };
+        if let Some(limit) = self.limit {
+            term_stream_builder = term_stream_builder.limit(limit);
+        }
+        term_stream_builder.into_stream_async().await
+    }
 }
 
 impl Weight for RangeWeight {
@@ -458,6 +482,53 @@ impl Weight for RangeWeight {
             return Err(does_not_match(doc));
         }
         Ok(Explanation::new("RangeQuery", 1.0))
+    }
+
+    #[cfg(feature = "quickwit")]
+    fn as_async_weight(&self) -> Option<&dyn AsyncWeight> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl AsyncWeight for RangeWeight {
+    fn scorer_async<'a>(
+        &'a self,
+        reader: SegmentReader,
+        boost: Score,
+    ) -> BoxFuture<'a, crate::Result<Box<dyn Scorer>>> {
+        Box::pin(async move {
+            let max_doc = reader.max_doc();
+            let mut doc_bitset = BitSet::with_max_value(max_doc);
+
+            let inverted_index = reader.inverted_index_async(reader.schema().get_field(&self.field)?).await?;
+            let term_dict = inverted_index.terms();
+            let mut term_range = self.term_range_async(term_dict).await?;
+            let mut processed_count = 0;
+            while term_range.advance() {
+                if let Some(limit) = self.limit {
+                    if limit <= processed_count {
+                        break;
+                    }
+                }
+                processed_count += 1;
+                let term_info = term_range.value();
+                let mut block_segment_postings = inverted_index
+                    .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+                loop {
+                    let docs = block_segment_postings.docs();
+                    if docs.is_empty() {
+                        break;
+                    }
+                    for &doc in block_segment_postings.docs() {
+                        doc_bitset.insert(doc);
+                    }
+                    block_segment_postings.advance();
+                }
+            }
+            let doc_bitset = BitSetDocSet::from(doc_bitset);
+            Ok(Box::new(ConstScorer::new(doc_bitset, boost)) as Box<dyn Scorer>)
+        })
     }
 }
 
