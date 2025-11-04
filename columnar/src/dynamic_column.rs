@@ -1,4 +1,5 @@
 use std::net::Ipv6Addr;
+use tracing::Instrument;
 use std::sync::Arc;
 use std::{fmt, io};
 
@@ -286,7 +287,9 @@ impl DynamicColumnHandle {
     }
 
     pub async fn open_u64_lenient_async(&self) -> io::Result<Option<Column<u64>>> {
-        let column_bytes = self.file_slice.read_bytes_async().await?;
+        let column_bytes = self.file_slice.read_bytes_async()
+            .instrument(tracing::info_span!("read_bytes_async", len=%self.file_slice.len()))
+            .await?;
         match self.column_type {
             ColumnType::Str | ColumnType::Bytes => {
                 let column: BytesColumn = crate::column::open_column_bytes(column_bytes)?;

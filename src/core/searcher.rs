@@ -11,6 +11,8 @@ use crate::core::Executor;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query, Weight};
+#[cfg(feature = "quickwit")]
+use crate::query::AsyncWeight;
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
@@ -277,47 +279,68 @@ impl Searcher {
             .as_async_weight()
             .expect("checked for async support in caller");
 
-        // Create all segment collectors concurrently
-        let collector_futures: Vec<_> = self
+        // UNSAFE HACK FOR BENCHMARKING ONLY:
+        // Transmute the collector and async_weight to 'static so we can spawn tasks.
+        // This is UNSAFE because we're lying about the lifetime, but it's safe in practice
+        // because we await all spawned tasks before returning, ensuring the references
+        // don't outlive the actual lifetimes.
+        // TODO: Replace with proper Arc-based solution for production.
+        let collector_static: &'static (dyn AsyncCollector<Fruit = FruitT, Child = Child> + '_) =
+            unsafe { std::mem::transmute(collector) };
+        let async_weight_static: &'static dyn AsyncWeight =
+            unsafe { std::mem::transmute(async_weight) };
+
+        // Create all segment collectors concurrently with tokio::spawn
+        let collector_handles: Vec<_> = self
             .segment_readers()
             .iter()
             .cloned()
             .enumerate()
             .map(|(segment_ord, segment_reader)| {
-                async move {
-                    let segment_collector = collector
+                tokio::spawn(async move {
+                    let segment_collector = collector_static
                         .for_segment_async(segment_ord as u32, &segment_reader)
                         .instrument(tracing::info_span!("create_segment_collector", segment_ord=%segment_ord))
                         .await?;
                     Ok::<_, crate::TantivyError>((segment_collector, segment_reader))
-                }
+                }.instrument(tracing::Span::current()))
             })
             .collect();
 
-        // Create all segment scorers concurrently
-        let scorer_futures: Vec<_> = self
+        // Create all segment scorers concurrently with tokio::spawn
+        let scorer_handles: Vec<_> = self
             .segment_readers()
             .iter()
             .cloned()
             .enumerate()
             .map(|(segment_ord, segment_reader)| {
-                async move {
-                    let scorer = async_weight
+                tokio::spawn(async move {
+                    let scorer = async_weight_static
                         .scorer_async(segment_reader, 1.0)
                         .instrument(tracing::info_span!("scorer_async", segment_ord=%segment_ord))
                         .await?;
                     Ok::<_, crate::TantivyError>(scorer)
-                }
+                }.instrument(tracing::Span::current()))
             })
             .collect();
 
-        // Wait for all collectors and scorers concurrently
-        let (collectors, scorers) = tokio::try_join!(
-            futures::future::try_join_all(collector_futures)
-                .instrument(tracing::info_span!("create_all_collectors")),
-            futures::future::try_join_all(scorer_futures)
-                .instrument(tracing::info_span!("create_all_scorers"))
-        )?;
+        // Wait for all spawned tasks
+        let (collector_results, scorer_results) = futures::future::try_join(
+            futures::future::try_join_all(collector_handles)
+                .instrument(tracing::info_span!("join_all_collectors")),
+            futures::future::try_join_all(scorer_handles)
+                .instrument(tracing::info_span!("join_all_scorers"))
+        ).await.map_err(|e| crate::TantivyError::InternalError(format!("Task join failed: {}", e)))?;
+
+        // Unwrap the JoinHandle results and propagate errors
+        let collectors: Vec<_> = collector_results
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| crate::TantivyError::InternalError(format!("Collector task failed: {}", e)))?;
+        let scorers: Vec<_> = scorer_results
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| crate::TantivyError::InternalError(format!("Scorer task failed: {}", e)))?;
 
         // Zip collectors with scorers
         let segment_tasks: Vec<_> = collectors
