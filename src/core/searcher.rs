@@ -290,8 +290,12 @@ impl Searcher {
                 async move {
                     let segment_collector = collector
                         .for_segment_async(segment_ord as u32, &segment_reader)
+                        .instrument(tracing::info_span!("create_segment_collector"))
                         .await?;
-                    let scorer = async_weight.scorer_async(segment_reader_clone, 1.0).await?;
+                    let scorer = async_weight
+                        .scorer_async(segment_reader_clone, 1.0)
+                        .instrument(tracing::info_span!("scorer_async"))
+                        .await?;
                     Ok::<_, crate::TantivyError>((segment_collector, scorer, segment_reader))
                 }
             })
