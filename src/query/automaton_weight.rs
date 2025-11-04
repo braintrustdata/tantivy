@@ -66,6 +66,7 @@ where
     }
 }
 
+#[cfg(not(feature = "quickwit"))]
 impl<A> Weight for AutomatonWeight<A>
 where
     A: Automaton + Send + Sync + 'static,
@@ -106,6 +107,54 @@ where
                 "Document does not exist".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl<A> Weight for AutomatonWeight<A>
+where
+    A: Automaton + Send + Sync + 'static,
+    A::State: Clone + Send,
+{
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let max_doc = reader.max_doc();
+        let mut doc_bitset = BitSet::with_max_value(max_doc);
+        let inverted_index = reader.inverted_index(self.field)?;
+        let term_dict = inverted_index.terms();
+        let mut term_stream = self.automaton_stream(term_dict)?;
+        while term_stream.advance() {
+            let term_info = term_stream.value();
+            let mut block_segment_postings = inverted_index
+                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+            loop {
+                let docs = block_segment_postings.docs();
+                if docs.is_empty() {
+                    break;
+                }
+                for &doc in docs {
+                    doc_bitset.insert(doc);
+                }
+                block_segment_postings.advance();
+            }
+        }
+        let doc_bitset = BitSetDocSet::from(doc_bitset);
+        let const_scorer = ConstScorer::new(doc_bitset, boost);
+        Ok(Box::new(const_scorer))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) == doc {
+            Ok(Explanation::new("AutomatonScorer", 1.0))
+        } else {
+            Err(TantivyError::InvalidArgument(
+                "Document does not exist".to_string(),
+            ))
+        }
+    }
+
+    fn as_async_weight(&self) -> Option<&dyn crate::query::AsyncWeight> {
+        Some(self)
     }
 }
 
