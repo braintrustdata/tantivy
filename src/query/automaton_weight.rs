@@ -109,6 +109,46 @@ where
     }
 }
 
+#[cfg(feature = "quickwit")]
+impl<A> crate::query::AsyncWeight for AutomatonWeight<A>
+where
+    A: Automaton + Send + Sync + 'static,
+    A::State: Clone + Send,
+{
+    fn scorer_async<'a>(
+        &'a self,
+        reader: SegmentReader,
+        boost: Score,
+    ) -> futures::future::BoxFuture<'a, crate::Result<Box<dyn Scorer>>> {
+        Box::pin(async move {
+            let max_doc = reader.max_doc();
+            let mut doc_bitset = BitSet::with_max_value(max_doc);
+            let inverted_index = reader.inverted_index_async(self.field).await?;
+            let term_dict = inverted_index.terms();
+            let mut term_stream = self.automaton_stream(term_dict)?;
+            while term_stream.advance() {
+                let term_info = term_stream.value();
+                let mut block_segment_postings = inverted_index
+                    .read_block_postings_from_terminfo_async(term_info, IndexRecordOption::Basic)
+                    .await?;
+                loop {
+                    let docs = block_segment_postings.docs();
+                    if docs.is_empty() {
+                        break;
+                    }
+                    for &doc in docs {
+                        doc_bitset.insert(doc);
+                    }
+                    block_segment_postings.advance();
+                }
+            }
+            let doc_bitset = BitSetDocSet::from(doc_bitset);
+            let const_scorer = ConstScorer::new(doc_bitset, boost);
+            Ok(Box::new(const_scorer) as Box<dyn Scorer>)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tantivy_fst::Automaton;
