@@ -897,6 +897,44 @@ mod test {
         test_alive_docs_iterator_impl(&AsyncSegmentOpener::new())
     }
 
+    fn test_inverted_index_access_impl(opener: &dyn SegmentOpener) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "hello world"))?;
+            index_writer.add_document(doc!(text_field => "tantivy search"))?;
+            index_writer.commit()?;
+        }
+
+        let segments = index.searchable_segments()?;
+        let segment_reader = opener.open_segment(&segments[0])?;
+
+        // Access the inverted index - this will fail if termdict/postings are swapped
+        let inverted_index = segment_reader.inverted_index(text_field)?;
+        let term = Term::from_field_text(text_field, "hello");
+        let term_info = inverted_index.get_term_info(&term)?;
+
+        // Should find the term "hello" in the index
+        assert!(term_info.is_some(), "Term 'hello' should be found in the index");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inverted_index_access() -> crate::Result<()> {
+        test_inverted_index_access_impl(&SyncSegmentOpener)
+    }
+
+    #[test]
+    #[cfg(feature = "tokio")]
+    fn test_inverted_index_access_async() -> crate::Result<()> {
+        test_inverted_index_access_impl(&AsyncSegmentOpener::new())
+    }
+
     #[test]
     fn test_parallel_segment_opening_deadlock() -> crate::Result<()> {
         use std::sync::Arc;
