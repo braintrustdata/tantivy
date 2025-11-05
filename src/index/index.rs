@@ -615,6 +615,39 @@ impl Index {
         )
     }
 
+    /// Async version of `writer_with_num_threads`.
+    ///
+    /// Creates an index writer using async I/O for initialization.
+    pub async fn writer_with_num_threads_async<D: Document>(
+        &self,
+        num_threads: usize,
+        overall_memory_budget_in_bytes: usize,
+    ) -> crate::Result<IndexWriter<D>> {
+        let directory_lock = self
+            .directory
+            .acquire_lock_async(&INDEX_WRITER_LOCK)
+            .await
+            .map_err(|err| {
+                TantivyError::LockFailure(
+                    err,
+                    Some(
+                        "Failed to acquire index lock. If you are using a regular directory, this \
+                         means there is already an `IndexWriter` working on this `Directory`, in \
+                         this process or in a different process."
+                            .to_string(),
+                    ),
+                )
+            })?;
+        let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
+        IndexWriter::new_async(
+            self,
+            num_threads,
+            memory_arena_in_bytes_per_thread,
+            directory_lock,
+        )
+        .await
+    }
+
     /// Helper to create an index writer for tests.
     ///
     /// That index writer only simply has a single thread and a memory budget of 15 MB.
@@ -750,5 +783,72 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{Schema, TEXT, STORED};
+    use crate::IndexWriter;
+
+    #[tokio::test]
+    #[cfg(feature = "tokio")]
+    async fn test_writer_with_num_threads_async() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema.clone());
+
+        // Create writer using async API
+        let mut index_writer: IndexWriter = index
+            .writer_with_num_threads_async(1, 15_000_000)
+            .await?;
+
+        // Add documents
+        index_writer.add_document(doc!(text_field => "hello world"))?;
+        index_writer.add_document(doc!(text_field => "tantivy search"))?;
+        index_writer.commit()?;
+
+        // Verify documents were indexed
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "tokio")]
+    async fn test_writer_async_with_existing_segments() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema.clone());
+
+        // First, create some segments with regular writer
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "existing document"))?;
+            index_writer.commit()?;
+        }
+
+        // Now create a new writer using async API - should load existing segments
+        let mut index_writer: IndexWriter = index
+            .writer_with_num_threads_async(1, 15_000_000)
+            .await?;
+
+        // Add more documents
+        index_writer.add_document(doc!(text_field => "new document"))?;
+        index_writer.commit()?;
+
+        // Verify both documents are present
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 2);
+
+        Ok(())
     }
 }
