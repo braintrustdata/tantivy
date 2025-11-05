@@ -422,3 +422,157 @@ impl IndexReader {
         self.inner.searcher()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{Schema, TEXT, STORED};
+    use crate::{Index, IndexWriter};
+
+    /// Trait to abstract over sync and async index reader building for testing.
+    trait IndexReaderBuilder {
+        fn build(&self, builder: super::IndexReaderBuilder) -> crate::Result<IndexReader>;
+    }
+
+    /// Synchronous implementation - uses the regular sync API
+    struct SyncIndexReaderBuilder;
+
+    impl IndexReaderBuilder for SyncIndexReaderBuilder {
+        fn build(&self, builder: super::IndexReaderBuilder) -> crate::Result<IndexReader> {
+            builder.try_into()
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    /// Async implementation wrapped in sync interface - uses runtime.block_on
+    struct AsyncIndexReaderBuilder {
+        runtime: tokio::runtime::Runtime,
+    }
+
+    #[cfg(feature = "tokio")]
+    impl AsyncIndexReaderBuilder {
+        fn new() -> Self {
+            Self {
+                runtime: tokio::runtime::Runtime::new().unwrap(),
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    impl IndexReaderBuilder for AsyncIndexReaderBuilder {
+        fn build(&self, builder: super::IndexReaderBuilder) -> crate::Result<IndexReader> {
+            self.runtime.block_on(builder.try_into_async())
+        }
+    }
+
+    fn test_index_reader_basic_impl(builder: &dyn IndexReaderBuilder) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "hello world"))?;
+            index_writer.add_document(doc!(text_field => "tantivy search"))?;
+            index_writer.commit()?;
+        }
+
+        let reader_builder = index.reader_builder();
+        let reader = builder.build(reader_builder)?;
+        let searcher = reader.searcher();
+
+        assert_eq!(searcher.num_docs(), 2);
+        assert_eq!(searcher.segment_readers().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_reader_basic() -> crate::Result<()> {
+        test_index_reader_basic_impl(&SyncIndexReaderBuilder)
+    }
+
+    #[test]
+    #[cfg(feature = "tokio")]
+    fn test_index_reader_basic_async() -> crate::Result<()> {
+        test_index_reader_basic_impl(&AsyncIndexReaderBuilder::new())
+    }
+
+    fn test_index_reader_multiple_segments_impl(
+        builder: &dyn IndexReaderBuilder,
+    ) -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Create multiple segments
+            for i in 0..5 {
+                index_writer.add_document(doc!(text_field => format!("document {}", i)))?;
+                index_writer.commit()?;
+            }
+        }
+
+        let reader_builder = index.reader_builder();
+        let reader = builder.build(reader_builder)?;
+        let searcher = reader.searcher();
+
+        assert_eq!(searcher.num_docs(), 5);
+        assert_eq!(searcher.segment_readers().len(), 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_reader_multiple_segments() -> crate::Result<()> {
+        test_index_reader_multiple_segments_impl(&SyncIndexReaderBuilder)
+    }
+
+    #[test]
+    #[cfg(feature = "tokio")]
+    fn test_index_reader_multiple_segments_async() -> crate::Result<()> {
+        test_index_reader_multiple_segments_impl(&AsyncIndexReaderBuilder::new())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "tokio")]
+    async fn test_async_index_reader_concurrent() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Create multiple segments with different numbers of docs
+            for seg_num in 0..4 {
+                for doc_num in 0..3 {
+                    index_writer
+                        .add_document(doc!(text_field => format!("seg {} doc {}", seg_num, doc_num)))?;
+                }
+                index_writer.commit()?;
+            }
+        }
+
+        // Build the reader asynchronously - this will open all segments concurrently
+        let reader = index.reader_builder().try_into_async().await?;
+        let searcher = reader.searcher();
+
+        assert_eq!(searcher.num_docs(), 12);
+        assert_eq!(searcher.segment_readers().len(), 4);
+
+        // Verify each segment has the correct number of docs
+        for segment_reader in searcher.segment_readers() {
+            assert_eq!(segment_reader.num_docs(), 3);
+        }
+
+        Ok(())
+    }
+
+}
