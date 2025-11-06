@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io, thread};
 
+use futures::future::BoxFuture;
+
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
@@ -229,20 +231,29 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
 
     /// Async version of `get_file_handle`.
-    /// Default implementation calls the sync version.
+    ///
+    /// Default implementation panics - implementations should override this
+    /// rather than calling blocking sync code from an async context.
     fn get_file_handle_async<'a>(
         &'a self,
         path: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn FileHandle>, OpenReadError>> + Send + 'a>> {
-        Box::pin(async move { self.get_file_handle(path) })
+    ) -> BoxFuture<'a, Result<Arc<dyn FileHandle>, OpenReadError>> {
+        let _ = path;
+        Box::pin(async move {
+            panic!(
+                "get_file_handle_async not implemented for this Directory type. \
+                 Calling blocking sync code from async context is not supported."
+            )
+        })
     }
 
     /// Async version of `open_read`.
-    /// Default implementation calls the sync version.
+    ///
+    /// Default implementation delegates to `get_file_handle_async`.
     fn open_read_async<'a>(
         &'a self,
         path: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<FileSlice, OpenReadError>> + Send + 'a>> {
+    ) -> BoxFuture<'a, Result<FileSlice, OpenReadError>> {
         Box::pin(async move {
             let file_handle = self.get_file_handle_async(path).await?;
             Ok(FileSlice::new(file_handle))
@@ -250,21 +261,37 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     }
 
     /// Async version of `atomic_read`.
-    /// Default implementation calls the sync version.
+    ///
+    /// Default implementation panics - implementations should override this
+    /// rather than calling blocking sync code from an async context.
     fn atomic_read_async<'a>(
         &'a self,
         path: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, OpenReadError>> + Send + 'a>> {
-        Box::pin(async move { self.atomic_read(path) })
+    ) -> BoxFuture<'a, Result<Vec<u8>, OpenReadError>> {
+        let _ = path;
+        Box::pin(async move {
+            panic!(
+                "atomic_read_async not implemented for this Directory type. \
+                 Calling blocking sync code from async context is not supported."
+            )
+        })
     }
 
     /// Async version of `acquire_lock`.
-    /// Default implementation calls the sync version.
+    ///
+    /// Default implementation panics - implementations should override this
+    /// rather than calling blocking sync code from an async context.
     fn acquire_lock_async<'a>(
         &'a self,
         lock: &'a Lock,
-    ) -> Pin<Box<dyn Future<Output = Result<DirectoryLock, LockError>> + Send + 'a>> {
-        Box::pin(async move { self.acquire_lock(lock) })
+    ) -> BoxFuture<'a, Result<DirectoryLock, LockError>> {
+        let _ = lock;
+        Box::pin(async move {
+            panic!(
+                "acquire_lock_async not implemented for this Directory type. \
+                 Calling blocking sync code from async context is not supported."
+            )
+        })
     }
 }
 
