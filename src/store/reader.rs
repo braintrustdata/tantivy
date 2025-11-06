@@ -139,6 +139,31 @@ impl StoreReader {
         })
     }
 
+    /// Async counterpart to [`StoreReader::open`].
+    pub async fn open_async(
+        store_file: FileSlice,
+        cache_num_blocks: usize,
+    ) -> io::Result<StoreReader> {
+        let (footer, data_and_offset) = DocStoreFooter::extract_footer_async(store_file).await?;
+        let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
+        let index_data = offset_index_file.read_bytes_async().await?;
+        let space_usage =
+            StoreSpaceUsage::new(data_file.num_bytes(), offset_index_file.num_bytes());
+        let skip_index = SkipIndex::open(index_data);
+        Ok(StoreReader {
+            decompressor: footer.decompressor,
+            data: data_file,
+            cache: BlockCache {
+                cache: NonZeroUsize::new(cache_num_blocks)
+                    .map(|cache_num_blocks| Mutex::new(LruCache::new(cache_num_blocks))),
+                cache_hits: Default::default(),
+                cache_misses: Default::default(),
+            },
+            skip_index: Arc::new(skip_index),
+            space_usage,
+        })
+    }
+
     pub(crate) fn block_checkpoints(&self) -> impl Iterator<Item = Checkpoint> + '_ {
         self.skip_index.checkpoints()
     }

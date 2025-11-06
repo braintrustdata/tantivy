@@ -283,6 +283,30 @@ impl SegmentUpdater {
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
+        let index_meta = index.load_metas()?;
+        Self::create_with_components(index, stamper, segment_manager, index_meta)
+    }
+
+    /// Async version of `create`.
+    ///
+    /// Creates a segment updater using async I/O to load segment metadata.
+    pub async fn create_async(
+        index: Index,
+        stamper: Stamper,
+        delete_cursor: &DeleteCursor,
+    ) -> crate::Result<SegmentUpdater> {
+        let segments = index.searchable_segment_metas_async().await?;
+        let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
+        let index_meta = index.load_metas_async().await?;
+        Self::create_with_components(index, stamper, segment_manager, index_meta)
+    }
+
+    fn create_with_components(
+        index: Index,
+        stamper: Stamper,
+        segment_manager: SegmentManager,
+        index_meta: IndexMeta,
+    ) -> crate::Result<SegmentUpdater> {
         let pool = ThreadPoolBuilder::new()
             .thread_name(|_| "segment_updater".to_string())
             .num_threads(1)
@@ -301,7 +325,6 @@ impl SegmentUpdater {
                     "Failed to spawn segment merging thread".to_string(),
                 )
             })?;
-        let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
             pool,

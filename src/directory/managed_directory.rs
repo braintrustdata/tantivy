@@ -282,6 +282,22 @@ impl Directory for ManagedDirectory {
         Ok(reader)
     }
 
+    fn open_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FileSlice, OpenReadError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let file_slice = self.directory.open_read_async(path).await?;
+            let (footer, reader) = Footer::extract_footer_async(file_slice)
+                .await
+                .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
+            footer.is_compatible()?;
+            Ok(reader)
+        })
+    }
+
     fn open_write(&self, path: &Path) -> result::Result<WritePtr, OpenWriteError> {
         self.register_file_as_managed(path)
             .map_err(|io_error| OpenWriteError::wrap_io_error(io_error, path.to_path_buf()))?;
@@ -303,6 +319,15 @@ impl Directory for ManagedDirectory {
         self.directory.atomic_read(path)
     }
 
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, OpenReadError>> + Send + 'a>,
+    > {
+        self.directory.atomic_read_async(path)
+    }
+
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
         self.directory.delete(path)
     }
@@ -313,6 +338,15 @@ impl Directory for ManagedDirectory {
 
     fn acquire_lock(&self, lock: &Lock) -> result::Result<DirectoryLock, LockError> {
         self.directory.acquire_lock(lock)
+    }
+
+    fn acquire_lock_async<'a>(
+        &'a self,
+        lock: &'a Lock,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<DirectoryLock, LockError>> + Send + 'a>,
+    > {
+        self.directory.acquire_lock_async(lock)
     }
 
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle> {
