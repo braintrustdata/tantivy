@@ -8,10 +8,10 @@ use common::HasLen;
 
 use super::FileHandle;
 use crate::core::META_FILEPATH;
-use crate::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{
-    AntiCallToken, Directory, FileSlice, TerminatingWrite, WatchCallback, WatchCallbackList,
-    WatchHandle, WritePtr,
+    AntiCallToken, Directory, DirectoryLock, FileSlice, TerminatingWrite, WatchCallback,
+    WatchCallbackList, WatchHandle, WritePtr,
 };
 
 /// Writer associated with the [`RamDirectory`].
@@ -236,6 +236,28 @@ impl Directory for RamDirectory {
 
     fn sync_directory(&self) -> io::Result<()> {
         Ok(())
+    }
+
+    // Since all operations are in-memory and instant, we can safely call sync versions
+    fn get_file_handle_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> futures::future::BoxFuture<'a, Result<Arc<dyn FileHandle>, OpenReadError>> {
+        Box::pin(async move { self.get_file_handle(path) })
+    }
+
+    fn atomic_read_async<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, OpenReadError>> {
+        Box::pin(async move { self.atomic_read(path) })
+    }
+
+    fn acquire_lock_async<'a>(
+        &'a self,
+        lock: &'a crate::directory::directory_lock::Lock,
+    ) -> futures::future::BoxFuture<'a, Result<DirectoryLock, LockError>> {
+        Box::pin(async move { self.acquire_lock(lock) })
     }
 }
 
