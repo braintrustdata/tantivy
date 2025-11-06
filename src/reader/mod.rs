@@ -283,12 +283,26 @@ impl InnerIndexReader {
         let searchable_segments = index.searchable_segments_async().await?;
 
         // Open all segments concurrently
-        let segment_readers = futures::future::try_join_all(
-            searchable_segments
-                .iter()
-                .map(|segment| SegmentReader::open_with_custom_alive_set_async(segment, None)),
-        )
-        .await?;
+        let handles: Vec<_> = searchable_segments
+            .into_iter()
+            .map(|segment| {
+                tokio::spawn(async move {
+                    SegmentReader::open_with_custom_alive_set_async(&segment, None).await
+                })
+            })
+            .collect();
+
+        // Wait for all tasks to complete and collect results
+        let mut segment_readers = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let result = handle.await.map_err(|join_err| {
+                crate::TantivyError::InternalError(format!(
+                    "Failed to join segment reader task: {}",
+                    join_err
+                ))
+            })??;
+            segment_readers.push(result);
+        }
 
         Ok(segment_readers)
     }
@@ -571,6 +585,44 @@ mod tests {
         for segment_reader in searcher.segment_readers() {
             assert_eq!(segment_reader.num_docs(), 3);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[cfg(feature = "tokio")]
+    async fn test_async_parallel_segment_opening() -> crate::Result<()> {
+        use std::time::Instant;
+
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // Create many segments to benefit from parallel opening
+            for seg_num in 0..8 {
+                for doc_num in 0..10 {
+                    index_writer
+                        .add_document(doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)))?;
+                }
+                index_writer.commit()?;
+            }
+        }
+
+        let start = Instant::now();
+        let reader = index.reader_builder().try_into_async().await?;
+        let elapsed = start.elapsed();
+
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 80);
+        assert_eq!(searcher.segment_readers().len(), 8);
+
+        // With parallel opening, this should be reasonably fast
+        // Even with 8 segments, should complete in under 1 second for in-memory index
+        println!("Opened 8 segments in parallel in {:?}", elapsed);
 
         Ok(())
     }
