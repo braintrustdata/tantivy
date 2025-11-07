@@ -278,48 +278,31 @@ impl InnerIndexReader {
     ///
     /// Opens segments concurrently using async I/O.
     async fn open_segment_readers_async(index: &Index) -> crate::Result<Vec<SegmentReader>> {
-        let overall_start = std::time::Instant::now();
-
         // Prevents segment files from getting deleted while we are in the process of opening them
         let _meta_lock = index.directory().acquire_lock_async(&META_LOCK).await?;
         let searchable_segments = index.searchable_segments_async().await?;
 
-        eprintln!("[TIMING] open_segment_readers_async: Starting to open {} segments concurrently", searchable_segments.len());
-
         // Open all segments concurrently
-        let spawn_start = std::time::Instant::now();
         let handles: Vec<_> = searchable_segments
             .into_iter()
-            .enumerate()
-            .map(|(idx, segment)| {
-                let segment_id = segment.id();
+            .map(|segment| {
                 tokio::spawn(async move {
-                    let task_start = std::time::Instant::now();
-                    eprintln!("[TIMING] Task {}: tokio::spawn started for segment {}", idx, segment_id);
-                    let result = SegmentReader::open_with_custom_alive_set_async(&segment, None).await;
-                    eprintln!("[TIMING] Task {}: tokio::spawn completed for segment {} in {:?}", idx, segment_id, task_start.elapsed());
-                    result
+                    SegmentReader::open_with_custom_alive_set_async(&segment, None).await
                 })
             })
             .collect();
-        eprintln!("[TIMING] open_segment_readers_async: All {} tasks spawned in {:?}", handles.len(), spawn_start.elapsed());
 
         // Wait for all tasks to complete and collect results
-        let join_start = std::time::Instant::now();
         let mut segment_readers = Vec::with_capacity(handles.len());
-        for (idx, handle) in handles.into_iter().enumerate() {
-            let await_start = std::time::Instant::now();
+        for handle in handles {
             let result = handle.await.map_err(|join_err| {
                 crate::TantivyError::InternalError(format!(
                     "Failed to join segment reader task: {}",
                     join_err
                 ))
             })??;
-            eprintln!("[TIMING] Task {}: Joined in {:?}", idx, await_start.elapsed());
             segment_readers.push(result);
         }
-        eprintln!("[TIMING] open_segment_readers_async: All tasks joined in {:?}", join_start.elapsed());
-        eprintln!("[TIMING] open_segment_readers_async: Total time {:?}", overall_start.elapsed());
 
         Ok(segment_readers)
     }
