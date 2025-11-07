@@ -226,38 +226,54 @@ impl SegmentReader {
 
         let open_files_start = std::time::Instant::now();
 
-        eprintln!("[TIMING] SegmentReader({}): Starting to open component files", segment_id);
+        eprintln!("[TIMING] SegmentReader({}): Starting to open component files concurrently", segment_id);
 
-        let terms_start = std::time::Instant::now();
-        let termdict_file = segment.open_read_async(SegmentComponent::Terms).await?;
-        eprintln!("[TIMING] SegmentReader({}): Terms file opened in {:?}", segment_id, terms_start.elapsed());
-
-        let store_start = std::time::Instant::now();
-        let store_file = segment.open_read_async(SegmentComponent::Store).await?;
-        eprintln!("[TIMING] SegmentReader({}): Store file opened in {:?}", segment_id, store_start.elapsed());
-
-        let postings_start = std::time::Instant::now();
-        let postings_file = segment.open_read_async(SegmentComponent::Postings).await?;
-        eprintln!("[TIMING] SegmentReader({}): Postings file opened in {:?}", segment_id, postings_start.elapsed());
-
-        let fastfields_start = std::time::Instant::now();
-        let fast_fields_data = segment.open_read_async(SegmentComponent::FastFields).await?;
-        eprintln!("[TIMING] SegmentReader({}): FastFields file opened in {:?}", segment_id, fastfields_start.elapsed());
-
-        let fieldnorms_start = std::time::Instant::now();
-        let fieldnorm_data = segment.open_read_async(SegmentComponent::FieldNorms).await?;
-        eprintln!("[TIMING] SegmentReader({}): FieldNorms file opened in {:?}", segment_id, fieldnorms_start.elapsed());
-
-        let positions_start = std::time::Instant::now();
-        let positions_file_opt = match segment.open_read_async(SegmentComponent::Positions).await {
-            Ok(file) => Some(file),
-            Err(OpenReadError::FileDoesNotExist(_)) => None,
-            Err(err) => return Err(err.into()),
-        };
-        eprintln!("[TIMING] SegmentReader({}): Positions file opened in {:?}", segment_id, positions_start.elapsed());
+        // Open all component files concurrently
+        let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = futures::try_join!(
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::Terms).await;
+                eprintln!("[TIMING] SegmentReader({}): Terms file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::Store).await;
+                eprintln!("[TIMING] SegmentReader({}): Store file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::Postings).await;
+                eprintln!("[TIMING] SegmentReader({}): Postings file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::FastFields).await;
+                eprintln!("[TIMING] SegmentReader({}): FastFields file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::FieldNorms).await;
+                eprintln!("[TIMING] SegmentReader({}): FieldNorms file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = match segment.open_read_async(SegmentComponent::Positions).await {
+                    Ok(file) => Ok(Some(file)),
+                    Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
+                    Err(err) => Err(err),
+                };
+                eprintln!("[TIMING] SegmentReader({}): Positions file opened in {:?}", segment_id, start.elapsed());
+                result
+            }
+        )?;
 
         let open_files_elapsed = open_files_start.elapsed();
-        eprintln!("[TIMING] SegmentReader({}): All component files opened in {:?}", segment_id, open_files_elapsed);
+        eprintln!("[TIMING] SegmentReader({}): All component files opened concurrently in {:?}", segment_id, open_files_elapsed);
 
         let schema = segment.schema();
 
