@@ -236,9 +236,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes_async().await?;
 
-        // CPU-bound: FST construction and block metadata deserialization
         // Run on blocking thread pool to avoid blocking tokio runtime when available
-        let load_start = std::time::Instant::now();
         #[cfg(feature = "tokio")]
         let sstable_index = {
             tokio::task::spawn_blocking(move || {
@@ -248,7 +246,6 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
         #[cfg(not(feature = "tokio"))]
         let sstable_index = Self::load_sstable_index(version, sstable_index_bytes, index_offset)?;
-        let load_elapsed = load_start.elapsed();
 
         Ok(Dictionary {
             sstable_slice,

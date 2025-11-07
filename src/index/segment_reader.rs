@@ -272,6 +272,7 @@ impl SegmentReader {
                     let alive_doc_file_slice =
                         segment.open_read_async(SegmentComponent::Delete).await?;
                     let alive_doc_data = alive_doc_file_slice.read_bytes_async().await?;
+                    // Run the open on a blocking thread in case it's slow.
                     let result = tokio::task::spawn_blocking(move || {
                         AliveBitSet::open(alive_doc_data)
                     }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))?;

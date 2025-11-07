@@ -155,7 +155,6 @@ impl CompositeFile {
             .read_bytes_async()
             .await?;
 
-        // CPU-bound: VInt deserialization loop and HashMap construction
         // Run on blocking thread pool to avoid blocking tokio runtime
         let parse_start = std::time::Instant::now();
         let (file_addrs, offsets) = tokio::task::spawn_blocking(move || {

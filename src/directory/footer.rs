@@ -151,13 +151,7 @@ impl Footer {
                 file.len() - total_footer_size..file.len() - footer_metadata_len,
             )
             .await?;
-
-        // CPU-bound: JSON deserialization
-        // Run on blocking thread pool to avoid blocking tokio runtime
-        let footer = tokio::task::spawn_blocking(move || {
-            serde_json::from_slice::<Footer>(&footer_bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Task panicked: {}", e)))??;
+        let footer: Footer = serde_json::from_slice(&footer_bytes)?;
 
         let body = file.slice_to(file.len() - total_footer_size);
         Ok((footer, body))
