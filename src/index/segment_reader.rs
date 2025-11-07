@@ -228,49 +228,57 @@ impl SegmentReader {
 
         eprintln!("[TIMING] SegmentReader({}): Starting to open component files concurrently", segment_id);
 
-        // Open all component files concurrently
-        let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = futures::try_join!(
-            async {
-                let start = std::time::Instant::now();
-                let result = segment.open_read_async(SegmentComponent::Terms).await;
-                eprintln!("[TIMING] SegmentReader({}): Terms file opened in {:?}", segment_id, start.elapsed());
-                result
-            },
-            async {
-                let start = std::time::Instant::now();
-                let result = segment.open_read_async(SegmentComponent::Store).await;
-                eprintln!("[TIMING] SegmentReader({}): Store file opened in {:?}", segment_id, start.elapsed());
-                result
-            },
-            async {
-                let start = std::time::Instant::now();
-                let result = segment.open_read_async(SegmentComponent::Postings).await;
-                eprintln!("[TIMING] SegmentReader({}): Postings file opened in {:?}", segment_id, start.elapsed());
-                result
-            },
-            async {
-                let start = std::time::Instant::now();
-                let result = segment.open_read_async(SegmentComponent::FastFields).await;
-                eprintln!("[TIMING] SegmentReader({}): FastFields file opened in {:?}", segment_id, start.elapsed());
-                result
-            },
-            async {
-                let start = std::time::Instant::now();
-                let result = segment.open_read_async(SegmentComponent::FieldNorms).await;
-                eprintln!("[TIMING] SegmentReader({}): FieldNorms file opened in {:?}", segment_id, start.elapsed());
-                result
-            },
-            async {
-                let start = std::time::Instant::now();
-                let result = match segment.open_read_async(SegmentComponent::Positions).await {
-                    Ok(file) => Ok(Some(file)),
-                    Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
-                    Err(err) => Err(err),
-                };
-                eprintln!("[TIMING] SegmentReader({}): Positions file opened in {:?}", segment_id, start.elapsed());
-                result
-            }
-        )?;
+        // Open all component files concurrently - wrapped in spawn_blocking to test if this is blocking
+        let segment_clone = segment.clone();
+        let seg_id = segment_id.clone();
+        let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = tokio::task::spawn_blocking(move || {
+            eprintln!("[TIMING] SegmentReader({}): File opens spawn_blocking started", seg_id);
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                futures::try_join!(
+                    async {
+                        let start = std::time::Instant::now();
+                        let result = segment_clone.open_read_async(SegmentComponent::Terms).await;
+                        eprintln!("[TIMING] SegmentReader({}): Terms file opened in {:?}", seg_id, start.elapsed());
+                        result
+                    },
+                    async {
+                        let start = std::time::Instant::now();
+                        let result = segment_clone.open_read_async(SegmentComponent::Store).await;
+                        eprintln!("[TIMING] SegmentReader({}): Store file opened in {:?}", seg_id, start.elapsed());
+                        result
+                    },
+                    async {
+                        let start = std::time::Instant::now();
+                        let result = segment_clone.open_read_async(SegmentComponent::Postings).await;
+                        eprintln!("[TIMING] SegmentReader({}): Postings file opened in {:?}", seg_id, start.elapsed());
+                        result
+                    },
+                    async {
+                        let start = std::time::Instant::now();
+                        let result = segment_clone.open_read_async(SegmentComponent::FastFields).await;
+                        eprintln!("[TIMING] SegmentReader({}): FastFields file opened in {:?}", seg_id, start.elapsed());
+                        result
+                    },
+                    async {
+                        let start = std::time::Instant::now();
+                        let result = segment_clone.open_read_async(SegmentComponent::FieldNorms).await;
+                        eprintln!("[TIMING] SegmentReader({}): FieldNorms file opened in {:?}", seg_id, start.elapsed());
+                        result
+                    },
+                    async {
+                        let start = std::time::Instant::now();
+                        let result = match segment_clone.open_read_async(SegmentComponent::Positions).await {
+                            Ok(file) => Ok(Some(file)),
+                            Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
+                            Err(err) => Err(err),
+                        };
+                        eprintln!("[TIMING] SegmentReader({}): Positions file opened in {:?}", seg_id, start.elapsed());
+                        result
+                    }
+                )
+            })
+        }).await.map_err(|e| crate::TantivyError::InternalError(format!("Task panicked: {}", e)))??;
 
         let open_files_elapsed = open_files_start.elapsed();
         eprintln!("[TIMING] SegmentReader({}): All component files opened concurrently in {:?}", segment_id, open_files_elapsed);
@@ -290,9 +298,17 @@ impl SegmentReader {
         ) = futures::try_join!(
             async {
                 let termdict_file = termdict_file.clone();
+                let seg_id = segment_id.clone();
+                let spawn_start = std::time::Instant::now();
                 let result = tokio::task::spawn_blocking(move || {
-                    CompositeFile::open(&termdict_file)
+                    let queue_time = spawn_start.elapsed();
+                    eprintln!("[TIMING] SegmentReader({}): Terms spawn_blocking queued for {:?}", seg_id, queue_time);
+                    let exec_start = std::time::Instant::now();
+                    let result = CompositeFile::open(&termdict_file);
+                    eprintln!("[TIMING] SegmentReader({}): Terms spawn_blocking executed in {:?}", seg_id, exec_start.elapsed());
+                    result
                 }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+                eprintln!("[TIMING] SegmentReader({}): Terms spawn_blocking total {:?}", segment_id, spawn_start.elapsed());
                 Ok::<_, TantivyError>(result)
             },
             async {
@@ -343,13 +359,18 @@ impl SegmentReader {
         )?;
         let parse_elapsed = parse_start.elapsed();
 
-        let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
-
+        let bitset_start = std::time::Instant::now();
         let max_doc = segment.meta().max_doc();
-        let num_docs = alive_bitset_opt
-            .as_ref()
-            .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
-            .unwrap_or(max_doc);
+        let (alive_bitset_opt, num_docs) = tokio::task::spawn_blocking(move || {
+            let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
+            let num_docs = alive_bitset_opt
+                .as_ref()
+                .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
+                .unwrap_or(max_doc);
+            (alive_bitset_opt, num_docs)
+        }).await.map_err(|e| crate::TantivyError::InternalError(format!("Task panicked: {}", e)))?;
+        let bitset_elapsed = bitset_start.elapsed();
+        eprintln!("[TIMING] SegmentReader({}): Bitset computation in {:?}", segment_id, bitset_elapsed);
 
         eprintln!("[TIMING] SegmentReader::open_with_custom_alive_set_async({}): total={:?} (open_files={:?}, parse={:?})",
             segment_id, start.elapsed(), open_files_elapsed, parse_elapsed);
