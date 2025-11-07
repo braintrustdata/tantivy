@@ -221,11 +221,6 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        let start = std::time::Instant::now();
-        let segment_id = segment.id();
-
-        let open_files_start = std::time::Instant::now();
-
         // Open all component files concurrently
         let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = futures::try_join!(
             segment.open_read_async(SegmentComponent::Terms),
@@ -242,13 +237,9 @@ impl SegmentReader {
             }
         )?;
 
-        let open_files_elapsed = open_files_start.elapsed();
-
         let schema = segment.schema();
 
         crate::fail_point!("SegmentReader::open#middle");
-
-        let parse_start = std::time::Instant::now();
         let (
             termdict_composite,
             postings_composite,
@@ -258,51 +249,23 @@ impl SegmentReader {
             original_bitset,
         ) = futures::try_join!(
             async {
-                let termdict_file = termdict_file.clone();
-                let seg_id = segment_id.clone();
-                let spawn_start = std::time::Instant::now();
-                let result = tokio::task::spawn_blocking(move || {
-                    let queue_time = spawn_start.elapsed();
-                    eprintln!("[TIMING] SegmentReader({}): Terms spawn_blocking queued for {:?}", seg_id, queue_time);
-                    let exec_start = std::time::Instant::now();
-                    let result = CompositeFile::open(&termdict_file);
-                    eprintln!("[TIMING] SegmentReader({}): Terms spawn_blocking executed in {:?}", seg_id, exec_start.elapsed());
-                    result
-                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
-                eprintln!("[TIMING] SegmentReader({}): Terms spawn_blocking total {:?}", segment_id, spawn_start.elapsed());
-                Ok::<_, TantivyError>(result)
+                CompositeFile::open_async(&termdict_file).await.map_err(TantivyError::from)
             },
             async {
-                let postings_file = postings_file.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    CompositeFile::open(&postings_file)
-                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
-                Ok::<_, TantivyError>(result)
+                CompositeFile::open_async(&postings_file).await.map_err(TantivyError::from)
             },
             async {
                 if let Some(positions_file) = positions_file_opt {
-                    let result = tokio::task::spawn_blocking(move || {
-                        CompositeFile::open(&positions_file)
-                    }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
-                    Ok::<_, TantivyError>(result)
+                    CompositeFile::open_async(&positions_file).await.map_err(TantivyError::from)
                 } else {
                     Ok(CompositeFile::empty())
                 }
             },
             async {
-                let fast_fields_data = fast_fields_data.clone();
-                let schema = schema.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    FastFieldReaders::open(fast_fields_data, schema)
-                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
-                Ok::<_, TantivyError>(result)
+                FastFieldReaders::open_async(fast_fields_data, schema.clone()).await.map_err(TantivyError::from)
             },
             async {
-                let fieldnorm_data = fieldnorm_data.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    FieldNormReaders::open(fieldnorm_data)
-                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
-                Ok::<_, TantivyError>(result)
+                FieldNormReaders::open_async(fieldnorm_data).await
             },
             async {
                 if segment.meta().has_deletes() {
@@ -318,9 +281,6 @@ impl SegmentReader {
                 }
             }
         )?;
-        let parse_elapsed = parse_start.elapsed();
-
-        let bitset_start = std::time::Instant::now();
         let max_doc = segment.meta().max_doc();
         let (alive_bitset_opt, num_docs) = tokio::task::spawn_blocking(move || {
             let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
@@ -330,11 +290,6 @@ impl SegmentReader {
                 .unwrap_or(max_doc);
             (alive_bitset_opt, num_docs)
         }).await.map_err(|e| crate::TantivyError::InternalError(format!("Task panicked: {}", e)))?;
-        let bitset_elapsed = bitset_start.elapsed();
-        eprintln!("[TIMING] SegmentReader({}): Bitset computation in {:?}", segment_id, bitset_elapsed);
-
-        eprintln!("[TIMING] SegmentReader::open_with_custom_alive_set_async({}): total={:?} (open_files={:?}, parse={:?})",
-            segment_id, start.elapsed(), open_files_elapsed, parse_elapsed);
 
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{atomic, Arc, Weak};
 
 use arc_swap::ArcSwap;
+use futures::{stream, StreamExt, TryStreamExt};
 pub use warming::Warmer;
 
 use self::warming::WarmingState;
@@ -282,27 +283,18 @@ impl InnerIndexReader {
         let _meta_lock = index.directory().acquire_lock_async(&META_LOCK).await?;
         let searchable_segments = index.searchable_segments_async().await?;
 
-        // Open all segments concurrently
-        let handles: Vec<_> = searchable_segments
-            .into_iter()
-            .map(|segment| {
-                tokio::spawn(async move {
-                    SegmentReader::open_with_custom_alive_set_async(&segment, None).await
-                })
-            })
-            .collect();
+        const MAX_CONCURRENT_SEGMENT_OPENS: usize = 32;
 
-        // Wait for all tasks to complete and collect results
-        let mut segment_readers = Vec::with_capacity(handles.len());
-        for handle in handles {
-            let result = handle.await.map_err(|join_err| {
-                crate::TantivyError::InternalError(format!(
-                    "Failed to join segment reader task: {}",
-                    join_err
-                ))
-            })??;
-            segment_readers.push(result);
-        }
+        let segment_readers: Vec<_> = stream::iter(
+            searchable_segments
+                .into_iter()
+                .map(|segment| async move {
+                    SegmentReader::open_with_custom_alive_set_async(&segment, None).await
+                }),
+        )
+        .buffered(MAX_CONCURRENT_SEGMENT_OPENS)
+        .try_collect()
+        .await?;
 
         Ok(segment_readers)
     }
