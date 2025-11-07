@@ -228,16 +228,24 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Async version of `open`.
     pub async fn open_async(term_dictionary_file: FileSlice) -> io::Result<Self> {
+        let start = std::time::Instant::now();
+
         let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes_async().await?;
+        let read_footer_elapsed = start.elapsed();
+
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
+
+        let index_read_start = std::time::Instant::now();
         let sstable_index_bytes = index_slice.read_bytes_async().await?;
+        let read_index_elapsed = index_read_start.elapsed();
 
         // CPU-bound: FST construction and block metadata deserialization
         // Run on blocking thread pool to avoid blocking tokio runtime when available
+        let load_start = std::time::Instant::now();
         #[cfg(feature = "tokio")]
         let sstable_index = {
             tokio::task::spawn_blocking(move || {
@@ -247,6 +255,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
         #[cfg(not(feature = "tokio"))]
         let sstable_index = Self::load_sstable_index(version, sstable_index_bytes, index_offset)?;
+        let load_elapsed = load_start.elapsed();
+
+        eprintln!("[TIMING] Dictionary::open_async: total={:?} (read_footer={:?}, read_index={:?}, load_index={:?})",
+            start.elapsed(), read_footer_elapsed, read_index_elapsed, load_elapsed);
 
         Ok(Dictionary {
             sstable_slice,

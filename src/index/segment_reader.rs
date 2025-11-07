@@ -221,6 +221,10 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
+        let start = std::time::Instant::now();
+        let segment_id = segment.id();
+
+        let open_files_start = std::time::Instant::now();
         let (
             termdict_file,
             store_file,
@@ -242,11 +246,13 @@ impl SegmentReader {
                 }
             }
         )?;
+        let open_files_elapsed = open_files_start.elapsed();
 
         let schema = segment.schema();
 
         crate::fail_point!("SegmentReader::open#middle");
 
+        let parse_start = std::time::Instant::now();
         let (
             termdict_composite,
             postings_composite,
@@ -285,6 +291,7 @@ impl SegmentReader {
                 }
             }
         )?;
+        let parse_elapsed = parse_start.elapsed();
 
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
@@ -293,6 +300,9 @@ impl SegmentReader {
             .as_ref()
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
+
+        eprintln!("[TIMING] SegmentReader::open_with_custom_alive_set_async({}): total={:?} (open_files={:?}, parse={:?})",
+            segment_id, start.elapsed(), open_files_elapsed, parse_elapsed);
 
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),

@@ -146,17 +146,25 @@ impl CompositeFile {
 
     /// Async version of `open`.
     pub async fn open_async(data: &FileSlice) -> io::Result<CompositeFile> {
+        let start = std::time::Instant::now();
+
         let end = data.len();
         let footer_len_data = data.slice_from(end - 4).read_bytes_async().await?;
+        let read_footer_len_elapsed = start.elapsed();
+
         let footer_len = u32::deserialize(&mut footer_len_data.as_slice())? as usize;
         let footer_start = end - 4 - footer_len;
+
+        let footer_read_start = std::time::Instant::now();
         let footer_data = data
             .slice(footer_start..footer_start + footer_len)
             .read_bytes_async()
             .await?;
+        let read_footer_elapsed = footer_read_start.elapsed();
 
         // CPU-bound: VInt deserialization loop and HashMap construction
         // Run on blocking thread pool to avoid blocking tokio runtime
+        let parse_start = std::time::Instant::now();
         let (file_addrs, offsets) = tokio::task::spawn_blocking(move || {
             let mut footer_buffer = footer_data.as_slice();
             let num_fields = VInt::deserialize(&mut footer_buffer)?.0 as usize;
@@ -175,6 +183,7 @@ impl CompositeFile {
 
             Ok::<_, io::Error>((file_addrs, offsets))
         }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Task panicked: {}", e)))??;
+        let parse_elapsed = parse_start.elapsed();
 
         let mut field_index = HashMap::new();
         let num_fields = file_addrs.len();
@@ -184,6 +193,9 @@ impl CompositeFile {
             let end_offset = offsets[i + 1];
             field_index.insert(file_addr, start_offset..end_offset);
         }
+
+        eprintln!("[TIMING] CompositeFile::open_async: total={:?} (read_footer_len={:?}, read_footer={:?}, parse={:?}, num_fields={})",
+            start.elapsed(), read_footer_len_elapsed, read_footer_elapsed, parse_elapsed, num_fields);
 
         Ok(CompositeFile {
             data: data.slice_to(footer_start),
