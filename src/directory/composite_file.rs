@@ -154,21 +154,30 @@ impl CompositeFile {
             .slice(footer_start..footer_start + footer_len)
             .read_bytes_async()
             .await?;
-        let mut footer_buffer = footer_data.as_slice();
-        let num_fields = VInt::deserialize(&mut footer_buffer)?.0 as usize;
 
-        let mut file_addrs = vec![];
-        let mut offsets = vec![];
+        // CPU-bound: VInt deserialization loop and HashMap construction
+        // Run on blocking thread pool to avoid blocking tokio runtime
+        let (file_addrs, offsets) = tokio::task::spawn_blocking(move || {
+            let mut footer_buffer = footer_data.as_slice();
+            let num_fields = VInt::deserialize(&mut footer_buffer)?.0 as usize;
+
+            let mut file_addrs = vec![];
+            let mut offsets = vec![];
+
+            let mut offset = 0;
+            for _ in 0..num_fields {
+                offset += VInt::deserialize(&mut footer_buffer)?.0 as usize;
+                let file_addr = FileAddr::deserialize(&mut footer_buffer)?;
+                offsets.push(offset);
+                file_addrs.push(file_addr);
+            }
+            offsets.push(footer_start);
+
+            Ok::<_, io::Error>((file_addrs, offsets))
+        }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Task panicked: {}", e)))??;
+
         let mut field_index = HashMap::new();
-
-        let mut offset = 0;
-        for _ in 0..num_fields {
-            offset += VInt::deserialize(&mut footer_buffer)?.0 as usize;
-            let file_addr = FileAddr::deserialize(&mut footer_buffer)?;
-            offsets.push(offset);
-            file_addrs.push(file_addr);
-        }
-        offsets.push(footer_start);
+        let num_fields = file_addrs.len();
         for i in 0..num_fields {
             let file_addr = file_addrs[i];
             let start_offset = offsets[i];

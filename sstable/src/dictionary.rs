@@ -236,34 +236,17 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes_async().await?;
 
-        let sstable_index = match version {
-            2 => SSTableIndex::V2(
-                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?,
-            ),
-            3 => {
-                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
-                let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
-                if store_offset != 0 {
-                    SSTableIndex::V3(
-                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                        })?,
-                    )
-                } else {
-                    // if store_offset is zero, there is no index, so we build a pseudo-index
-                    // assuming a single block of sstable covering everything.
-                    SSTableIndex::V3Empty(SSTableIndexV3Empty::load(index_offset as usize))
-                }
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Unsuported sstable version, expected one of [2, 3], found {version}"),
-                ))
-            }
+        // CPU-bound: FST construction and block metadata deserialization
+        // Run on blocking thread pool to avoid blocking tokio runtime when available
+        #[cfg(feature = "tokio")]
+        let sstable_index = {
+            tokio::task::spawn_blocking(move || {
+                Self::load_sstable_index(version, sstable_index_bytes, index_offset)
+            }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Task panicked: {}", e)))??
         };
+
+        #[cfg(not(feature = "tokio"))]
+        let sstable_index = Self::load_sstable_index(version, sstable_index_bytes, index_offset)?;
 
         Ok(Dictionary {
             sstable_slice,
@@ -271,6 +254,37 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             num_terms,
             phantom_data: PhantomData,
         })
+    }
+
+    fn load_sstable_index(version: u32, sstable_index_bytes: OwnedBytes, index_offset: u64) -> io::Result<SSTableIndex> {
+        match version {
+            2 => Ok(SSTableIndex::V2(
+                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
+                })?,
+            )),
+            3 => {
+                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
+                let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
+                if store_offset != 0 {
+                    Ok(SSTableIndex::V3(
+                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
+                        })?,
+                    ))
+                } else {
+                    // if store_offset is zero, there is no index, so we build a pseudo-index
+                    // assuming a single block of sstable covering everything.
+                    Ok(SSTableIndex::V3Empty(SSTableIndexV3Empty::load(index_offset as usize)))
+                }
+            }
+            _ => {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Unsuported sstable version, expected one of [2, 3], found {version}"),
+                ))
+            }
+        }
     }
 
     /// Creates a term dictionary from the supplied bytes.
