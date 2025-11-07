@@ -289,30 +289,53 @@ impl SegmentReader {
             original_bitset,
         ) = futures::try_join!(
             async {
-                Ok::<_, TantivyError>(CompositeFile::open_async(&termdict_file).await?)
+                let termdict_file = termdict_file.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    CompositeFile::open(&termdict_file)
+                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+                Ok::<_, TantivyError>(result)
             },
             async {
-                Ok::<_, TantivyError>(CompositeFile::open_async(&postings_file).await?)
+                let postings_file = postings_file.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    CompositeFile::open(&postings_file)
+                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+                Ok::<_, TantivyError>(result)
             },
             async {
                 if let Some(positions_file) = positions_file_opt {
-                    Ok::<_, TantivyError>(CompositeFile::open_async(&positions_file).await?)
+                    let result = tokio::task::spawn_blocking(move || {
+                        CompositeFile::open(&positions_file)
+                    }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+                    Ok::<_, TantivyError>(result)
                 } else {
                     Ok(CompositeFile::empty())
                 }
             },
             async {
-                Ok::<_, TantivyError>(
-                    FastFieldReaders::open_async(fast_fields_data, schema.clone()).await?
-                )
+                let fast_fields_data = fast_fields_data.clone();
+                let schema = schema.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    FastFieldReaders::open(fast_fields_data, schema)
+                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+                Ok::<_, TantivyError>(result)
             },
-            async { FieldNormReaders::open_async(fieldnorm_data).await },
+            async {
+                let fieldnorm_data = fieldnorm_data.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    FieldNormReaders::open(fieldnorm_data)
+                }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+                Ok::<_, TantivyError>(result)
+            },
             async {
                 if segment.meta().has_deletes() {
                     let alive_doc_file_slice =
                         segment.open_read_async(SegmentComponent::Delete).await?;
                     let alive_doc_data = alive_doc_file_slice.read_bytes_async().await?;
-                    Ok::<_, TantivyError>(Some(AliveBitSet::open(alive_doc_data)))
+                    let result = tokio::task::spawn_blocking(move || {
+                        AliveBitSet::open(alive_doc_data)
+                    }).await.map_err(|e| TantivyError::InternalError(format!("Task panicked: {}", e)))?;
+                    Ok::<_, TantivyError>(Some(result))
                 } else {
                     Ok(None)
                 }
