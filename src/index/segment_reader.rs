@@ -228,57 +228,49 @@ impl SegmentReader {
 
         eprintln!("[TIMING] SegmentReader({}): Starting to open component files concurrently", segment_id);
 
-        // Open all component files concurrently - wrapped in spawn_blocking to test if this is blocking
-        let segment_clone = segment.clone();
-        let seg_id = segment_id.clone();
-        let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = tokio::task::spawn_blocking(move || {
-            eprintln!("[TIMING] SegmentReader({}): File opens spawn_blocking started", seg_id);
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                futures::try_join!(
-                    async {
-                        let start = std::time::Instant::now();
-                        let result = segment_clone.open_read_async(SegmentComponent::Terms).await;
-                        eprintln!("[TIMING] SegmentReader({}): Terms file opened in {:?}", seg_id, start.elapsed());
-                        result
-                    },
-                    async {
-                        let start = std::time::Instant::now();
-                        let result = segment_clone.open_read_async(SegmentComponent::Store).await;
-                        eprintln!("[TIMING] SegmentReader({}): Store file opened in {:?}", seg_id, start.elapsed());
-                        result
-                    },
-                    async {
-                        let start = std::time::Instant::now();
-                        let result = segment_clone.open_read_async(SegmentComponent::Postings).await;
-                        eprintln!("[TIMING] SegmentReader({}): Postings file opened in {:?}", seg_id, start.elapsed());
-                        result
-                    },
-                    async {
-                        let start = std::time::Instant::now();
-                        let result = segment_clone.open_read_async(SegmentComponent::FastFields).await;
-                        eprintln!("[TIMING] SegmentReader({}): FastFields file opened in {:?}", seg_id, start.elapsed());
-                        result
-                    },
-                    async {
-                        let start = std::time::Instant::now();
-                        let result = segment_clone.open_read_async(SegmentComponent::FieldNorms).await;
-                        eprintln!("[TIMING] SegmentReader({}): FieldNorms file opened in {:?}", seg_id, start.elapsed());
-                        result
-                    },
-                    async {
-                        let start = std::time::Instant::now();
-                        let result = match segment_clone.open_read_async(SegmentComponent::Positions).await {
-                            Ok(file) => Ok(Some(file)),
-                            Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
-                            Err(err) => Err(err),
-                        };
-                        eprintln!("[TIMING] SegmentReader({}): Positions file opened in {:?}", seg_id, start.elapsed());
-                        result
-                    }
-                )
-            })
-        }).await.map_err(|e| crate::TantivyError::InternalError(format!("Task panicked: {}", e)))??;
+        // Open all component files concurrently
+        let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = futures::try_join!(
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::Terms).await;
+                eprintln!("[TIMING] SegmentReader({}): Terms file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::Store).await;
+                eprintln!("[TIMING] SegmentReader({}): Store file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::Postings).await;
+                eprintln!("[TIMING] SegmentReader({}): Postings file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::FastFields).await;
+                eprintln!("[TIMING] SegmentReader({}): FastFields file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = segment.open_read_async(SegmentComponent::FieldNorms).await;
+                eprintln!("[TIMING] SegmentReader({}): FieldNorms file opened in {:?}", segment_id, start.elapsed());
+                result
+            },
+            async {
+                let start = std::time::Instant::now();
+                let result = match segment.open_read_async(SegmentComponent::Positions).await {
+                    Ok(file) => Ok(Some(file)),
+                    Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
+                    Err(err) => Err(err),
+                };
+                eprintln!("[TIMING] SegmentReader({}): Positions file opened in {:?}", segment_id, start.elapsed());
+                result
+            }
+        )?;
 
         let open_files_elapsed = open_files_start.elapsed();
         eprintln!("[TIMING] SegmentReader({}): All component files opened concurrently in {:?}", segment_id, open_files_elapsed);
