@@ -221,8 +221,14 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        // Open all component files concurrently
-        let (termdict_file, store_file, postings_file, fast_fields_data, fieldnorm_data, positions_file_opt) = futures::try_join!(
+        let (
+            termdict_file,
+            store_file,
+            postings_file,
+            fast_fields_data,
+            fieldnorm_data,
+            positions_file_opt,
+        ) = futures::try_join!(
             segment.open_read_async(SegmentComponent::Terms),
             segment.open_read_async(SegmentComponent::Store),
             segment.open_read_async(SegmentComponent::Postings),
@@ -240,6 +246,7 @@ impl SegmentReader {
         let schema = segment.schema();
 
         crate::fail_point!("SegmentReader::open#middle");
+
         let (
             termdict_composite,
             postings_composite,
@@ -249,24 +256,24 @@ impl SegmentReader {
             original_bitset,
         ) = futures::try_join!(
             async {
-                CompositeFile::open_async(&termdict_file).await.map_err(TantivyError::from)
+                Ok::<_, TantivyError>(CompositeFile::open_async(&termdict_file).await?)
             },
             async {
-                CompositeFile::open_async(&postings_file).await.map_err(TantivyError::from)
+                Ok::<_, TantivyError>(CompositeFile::open_async(&postings_file).await?)
             },
             async {
                 if let Some(positions_file) = positions_file_opt {
-                    CompositeFile::open_async(&positions_file).await.map_err(TantivyError::from)
+                    Ok::<_, TantivyError>(CompositeFile::open_async(&positions_file).await?)
                 } else {
                     Ok(CompositeFile::empty())
                 }
             },
             async {
-                FastFieldReaders::open_async(fast_fields_data, schema.clone()).await.map_err(TantivyError::from)
+                Ok::<_, TantivyError>(
+                    FastFieldReaders::open_async(fast_fields_data, schema.clone()).await?
+                )
             },
-            async {
-                FieldNormReaders::open_async(fieldnorm_data).await
-            },
+            async { FieldNormReaders::open_async(fieldnorm_data).await },
             async {
                 if segment.meta().has_deletes() {
                     let alive_doc_file_slice =
