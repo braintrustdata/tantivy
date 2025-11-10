@@ -1,5 +1,4 @@
 use std::io;
-use std::io::Cursor;
 
 use common::{BinarySerializable, FixedSize, HasLen};
 
@@ -66,22 +65,6 @@ impl DocStoreFooter {
         let (body, footer_slice) = file.split_from_end(DocStoreFooter::SIZE_IN_BYTES);
         let mut footer_bytes = footer_slice.read_bytes()?;
         let footer = DocStoreFooter::deserialize(&mut footer_bytes)?;
-        Ok((footer, body))
-    }
-
-    pub async fn extract_footer_async(file: FileSlice) -> io::Result<(DocStoreFooter, FileSlice)> {
-        if file.len() < DocStoreFooter::SIZE_IN_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "File corrupted. The file is smaller than Footer::SIZE_IN_BYTES (len={}).",
-                    file.len()
-                ),
-            ));
-        }
-        let (body, footer_slice) = file.split_from_end(DocStoreFooter::SIZE_IN_BYTES);
-        let footer_bytes = footer_slice.read_bytes_async().await?;
-        let footer = DocStoreFooter::deserialize(&mut Cursor::new(footer_bytes.as_ref()))?;
         Ok((footer, body))
     }
 }

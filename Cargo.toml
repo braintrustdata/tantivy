@@ -62,9 +62,7 @@ common = { version= "0.7", path = "./common/", package = "tantivy-common" }
 tokenizer-api = { version= "0.3", path="./tokenizer-api", package="tantivy-tokenizer-api" }
 sketches-ddsketch = { version = "0.2.1", features = ["use_serde"] }
 futures-util = { version = "0.3.28", optional = true }
-futures = "0.3.21"
 fnv = "1.0.7"
-tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -76,6 +74,7 @@ matches = "0.1.9"
 pretty_assertions = "1.2.1"
 proptest = "1.0.0"
 test-log = "0.2.10"
+futures = "0.3.21"
 paste = "1.0.11"
 more-asserts = "0.3.1"
 rand_distr = "0.4.3"
@@ -116,7 +115,7 @@ zstd-compression = ["zstd"]
 failpoints = ["fail", "fail/failpoints"]
 unstable = [] # useful for benches.
 
-quickwit = ["sstable", "futures-util", "tokio"]
+quickwit = ["sstable", "futures-util"]
 
 # Compares only the hash of a string when indexing data. 
 # Increases indexing speed, but may lead to extremely rare missing terms, when there's a hash collision.

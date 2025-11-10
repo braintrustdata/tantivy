@@ -226,53 +226,6 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         })
     }
 
-    /// Async version of `open`.
-    pub async fn open_async(term_dictionary_file: FileSlice) -> io::Result<Self> {
-        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
-        let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes_async().await?;
-        let index_offset = u64::deserialize(&mut footer_len_bytes)?;
-        let num_terms = u64::deserialize(&mut footer_len_bytes)?;
-        let version = u32::deserialize(&mut footer_len_bytes)?;
-        let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
-        let sstable_index_bytes = index_slice.read_bytes_async().await?;
-
-        let sstable_index = match version {
-            2 => SSTableIndex::V2(
-                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?,
-            ),
-            3 => {
-                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
-                let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
-                if store_offset != 0 {
-                    SSTableIndex::V3(
-                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                        })?,
-                    )
-                } else {
-                    // if store_offset is zero, there is no index, so we build a pseudo-index
-                    // assuming a single block of sstable covering everything.
-                    SSTableIndex::V3Empty(SSTableIndexV3Empty::load(index_offset as usize))
-                }
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Unsuported sstable version, expected one of [2, 3], found {version}"),
-                ))
-            }
-        };
-
-        Ok(Dictionary {
-            sstable_slice,
-            sstable_index,
-            num_terms,
-            phantom_data: PhantomData,
-        })
-    }
-
     /// Creates a term dictionary from the supplied bytes.
     pub fn from_bytes(owned_bytes: OwnedBytes) -> io::Result<Self> {
         Dictionary::open(FileSlice::new(Arc::new(owned_bytes)))

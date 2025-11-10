@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 use crate::collector::Collector;
-use futures::future::try_join_all;
 use crate::core::Executor;
 use crate::index::SegmentReader;
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
@@ -284,35 +283,6 @@ impl SearcherInner {
             .iter()
             .map(|segment_reader| segment_reader.get_store_reader(doc_store_cache_num_blocks))
             .collect::<io::Result<Vec<_>>>()?;
-
-        Ok(SearcherInner {
-            schema,
-            index,
-            segment_readers,
-            store_readers,
-            generation,
-        })
-    }
-
-    pub(crate) async fn new_async(
-        schema: Schema,
-        index: Index,
-        segment_readers: Vec<SegmentReader>,
-        generation: TrackedObject<SearcherGeneration>,
-        doc_store_cache_num_blocks: usize,
-    ) -> io::Result<SearcherInner> {
-        assert_eq!(
-            &segment_readers
-                .iter()
-                .map(|reader| (reader.segment_id(), reader.delete_opstamp()))
-                .collect::<BTreeMap<_, _>>(),
-            generation.segments(),
-            "Set of segments referenced by this Searcher and its SearcherGeneration must match"
-        );
-        let store_reader_futures = segment_readers
-            .iter()
-            .map(|segment_reader| segment_reader.get_store_reader_async(doc_store_cache_num_blocks));
-        let store_readers = try_join_all(store_reader_futures).await?;
 
         Ok(SearcherInner {
             schema,

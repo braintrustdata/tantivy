@@ -46,28 +46,6 @@ fn load_metas(
         .map_err(From::from)
 }
 
-async fn load_metas_async(
-    directory: &dyn Directory,
-    inventory: &SegmentMetaInventory,
-) -> crate::Result<IndexMeta> {
-    let meta_data = directory.atomic_read_async(&META_FILEPATH).await?;
-    let meta_string = String::from_utf8(meta_data).map_err(|_utf8_err| {
-        error!("Meta data is not valid utf8.");
-        DataCorruption::new(
-            META_FILEPATH.to_path_buf(),
-            "Meta file does not contain valid utf8 file.".to_string(),
-        )
-    })?;
-    IndexMeta::deserialize(&meta_string, inventory)
-        .map_err(|e| {
-            DataCorruption::new(
-                META_FILEPATH.to_path_buf(),
-                format!("Meta file cannot be deserialized. {e:?}. Content: {meta_string:?}"),
-            )
-        })
-        .map_err(From::from)
-}
-
 /// Save the index meta file.
 /// This operation is atomic :
 /// Either
@@ -563,11 +541,6 @@ impl Index {
         load_metas(self.directory(), &self.inventory)
     }
 
-    /// Async version of `load_metas`.
-    pub async fn load_metas_async(&self) -> crate::Result<IndexMeta> {
-        load_metas_async(self.directory(), &self.inventory).await
-    }
-
     /// Open a new index writer. Attempts to acquire a lockfile.
     ///
     /// The lockfile should be deleted on drop, but it is possible
@@ -613,39 +586,6 @@ impl Index {
             memory_arena_in_bytes_per_thread,
             directory_lock,
         )
-    }
-
-    /// Async version of `writer_with_num_threads`.
-    ///
-    /// Creates an index writer using async I/O for initialization.
-    pub async fn writer_with_num_threads_async<D: Document>(
-        &self,
-        num_threads: usize,
-        overall_memory_budget_in_bytes: usize,
-    ) -> crate::Result<IndexWriter<D>> {
-        let directory_lock = self
-            .directory
-            .acquire_lock_async(&INDEX_WRITER_LOCK)
-            .await
-            .map_err(|err| {
-                TantivyError::LockFailure(
-                    err,
-                    Some(
-                        "Failed to acquire index lock. If you are using a regular directory, this \
-                         means there is already an `IndexWriter` working on this `Directory`, in \
-                         this process or in a different process."
-                            .to_string(),
-                    ),
-                )
-            })?;
-        let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
-        IndexWriter::new_async(
-            self,
-            num_threads,
-            memory_arena_in_bytes_per_thread,
-            directory_lock,
-        )
-        .await
     }
 
     /// Helper to create an index writer for tests.
@@ -735,21 +675,6 @@ impl Index {
         Ok(self.load_metas()?.segments)
     }
 
-    /// Async version of `searchable_segment_metas`.
-    pub async fn searchable_segment_metas_async(&self) -> crate::Result<Vec<SegmentMeta>> {
-        Ok(self.load_metas_async().await?.segments)
-    }
-
-    /// Async version of `searchable_segments`.
-    pub async fn searchable_segments_async(&self) -> crate::Result<Vec<Segment>> {
-        Ok(self
-            .searchable_segment_metas_async()
-            .await?
-            .into_iter()
-            .map(|segment_meta| self.segment(segment_meta))
-            .collect())
-    }
-
     /// Returns the list of segment ids that are searchable.
     pub fn searchable_segment_ids(&self) -> crate::Result<Vec<SegmentId>> {
         Ok(self
@@ -783,72 +708,5 @@ impl Index {
 impl fmt::Debug for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::schema::{Schema, TEXT, STORED};
-    use crate::IndexWriter;
-
-    #[tokio::test]
-    #[cfg(feature = "tokio")]
-    async fn test_writer_with_num_threads_async() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-
-        let index = Index::create_in_ram(schema.clone());
-
-        // Create writer using async API
-        let mut index_writer: IndexWriter = index
-            .writer_with_num_threads_async(1, 15_000_000)
-            .await?;
-
-        // Add documents
-        index_writer.add_document(doc!(text_field => "hello world"))?;
-        index_writer.add_document(doc!(text_field => "tantivy search"))?;
-        index_writer.commit()?;
-
-        // Verify documents were indexed
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        assert_eq!(searcher.num_docs(), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "tokio")]
-    async fn test_writer_async_with_existing_segments() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-
-        let index = Index::create_in_ram(schema.clone());
-
-        // First, create some segments with regular writer
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => "existing document"))?;
-            index_writer.commit()?;
-        }
-
-        // Now create a new writer using async API - should load existing segments
-        let mut index_writer: IndexWriter = index
-            .writer_with_num_threads_async(1, 15_000_000)
-            .await?;
-
-        // Add more documents
-        index_writer.add_document(doc!(text_field => "new document"))?;
-        index_writer.commit()?;
-
-        // Verify both documents are present
-        let reader = index.reader()?;
-        let searcher = reader.searcher();
-        assert_eq!(searcher.num_docs(), 2);
-
-        Ok(())
     }
 }

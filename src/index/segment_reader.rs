@@ -6,7 +6,6 @@ use std::{fmt, io};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
-use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
@@ -140,14 +139,6 @@ impl SegmentReader {
         StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
-    /// Async counterpart to [`SegmentReader::get_store_reader`].
-    pub async fn get_store_reader_async(
-        &self,
-        cache_num_blocks: usize,
-    ) -> io::Result<StoreReader> {
-        StoreReader::open_async(self.store_file.clone(), cache_num_blocks).await
-    }
-
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)
@@ -190,101 +181,6 @@ impl SegmentReader {
         } else {
             None
         };
-
-        let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
-
-        let max_doc = segment.meta().max_doc();
-        let num_docs = alive_bitset_opt
-            .as_ref()
-            .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
-            .unwrap_or(max_doc);
-
-        Ok(SegmentReader {
-            inv_idx_reader_cache: Default::default(),
-            num_docs,
-            max_doc,
-            termdict_composite,
-            postings_composite,
-            fast_fields_readers,
-            fieldnorm_readers,
-            segment_id: segment.id(),
-            delete_opstamp: segment.meta().delete_opstamp(),
-            store_file,
-            alive_bitset_opt,
-            positions_composite,
-            schema,
-        })
-    }
-
-    /// Async version of `open_with_custom_alive_set`.
-    pub async fn open_with_custom_alive_set_async(
-        segment: &Segment,
-        custom_bitset: Option<AliveBitSet>,
-    ) -> crate::Result<SegmentReader> {
-        let (
-            termdict_file,
-            store_file,
-            postings_file,
-            fast_fields_data,
-            fieldnorm_data,
-            positions_file_opt,
-        ) = futures::try_join!(
-            segment.open_read_async(SegmentComponent::Terms),
-            segment.open_read_async(SegmentComponent::Store),
-            segment.open_read_async(SegmentComponent::Postings),
-            segment.open_read_async(SegmentComponent::FastFields),
-            segment.open_read_async(SegmentComponent::FieldNorms),
-            async {
-                match segment.open_read_async(SegmentComponent::Positions).await {
-                    Ok(file) => Ok(Some(file)),
-                    Err(OpenReadError::FileDoesNotExist(_)) => Ok(None),
-                    Err(err) => Err(err),
-                }
-            }
-        )?;
-
-        let schema = segment.schema();
-
-        crate::fail_point!("SegmentReader::open#middle");
-
-        let (
-            termdict_composite,
-            postings_composite,
-            positions_composite,
-            fast_fields_readers,
-            fieldnorm_readers,
-            original_bitset,
-        ) = futures::try_join!(
-            async {
-                Ok::<_, TantivyError>(CompositeFile::open_async(&termdict_file).await?)
-            },
-            async {
-                Ok::<_, TantivyError>(CompositeFile::open_async(&postings_file).await?)
-            },
-            async {
-                if let Some(positions_file) = positions_file_opt {
-                    Ok::<_, TantivyError>(CompositeFile::open_async(&positions_file).await?)
-                } else {
-                    Ok(CompositeFile::empty())
-                }
-            },
-            async {
-                Ok::<_, TantivyError>(
-                    FastFieldReaders::open_async(fast_fields_data, schema.clone()).await?
-                )
-            },
-            async { FieldNormReaders::open_async(fieldnorm_data).await },
-            async {
-                if segment.meta().has_deletes() {
-                    let alive_doc_file_slice =
-                        segment.open_read_async(SegmentComponent::Delete).await?;
-                    let alive_doc_data = alive_doc_file_slice.read_bytes_async().await?;
-                    Ok::<_, TantivyError>(Some(AliveBitSet::open(alive_doc_data)))
-                } else {
-                    Ok(None)
-                }
-            }
-        )?;
 
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
@@ -660,44 +556,6 @@ mod test {
     use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
     use crate::IndexWriter;
 
-    /// Trait to abstract over sync and async segment opening for testing.
-    /// This allows us to test both implementations with the same test logic.
-    trait SegmentOpener {
-        fn open_segment(&self, segment: &Segment) -> crate::Result<SegmentReader>;
-    }
-
-    /// Synchronous implementation - uses the regular sync API
-    struct SyncSegmentOpener;
-
-    impl SegmentOpener for SyncSegmentOpener {
-        fn open_segment(&self, segment: &Segment) -> crate::Result<SegmentReader> {
-            SegmentReader::open(segment)
-        }
-    }
-
-    #[cfg(feature = "tokio")]
-    /// Async implementation wrapped in sync interface - uses runtime.block_on
-    struct AsyncSegmentOpener {
-        runtime: tokio::runtime::Runtime,
-    }
-
-    #[cfg(feature = "tokio")]
-    impl AsyncSegmentOpener {
-        fn new() -> Self {
-            Self {
-                runtime: tokio::runtime::Runtime::new().unwrap(),
-            }
-        }
-    }
-
-    #[cfg(feature = "tokio")]
-    impl SegmentOpener for AsyncSegmentOpener {
-        fn open_segment(&self, segment: &Segment) -> crate::Result<SegmentReader> {
-            self.runtime
-                .block_on(SegmentReader::open_with_custom_alive_set_async(segment, None))
-        }
-    }
-
     #[test]
     fn test_merge_field_meta_data_same() {
         let schema = SchemaBuilder::new().build();
@@ -815,7 +673,8 @@ mod test {
         assert_eq!(res2, field_metadata_expected);
     }
 
-    fn test_num_alive_impl(opener: &dyn SegmentOpener) -> crate::Result<()> {
+    #[test]
+    fn test_num_alive() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("name", TEXT | STORED);
         let schema = schema_builder.build();
@@ -835,25 +694,13 @@ mod test {
             // ok, now we should have a deleted doc
             index_writer.commit()?;
         }
-
-        let segments = index.searchable_segments()?;
-        let segment_reader = opener.open_segment(&segments[0])?;
-        assert_eq!(2, segment_reader.num_docs());
-        assert_eq!(4, segment_reader.max_doc());
+        let searcher = index.reader()?.searcher();
+        assert_eq!(2, searcher.segment_reader(0).num_docs());
+        assert_eq!(4, searcher.segment_reader(0).max_doc());
         Ok(())
     }
-
     #[test]
-    fn test_num_alive() -> crate::Result<()> {
-        test_num_alive_impl(&SyncSegmentOpener)
-    }
-
-    #[test]
-    #[cfg(feature = "tokio")]
-    fn test_num_alive_async() -> crate::Result<()> {
-        test_num_alive_impl(&AsyncSegmentOpener::new())
-    }
-    fn test_alive_docs_iterator_impl(opener: &dyn SegmentOpener) -> crate::Result<()> {
+    fn test_alive_docs_iterator() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("name", TEXT | STORED);
         let schema = schema_builder.build();
@@ -878,61 +725,10 @@ mod test {
             // ok, now we should have a deleted doc
             index_writer2.commit()?;
         }
-
-        let segments = index.searchable_segments()?;
-        let segment_reader = opener.open_segment(&segments[0])?;
-        let docs: Vec<DocId> = segment_reader.doc_ids_alive().collect();
+        let searcher = index.reader()?.searcher();
+        let docs: Vec<DocId> = searcher.segment_reader(0).doc_ids_alive().collect();
         assert_eq!(vec![0u32, 2u32], docs);
         Ok(())
-    }
-
-    #[test]
-    fn test_alive_docs_iterator() -> crate::Result<()> {
-        test_alive_docs_iterator_impl(&SyncSegmentOpener)
-    }
-
-    #[test]
-    #[cfg(feature = "tokio")]
-    fn test_alive_docs_iterator_async() -> crate::Result<()> {
-        test_alive_docs_iterator_impl(&AsyncSegmentOpener::new())
-    }
-
-    fn test_inverted_index_access_impl(opener: &dyn SegmentOpener) -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema.clone());
-
-        {
-            let mut index_writer: IndexWriter = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => "hello world"))?;
-            index_writer.add_document(doc!(text_field => "tantivy search"))?;
-            index_writer.commit()?;
-        }
-
-        let segments = index.searchable_segments()?;
-        let segment_reader = opener.open_segment(&segments[0])?;
-
-        // Access the inverted index - this will fail if termdict/postings are swapped
-        let inverted_index = segment_reader.inverted_index(text_field)?;
-        let term = Term::from_field_text(text_field, "hello");
-        let term_info = inverted_index.get_term_info(&term)?;
-
-        // Should find the term "hello" in the index
-        assert!(term_info.is_some(), "Term 'hello' should be found in the index");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_inverted_index_access() -> crate::Result<()> {
-        test_inverted_index_access_impl(&SyncSegmentOpener)
-    }
-
-    #[test]
-    #[cfg(feature = "tokio")]
-    fn test_inverted_index_access_async() -> crate::Result<()> {
-        test_inverted_index_access_impl(&AsyncSegmentOpener::new())
     }
 
     #[test]
@@ -1035,87 +831,6 @@ mod test {
             "✓ Successfully opened {} segments without deadlock",
             segment_readers.len()
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "tokio")]
-    async fn test_async_segment_opening_concurrent() -> crate::Result<()> {
-        // Create an index with multiple segments
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-        let text_field = schema.get_field("text").unwrap();
-
-        let index = Index::create_in_ram(schema.clone());
-
-        // Create 8 segments
-        {
-            let mut index_writer = index.writer_for_tests()?;
-            for seg_num in 0..8 {
-                for doc_num in 0..5 {
-                    index_writer.add_document(
-                        doc!(text_field => format!("segment {} doc {}", seg_num, doc_num)),
-                    )?;
-                }
-                index_writer.commit()?;
-            }
-        }
-
-        let segments = index.searchable_segments()?;
-        assert_eq!(segments.len(), 8);
-
-        // Open all segments concurrently using async
-        let segment_readers = futures::future::try_join_all(
-            segments
-                .iter()
-                .map(|segment| SegmentReader::open_with_custom_alive_set_async(segment, None)),
-        )
-        .await?;
-
-        assert_eq!(segment_readers.len(), 8);
-
-        // Verify all segments are correctly opened
-        for (i, reader) in segment_readers.iter().enumerate() {
-            assert_eq!(reader.num_docs(), 5, "Segment {} should have 5 docs", i);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(feature = "tokio")]
-    fn test_async_store_reader() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-        let text_field = schema.get_field("text").unwrap();
-
-        let index = Index::create_in_ram(schema.clone());
-
-        {
-            let mut index_writer = index.writer_for_tests()?;
-            index_writer.add_document(doc!(text_field => "test document"))?;
-            index_writer.commit()?;
-        }
-
-        let segments = index.searchable_segments()?;
-        let segment = &segments[0];
-
-        // Test async store reader opening
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let segment_reader = runtime.block_on(
-            SegmentReader::open_with_custom_alive_set_async(segment, None)
-        )?;
-
-        let store_reader = runtime.block_on(
-            segment_reader.get_store_reader_async(10)
-        )?;
-
-        // Verify we can read from it
-        let doc: crate::TantivyDocument = store_reader.get(0)?;
-        assert!(doc.get_first(text_field).is_some());
 
         Ok(())
     }

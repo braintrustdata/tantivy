@@ -1,11 +1,9 @@
 use std::fmt;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 
 use super::SegmentComponent;
 use crate::directory::error::{OpenReadError, OpenWriteError};
-use crate::directory::{Directory, DirectoryClone, FileSlice, WritePtr};
+use crate::directory::{Directory, FileSlice, WritePtr};
 use crate::index::{Index, SegmentId, SegmentMeta};
 use crate::schema::Schema;
 use crate::Opstamp;
@@ -81,16 +79,6 @@ impl Segment {
     pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
         let path = self.relative_path(component);
         self.index.directory().open_read(&path)
-    }
-
-    /// Async version of `open_read`.
-    pub fn open_read_async(
-        &self,
-        component: SegmentComponent,
-    ) -> Pin<Box<dyn Future<Output = Result<FileSlice, OpenReadError>> + Send + '_>> {
-        let path = self.relative_path(component);
-        let directory = self.index.directory().box_clone();
-        Box::pin(async move { directory.open_read_async(path.as_path()).await })
     }
 
     /// Open one of the component file for *regular* write.
