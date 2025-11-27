@@ -209,16 +209,20 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
-        match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
-                for_each_scorer(&mut union_scorer, callback);
+        let scorer = tracing::info_span!("tantivy_create_scorer").in_scope(|| {
+            self.complex_scorer(reader, 1.0, &self.score_combiner_fn)
+        })?;
+        tracing::info_span!("tantivy_iterate_docs").in_scope(|| {
+            match scorer {
+                SpecializedScorer::TermUnion(term_scorers) => {
+                    let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
+                    for_each_scorer(&mut union_scorer, callback);
+                }
+                SpecializedScorer::Other(mut scorer) => {
+                    for_each_scorer(scorer.as_mut(), callback);
+                }
             }
-            SpecializedScorer::Other(mut scorer) => {
-                for_each_scorer(scorer.as_mut(), callback);
-            }
-        }
+        });
         Ok(())
     }
 
@@ -227,18 +231,22 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, || DoNothingCombiner)?;
+        let scorer = tracing::info_span!("tantivy_create_scorer").in_scope(|| {
+            self.complex_scorer(reader, 1.0, || DoNothingCombiner)
+        })?;
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
 
-        match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
-                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+        tracing::info_span!("tantivy_iterate_docs").in_scope(|| {
+            match scorer {
+                SpecializedScorer::TermUnion(term_scorers) => {
+                    let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
+                    for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                }
+                SpecializedScorer::Other(mut scorer) => {
+                    for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
+                }
             }
-            SpecializedScorer::Other(mut scorer) => {
-                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
-            }
-        }
+        });
         Ok(())
     }
 

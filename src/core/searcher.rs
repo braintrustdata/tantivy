@@ -223,15 +223,25 @@ impl Searcher {
         executor: &Executor,
         enabled_scoring: EnableScoring,
     ) -> crate::Result<C::Fruit> {
-        let weight = query.weight(enabled_scoring)?;
+        let weight = tracing::info_span!("tantivy_create_weight").in_scope(|| {
+            query.weight(enabled_scoring)
+        })?;
         let segment_readers = self.segment_readers();
-        let fruits = executor.map(
-            |(segment_ord, segment_reader)| {
-                collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
-            },
-            segment_readers.iter().enumerate(),
-        )?;
-        collector.merge_fruits(fruits)
+        let num_segments = segment_readers.len();
+        let fruits = tracing::info_span!("tantivy_collect_segments", num_segments).in_scope(|| {
+            executor.map(
+                |(segment_ord, segment_reader)| {
+                    let num_docs = segment_reader.num_docs();
+                    tracing::info_span!("tantivy_collect_segment", segment_ord, num_docs).in_scope(|| {
+                        collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
+                    })
+                },
+                segment_readers.iter().enumerate(),
+            )
+        })?;
+        tracing::info_span!("tantivy_merge_fruits").in_scope(|| {
+            collector.merge_fruits(fruits)
+        })
     }
 
     /// Summarize total space usage of this searcher.

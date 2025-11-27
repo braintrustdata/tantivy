@@ -91,8 +91,12 @@ pub trait Weight: Send + Sync + 'static {
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score),
     ) -> crate::Result<()> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        for_each_scorer(scorer.as_mut(), callback);
+        let mut scorer = tracing::info_span!("tantivy_create_scorer").in_scope(|| {
+            self.scorer(reader, 1.0)
+        })?;
+        tracing::info_span!("tantivy_iterate_docs").in_scope(|| {
+            for_each_scorer(scorer.as_mut(), callback);
+        });
         Ok(())
     }
 
@@ -103,10 +107,14 @@ pub trait Weight: Send + Sync + 'static {
         reader: &SegmentReader,
         callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
-        let mut docset = self.scorer(reader, 1.0)?;
+        let mut docset = tracing::info_span!("tantivy_create_scorer").in_scope(|| {
+            self.scorer(reader, 1.0)
+        })?;
 
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(&mut docset, &mut buffer, callback);
+        tracing::info_span!("tantivy_iterate_docs").in_scope(|| {
+            for_each_docset_buffered(&mut docset, &mut buffer, callback);
+        });
         Ok(())
     }
 
