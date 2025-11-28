@@ -351,12 +351,15 @@ impl SegmentReader {
 
         let term_dictionary = TermDictionary::open_async(termdict_file).await?;
 
-        let inv_idx_reader = Arc::new(InvertedIndexReader::new(
-            term_dictionary,
-            postings_file,
-            positions_file,
-            record_option,
-        )?);
+        let inv_idx_reader = Arc::new(
+            InvertedIndexReader::new_async(
+                term_dictionary,
+                postings_file,
+                positions_file,
+                record_option,
+            )
+            .await?,
+        );
 
         self.inv_idx_reader_cache
             .write()

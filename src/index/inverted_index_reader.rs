@@ -48,6 +48,25 @@ impl InvertedIndexReader {
         })
     }
 
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) async fn new_async(
+        termdict: TermDictionary,
+        postings_file_slice: FileSlice,
+        positions_file_slice: FileSlice,
+        record_option: IndexRecordOption,
+    ) -> io::Result<InvertedIndexReader> {
+        let (total_num_tokens_slice, postings_body) = postings_file_slice.split(8);
+        let mut total_num_tokens_bytes = total_num_tokens_slice.read_bytes_async().await?;
+        let total_num_tokens = u64::deserialize(&mut total_num_tokens_bytes)?;
+        Ok(InvertedIndexReader {
+            termdict,
+            postings_file_slice: postings_body,
+            positions_file_slice,
+            record_option,
+            total_num_tokens,
+        })
+    }
+
     /// Creates an empty `InvertedIndexReader` object, which
     /// contains no terms at all.
     pub fn empty(record_option: IndexRecordOption) -> InvertedIndexReader {
