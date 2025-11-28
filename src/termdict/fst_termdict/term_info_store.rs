@@ -135,6 +135,20 @@ impl TermInfoStore {
         })
     }
 
+    pub async fn open_async(term_info_store_file: FileSlice) -> io::Result<TermInfoStore> {
+        let (len_slice, main_slice) = term_info_store_file.split(16);
+        let mut bytes = len_slice.read_bytes_async().await?;
+        let len = u64::deserialize(&mut bytes)? as usize;
+        let num_terms = u64::deserialize(&mut bytes)? as usize;
+        let (block_meta_file, term_info_file) = main_slice.split(len);
+        let term_info_bytes = term_info_file.read_bytes_async().await?;
+        Ok(TermInfoStore {
+            num_terms,
+            block_meta_bytes: block_meta_file.read_bytes_async().await?,
+            term_info_bytes,
+        })
+    }
+
     pub fn get(&self, term_ord: TermOrdinal) -> TermInfo {
         let block_id = (term_ord as usize) / BLOCK_LEN;
         let buffer = self.block_meta_bytes.as_slice();

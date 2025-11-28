@@ -99,6 +99,17 @@ fn open_fst_index(fst_file: FileSlice) -> io::Result<tantivy_fst::Map<OwnedBytes
     Ok(tantivy_fst::Map::from(fst))
 }
 
+async fn open_fst_index_async(fst_file: FileSlice) -> io::Result<tantivy_fst::Map<OwnedBytes>> {
+    let bytes = fst_file.read_bytes_async().await?;
+    let fst = Fst::new(bytes).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Fst data is corrupted: {:?}", err),
+        )
+    })?;
+    Ok(tantivy_fst::Map::from(fst))
+}
+
 static EMPTY_TERM_DICT_FILE: Lazy<FileSlice> = Lazy::new(|| {
     let term_dictionary_data: Vec<u8> = TermDictionaryBuilder::create(Vec::<u8>::new())
         .expect("Creating a TermDictionaryBuilder in a Vec<u8> should never fail")
@@ -135,6 +146,28 @@ impl TermDictionary {
         let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
         let fst_index = open_fst_index(fst_file_slice)?;
         let term_info_store = TermInfoStore::open(values_file_slice)?;
+        Ok(TermDictionary {
+            fst_index,
+            term_info_store,
+        })
+    }
+
+    /// Opens a `TermDictionary` asynchronously.
+    pub async fn open_async(file: FileSlice) -> io::Result<Self> {
+        let (main_slice, footer_len_slice) = file.split_from_end(12);
+        let mut footer_len_bytes = footer_len_slice.read_bytes_async().await?;
+        let footer_size = u64::deserialize(&mut footer_len_bytes)?;
+        let version = u32::deserialize(&mut footer_len_bytes)?;
+        if version != FST_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Unsuported fst version, expected {version}, found {FST_VERSION}",),
+            ));
+        }
+
+        let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
+        let fst_index = open_fst_index_async(fst_file_slice).await?;
+        let term_info_store = TermInfoStore::open_async(values_file_slice).await?;
         Ok(TermDictionary {
             fst_index,
             term_info_store,

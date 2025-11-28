@@ -300,6 +300,72 @@ impl SegmentReader {
         Ok(inv_idx_reader)
     }
 
+    /// Asynchronous variant of [`SegmentReader::inverted_index`] that avoids blocking on I/O.
+    pub async fn inverted_index_async(
+        &self,
+        field: Field,
+    ) -> crate::Result<Arc<InvertedIndexReader>> {
+        if let Some(inv_idx_reader) = self
+            .inv_idx_reader_cache
+            .read()
+            .expect("Lock poisoned. This should never happen")
+            .get(&field)
+        {
+            return Ok(Arc::clone(inv_idx_reader));
+        }
+        let field_entry = self.schema.get_field_entry(field);
+        let field_type = field_entry.field_type();
+        let record_option_opt = field_type.get_index_record_option();
+
+        if record_option_opt.is_none() {
+            warn!("Field {:?} does not seem indexed.", field_entry.name());
+        }
+
+        let postings_file_opt = self.postings_composite.open_read(field);
+
+        if postings_file_opt.is_none() || record_option_opt.is_none() {
+            let record_option = record_option_opt.unwrap_or(IndexRecordOption::Basic);
+            return Ok(Arc::new(InvertedIndexReader::empty(record_option)));
+        }
+
+        let record_option = record_option_opt.unwrap();
+        let postings_file = postings_file_opt.unwrap();
+
+        let termdict_file: FileSlice =
+            self.termdict_composite.open_read(field).ok_or_else(|| {
+                DataCorruption::comment_only(format!(
+                    "Failed to open field {:?}'s term dictionary in the composite file. Has the \
+                     schema been modified?",
+                    field_entry.name()
+                ))
+            })?;
+
+        let positions_file = self.positions_composite.open_read(field).ok_or_else(|| {
+            let error_msg = format!(
+                "Failed to open field {:?}'s positions in the composite file. Has the schema been \
+                 modified?",
+                field_entry.name()
+            );
+            DataCorruption::comment_only(error_msg)
+        })?;
+
+        let term_dictionary = TermDictionary::open_async(termdict_file).await?;
+
+        let inv_idx_reader = Arc::new(InvertedIndexReader::new(
+            term_dictionary,
+            postings_file,
+            positions_file,
+            record_option,
+        )?);
+
+        self.inv_idx_reader_cache
+            .write()
+            .expect("Field reader cache lock poisoned. This should never happen.")
+            .insert(field, Arc::clone(&inv_idx_reader));
+
+        Ok(inv_idx_reader)
+    }
+
     /// Returns the list of fields that have been indexed in the segment.
     /// The field list includes the field defined in the schema as well as the fields
     /// that have been indexed as a part of a JSON field.
