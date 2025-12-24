@@ -612,7 +612,7 @@ impl<D: Document> IndexWriter<D> {
         //
         // This will move uncommitted segments to the state of
         // committed segments.
-        info!("Preparing commit");
+        debug!("Preparing commit");
 
         // this will drop the current document channel
         // and recreate a new one.
@@ -637,7 +637,7 @@ impl<D: Document> IndexWriter<D> {
 
         let commit_opstamp = self.stamper.stamp();
         let prepared_commit = PreparedCommit::new(self, commit_opstamp);
-        info!("Prepared commit {}", commit_opstamp);
+        debug!("Prepared commit {}", commit_opstamp);
         Ok(prepared_commit)
     }
 
