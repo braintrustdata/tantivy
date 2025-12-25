@@ -93,6 +93,7 @@ fn column_dictionary_prefix_for_subpath(root_path: &str) -> String {
 fn read_all_columns_in_stream_with_name(
     mut stream: sstable::Streamer<'_, RangeSSTable>,
     column_data: &FileSlice,
+    format_version: Version,
 ) -> io::Result<Vec<(String, DynamicColumnHandle)>> {
     let mut results = Vec::new();
     while stream.advance() {
@@ -112,6 +113,7 @@ fn read_all_columns_in_stream_with_name(
         let dynamic_column_handle = DynamicColumnHandle {
             file_slice,
             column_type,
+            format_version,
         };
         results.push((column_name, dynamic_column_handle));
     }
@@ -257,7 +259,7 @@ impl ColumnarReader {
         let stream = self
             .stream_for_column_start_end(start_key, end_key)
             .into_stream()?;
-        read_all_columns_in_stream_with_name(stream, &self.column_data)
+        read_all_columns_in_stream_with_name(stream, &self.column_data, self.format_version)
     }
 
     /// Return the number of columns in the columnar.
