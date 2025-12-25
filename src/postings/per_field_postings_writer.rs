@@ -69,5 +69,7 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
                 JsonPostingsWriter::<DocIdRecorder>::default().into()
             }
         }
+        // Vectors are not indexed in postings, but we still need a placeholder postings writer
+        FieldType::Vector(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
     }
 }

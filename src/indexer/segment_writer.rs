@@ -18,6 +18,7 @@ use crate::schema::document::{Document, ReferenceValue, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
 use crate::store::{StoreReader, StoreWriter};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
+use crate::vector::VectorFieldsWriter;
 use crate::{DocId, Opstamp, SegmentComponent, TantivyError};
 
 /// Computes the initial size of the hash table.
@@ -67,6 +68,7 @@ pub struct SegmentWriter {
     pub(crate) segment_serializer: SegmentSerializer,
     pub(crate) fast_field_writers: FastFieldsWriter,
     pub(crate) fieldnorms_writer: FieldNormsWriter,
+    pub(crate) vector_fields_writer: VectorFieldsWriter,
     pub(crate) json_path_writer: JsonPathWriter,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     per_field_text_analyzers: Vec<TextAnalyzer>,
@@ -118,6 +120,7 @@ impl SegmentWriter {
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
+            vector_fields_writer: VectorFieldsWriter::from_schema(&schema),
             json_path_writer: JsonPathWriter::default(),
             segment_serializer,
             fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
@@ -152,6 +155,7 @@ impl SegmentWriter {
             self.ctx,
             self.fast_field_writers,
             &self.fieldnorms_writer,
+            self.vector_fields_writer,
             self.segment_serializer,
             mapping.as_ref(),
         )?;
@@ -165,6 +169,7 @@ impl SegmentWriter {
         self.ctx.mem_usage()
             + self.fieldnorms_writer.mem_usage()
             + self.fast_field_writers.mem_usage()
+            + self.vector_fields_writer.mem_usage()
             + self.segment_serializer.mem_usage()
     }
 
@@ -378,6 +383,10 @@ impl SegmentWriter {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
+                FieldType::Vector(_) => {
+                    // Vector fields are handled separately in the vector writer
+                    // They are not indexed in postings
+                }
             }
         }
         Ok(())
@@ -393,6 +402,7 @@ impl SegmentWriter {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
+        self.vector_fields_writer.add_document(&document);
         self.index_document(&document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema)?;
@@ -432,6 +442,7 @@ fn remap_and_write(
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
+    vector_fields_writer: VectorFieldsWriter,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {
@@ -453,6 +464,15 @@ fn remap_and_write(
     )?;
     debug!("fastfield-serialize");
     fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
+
+    // Serialize vectors if there are any vector fields
+    if vector_fields_writer.has_vector_fields() {
+        debug!("vector-serialize");
+        let vector_write = serializer
+            .segment_mut()
+            .open_write(SegmentComponent::Vectors)?;
+        vector_fields_writer.serialize(vector_write, doc_id_map)?;
+    }
 
     // finalize temp docstore and create version, which reflects the doc_id_map
     if let Some(doc_id_map) = doc_id_map {

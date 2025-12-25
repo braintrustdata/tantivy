@@ -48,6 +48,8 @@ pub enum OwnedValue {
     Object(BTreeMap<String, Self>),
     /// IpV6 Address. Internally there is no IpV4, it needs to be converted to `Ipv6Addr`.
     IpAddr(Ipv6Addr),
+    /// Vector embedding (f32 array)
+    Vector(Vec<f32>),
 }
 
 impl AsRef<OwnedValue> for OwnedValue {
@@ -74,6 +76,7 @@ impl<'a> Value<'a> for &'a OwnedValue {
             OwnedValue::Facet(val) => ReferenceValueLeaf::Facet(val).into(),
             OwnedValue::Bytes(val) => ReferenceValueLeaf::Bytes(val).into(),
             OwnedValue::IpAddr(val) => ReferenceValueLeaf::IpAddr(*val).into(),
+            OwnedValue::Vector(val) => ReferenceValueLeaf::Vector(val).into(),
             OwnedValue::Array(array) => ReferenceValue::Array(array.iter()),
             OwnedValue::Object(object) => ReferenceValue::Object(ObjectMapIter(object.iter())),
         }
@@ -156,6 +159,10 @@ impl ValueDeserialize for OwnedValue {
 
                 Ok(OwnedValue::Object(elements))
             }
+
+            fn visit_vector(&self, val: Vec<f32>) -> Result<Self::Value, DeserializeError> {
+                Ok(OwnedValue::Vector(val))
+            }
         }
 
         deserializer.deserialize_any(Visitor)
@@ -190,6 +197,7 @@ impl serde::Serialize for OwnedValue {
                 }
             }
             OwnedValue::Array(ref array) => array.serialize(serializer),
+            OwnedValue::Vector(ref vector) => vector.serialize(serializer),
         }
     }
 }
@@ -277,6 +285,7 @@ impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
                 ReferenceValueLeaf::IpAddr(val) => OwnedValue::IpAddr(val),
                 ReferenceValueLeaf::Bool(val) => OwnedValue::Bool(val),
                 ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(val.clone()),
+                ReferenceValueLeaf::Vector(val) => OwnedValue::Vector(val.to_vec()),
             },
             ReferenceValue::Array(val) => {
                 OwnedValue::Array(val.map(|v| v.as_value().into()).collect())
@@ -358,6 +367,12 @@ impl From<Vec<u8>> for OwnedValue {
 impl From<PreTokenizedString> for OwnedValue {
     fn from(pretokenized_string: PreTokenizedString) -> OwnedValue {
         OwnedValue::PreTokStr(pretokenized_string)
+    }
+}
+
+impl From<Vec<f32>> for OwnedValue {
+    fn from(vector: Vec<f32>) -> OwnedValue {
+        OwnedValue::Vector(vector)
     }
 }
 

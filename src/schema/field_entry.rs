@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ip_options::IpAddrOptions;
 use crate::schema::bytes_options::BytesOptions;
+use crate::schema::vector_options::VectorOptions;
 use crate::schema::{
     is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
     TextOptions,
@@ -81,6 +82,11 @@ impl FieldEntry {
         Self::new(field_name, FieldType::JsonObject(json_object_options))
     }
 
+    /// Creates a field entry for a vector field
+    pub fn new_vector(field_name: String, vector_options: VectorOptions) -> FieldEntry {
+        Self::new(field_name, FieldType::Vector(vector_options))
+    }
+
     /// Returns the name of the field
     pub fn name(&self) -> &str {
         &self.name
@@ -130,7 +136,13 @@ impl FieldEntry {
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
+            FieldType::Vector(_) => false, // Vectors are stored in .vec file, not doc store
         }
+    }
+
+    /// Returns true if this field is a vector field
+    pub fn is_vector(&self) -> bool {
+        self.field_type.is_vector()
     }
 }
 

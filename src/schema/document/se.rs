@@ -145,6 +145,16 @@ where W: Write
 
                     val.serialize(self.writer)
                 }
+                ReferenceValueLeaf::Vector(val) => {
+                    self.write_type_code(type_codes::VECTOR_CODE)?;
+                    // Write length as varint, then f32s as raw bytes
+                    let len = val.len() as u64;
+                    len.serialize(self.writer)?;
+                    for &v in val {
+                        self.writer.write_all(&v.to_le_bytes())?;
+                    }
+                    Ok(())
+                }
             },
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;

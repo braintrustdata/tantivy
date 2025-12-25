@@ -509,6 +509,11 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
+            FieldType::Vector(_) => {
+                Err(QueryParserError::UnsupportedQuery(
+                    "Vector fields cannot be queried with text queries. Use vector similarity search instead.".to_string(),
+                ))
+            }
         }
     }
 
@@ -608,6 +613,11 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
+            }
+            FieldType::Vector(_) => {
+                Err(QueryParserError::UnsupportedQuery(
+                    "Vector fields cannot be queried with text queries. Use vector similarity search instead.".to_string(),
+                ))
             }
         }
     }

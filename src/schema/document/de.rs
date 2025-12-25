@@ -125,6 +125,9 @@ pub trait ValueDeserializer<'de> {
     /// Attempts to deserialize a pre-tokenized string value from the deserializer.
     fn deserialize_pre_tokenized_string(self) -> Result<PreTokenizedString, DeserializeError>;
 
+    /// Attempts to deserialize a vector value from the deserializer.
+    fn deserialize_vector(self) -> Result<Vec<f32>, DeserializeError>;
+
     /// Attempts to deserialize the value using a given visitor.
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
     where V: ValueVisitor;
@@ -162,6 +165,8 @@ pub enum ValueType {
     /// A JSON object value. Deprecated.
     #[deprecated(note = "We keep this for backwards compatibility, use Object instead")]
     JSONObject,
+    /// A vector embedding value.
+    Vector,
 }
 
 /// A value visitor for deserializing a document value.
@@ -240,6 +245,12 @@ pub trait ValueVisitor {
         _val: PreTokenizedString,
     ) -> Result<Self::Value, DeserializeError> {
         Err(DeserializeError::UnsupportedType(ValueType::PreTokStr))
+    }
+
+    #[inline]
+    /// Called when the deserializer visits a vector value.
+    fn visit_vector(&self, _val: Vec<f32>) -> Result<Self::Value, DeserializeError> {
+        Err(DeserializeError::UnsupportedType(ValueType::Vector))
     }
 
     #[inline]
@@ -381,6 +392,7 @@ where R: Read
             type_codes::NULL_CODE => ValueType::Null,
             type_codes::ARRAY_CODE => ValueType::Array,
             type_codes::OBJECT_CODE => ValueType::Object,
+            type_codes::VECTOR_CODE => ValueType::Vector,
             #[allow(deprecated)]
             type_codes::JSON_OBJ_CODE => ValueType::JSONObject,
             _ => {
@@ -469,6 +481,21 @@ where R: Read
             .map_err(DeserializeError::from)
     }
 
+    fn deserialize_vector(self) -> Result<Vec<f32>, DeserializeError> {
+        self.validate_type(ValueType::Vector)?;
+        let len = <u64 as BinarySerializable>::deserialize(&mut *self.reader)
+            .map_err(DeserializeError::from)? as usize;
+        let mut vector = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut bytes = [0u8; 4];
+            self.reader
+                .read_exact(&mut bytes)
+                .map_err(DeserializeError::from)?;
+            vector.push(f32::from_le_bytes(bytes));
+        }
+        Ok(vector)
+    }
+
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
     where V: ValueVisitor {
         match self.value_type {
@@ -540,6 +567,10 @@ where R: Read
                 let access = BinaryObjectDeserializer::from_reader(&mut slice)?;
 
                 visitor.visit_object(access)
+            }
+            ValueType::Vector => {
+                let val = self.deserialize_vector()?;
+                visitor.visit_vector(val)
             }
         }
     }
