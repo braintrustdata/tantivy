@@ -147,11 +147,17 @@ where W: Write
                 }
                 ReferenceValueLeaf::Vector(val) => {
                     self.write_type_code(type_codes::VECTOR_CODE)?;
-                    // Write length as varint, then f32s as raw bytes
-                    let len = val.len() as u64;
-                    len.serialize(self.writer)?;
-                    for &v in val {
-                        self.writer.write_all(&v.to_le_bytes())?;
+                    // Write number of entries in the map
+                    let num_entries = val.len() as u64;
+                    num_entries.serialize(self.writer)?;
+                    // Write each key-vector pair
+                    for (key, vec) in val {
+                        key.serialize(self.writer)?;
+                        let vec_len = vec.len() as u64;
+                        vec_len.serialize(self.writer)?;
+                        for &v in vec {
+                            self.writer.write_all(&v.to_le_bytes())?;
+                        }
                     }
                     Ok(())
                 }

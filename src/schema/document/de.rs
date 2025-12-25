@@ -125,8 +125,8 @@ pub trait ValueDeserializer<'de> {
     /// Attempts to deserialize a pre-tokenized string value from the deserializer.
     fn deserialize_pre_tokenized_string(self) -> Result<PreTokenizedString, DeserializeError>;
 
-    /// Attempts to deserialize a vector value from the deserializer.
-    fn deserialize_vector(self) -> Result<Vec<f32>, DeserializeError>;
+    /// Attempts to deserialize a vector map value from the deserializer.
+    fn deserialize_vector(self) -> Result<BTreeMap<String, Vec<f32>>, DeserializeError>;
 
     /// Attempts to deserialize the value using a given visitor.
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
@@ -248,8 +248,11 @@ pub trait ValueVisitor {
     }
 
     #[inline]
-    /// Called when the deserializer visits a vector value.
-    fn visit_vector(&self, _val: Vec<f32>) -> Result<Self::Value, DeserializeError> {
+    /// Called when the deserializer visits a vector map value.
+    fn visit_vector(
+        &self,
+        _val: BTreeMap<String, Vec<f32>>,
+    ) -> Result<Self::Value, DeserializeError> {
         Err(DeserializeError::UnsupportedType(ValueType::Vector))
     }
 
@@ -481,19 +484,31 @@ where R: Read
             .map_err(DeserializeError::from)
     }
 
-    fn deserialize_vector(self) -> Result<Vec<f32>, DeserializeError> {
+    fn deserialize_vector(self) -> Result<BTreeMap<String, Vec<f32>>, DeserializeError> {
         self.validate_type(ValueType::Vector)?;
-        let len = <u64 as BinarySerializable>::deserialize(&mut *self.reader)
+        // Read number of entries in the map
+        let num_entries = <u64 as BinarySerializable>::deserialize(&mut *self.reader)
             .map_err(DeserializeError::from)? as usize;
-        let mut vector = Vec::with_capacity(len);
-        for _ in 0..len {
-            let mut bytes = [0u8; 4];
-            self.reader
-                .read_exact(&mut bytes)
+        let mut vector_map = BTreeMap::new();
+        for _ in 0..num_entries {
+            // Read the key (string)
+            let key = <String as BinarySerializable>::deserialize(&mut *self.reader)
                 .map_err(DeserializeError::from)?;
-            vector.push(f32::from_le_bytes(bytes));
+            // Read the vector length
+            let vec_len = <u64 as BinarySerializable>::deserialize(&mut *self.reader)
+                .map_err(DeserializeError::from)? as usize;
+            // Read the vector data
+            let mut vector = Vec::with_capacity(vec_len);
+            for _ in 0..vec_len {
+                let mut bytes = [0u8; 4];
+                self.reader
+                    .read_exact(&mut bytes)
+                    .map_err(DeserializeError::from)?;
+                vector.push(f32::from_le_bytes(bytes));
+            }
+            vector_map.insert(key, vector);
         }
-        Ok(vector)
+        Ok(vector_map)
     }
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>

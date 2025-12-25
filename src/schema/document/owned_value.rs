@@ -48,8 +48,9 @@ pub enum OwnedValue {
     Object(BTreeMap<String, Self>),
     /// IpV6 Address. Internally there is no IpV4, it needs to be converted to `Ipv6Addr`.
     IpAddr(Ipv6Addr),
-    /// Vector embedding (f32 array)
-    Vector(Vec<f32>),
+    /// Vector embeddings - a map of string IDs to f32 arrays.
+    /// Each document can have multiple named vectors for a single vector field.
+    Vector(BTreeMap<String, Vec<f32>>),
 }
 
 impl AsRef<OwnedValue> for OwnedValue {
@@ -160,7 +161,10 @@ impl ValueDeserialize for OwnedValue {
                 Ok(OwnedValue::Object(elements))
             }
 
-            fn visit_vector(&self, val: Vec<f32>) -> Result<Self::Value, DeserializeError> {
+            fn visit_vector(
+                &self,
+                val: BTreeMap<String, Vec<f32>>,
+            ) -> Result<Self::Value, DeserializeError> {
                 Ok(OwnedValue::Vector(val))
             }
         }
@@ -285,7 +289,7 @@ impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
                 ReferenceValueLeaf::IpAddr(val) => OwnedValue::IpAddr(val),
                 ReferenceValueLeaf::Bool(val) => OwnedValue::Bool(val),
                 ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(val.clone()),
-                ReferenceValueLeaf::Vector(val) => OwnedValue::Vector(val.to_vec()),
+                ReferenceValueLeaf::Vector(val) => OwnedValue::Vector(val.clone()),
             },
             ReferenceValue::Array(val) => {
                 OwnedValue::Array(val.map(|v| v.as_value().into()).collect())
@@ -370,9 +374,9 @@ impl From<PreTokenizedString> for OwnedValue {
     }
 }
 
-impl From<Vec<f32>> for OwnedValue {
-    fn from(vector: Vec<f32>) -> OwnedValue {
-        OwnedValue::Vector(vector)
+impl From<BTreeMap<String, Vec<f32>>> for OwnedValue {
+    fn from(vector_map: BTreeMap<String, Vec<f32>>) -> OwnedValue {
+        OwnedValue::Vector(vector_map)
     }
 }
 

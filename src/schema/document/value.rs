@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::net::Ipv6Addr;
 
@@ -99,8 +100,8 @@ pub trait Value<'a>: Send + Sync + Debug {
     }
 
     #[inline]
-    /// If the Value is a vector, returns the associated vector slice. Returns None otherwise.
-    fn as_vector(&self) -> Option<&'a [f32]> {
+    /// If the Value is a vector map, returns the associated map. Returns None otherwise.
+    fn as_vector(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
         self.as_leaf().and_then(|leaf| leaf.as_vector())
     }
 
@@ -162,8 +163,8 @@ pub enum ReferenceValueLeaf<'a> {
     Bool(bool),
     /// Pre-tokenized str type,
     PreTokStr(&'a PreTokenizedString),
-    /// Vector embedding (f32 array)
-    Vector(&'a [f32]),
+    /// Vector embeddings - a map of string IDs to f32 arrays.
+    Vector(&'a BTreeMap<String, Vec<f32>>),
 }
 
 impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<'a, T> {
@@ -301,8 +302,8 @@ impl<'a> ReferenceValueLeaf<'a> {
     }
 
     #[inline]
-    /// If the Value is a vector, returns the associated vector slice. Returns None otherwise.
-    pub fn as_vector(&self) -> Option<&'a [f32]> {
+    /// If the Value is a vector map, returns the associated map. Returns None otherwise.
+    pub fn as_vector(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
         if let Self::Vector(val) = self {
             Some(val)
         } else {
@@ -405,8 +406,8 @@ where V: Value<'a>
     }
 
     #[inline]
-    /// If the Value is a vector, returns the associated vector slice. Returns None otherwise.
-    pub fn as_vector(&self) -> Option<&'a [f32]> {
+    /// If the Value is a vector map, returns the associated map. Returns None otherwise.
+    pub fn as_vector(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
         self.as_leaf().and_then(|leaf| leaf.as_vector())
     }
 

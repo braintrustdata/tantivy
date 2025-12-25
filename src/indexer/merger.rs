@@ -812,16 +812,18 @@ impl IndexMerger {
             .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)))
     }
     
-    /// Writes merged vectors from all segments to the output.
+    /// Writes merged vectors from all segments to the output in columnar format.
     fn write_vectors(
         &self,
         mut wrt: WritePtr,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
+        use std::collections::BTreeSet;
         use std::io::Write;
-        
+
         // Get vector fields from schema
-        let vector_fields: Vec<Field> = self.schema
+        let vector_fields: Vec<Field> = self
+            .schema
             .fields()
             .filter_map(|(field, entry)| {
                 if matches!(entry.field_type(), FieldType::Vector(_)) {
@@ -831,16 +833,16 @@ impl IndexMerger {
                 }
             })
             .collect();
-        
+
         if vector_fields.is_empty() {
             return Ok(());
         }
-        
+
         // Load vector readers for each segment
         let mut segment_vector_readers: Vec<Option<VectorReader>> = Vec::new();
         for segment in &self.segments {
             let vec_path = segment.meta().relative_path(SegmentComponent::Vectors);
-            
+
             if segment.index().directory().exists(&vec_path)? {
                 let vec_data = segment.open_read(SegmentComponent::Vectors)?;
                 let vec_bytes = vec_data.read_bytes()?;
@@ -850,42 +852,64 @@ impl IndexMerger {
                 segment_vector_readers.push(None);
             }
         }
-        
+
         // Write header
         let num_fields = vector_fields.len() as u32;
         wrt.write_all(&num_fields.to_le_bytes())?;
-        
+
         for field in &vector_fields {
             wrt.write_all(&field.field_id().to_le_bytes())?;
         }
-        
+
         wrt.write_all(&self.max_doc.to_le_bytes())?;
-        
-        // Write vectors for each field following the doc_id_mapping
+
+        // Write vectors for each field in columnar format
         for field in &vector_fields {
-            for doc_addr in &doc_id_mapping.new_doc_id_to_old_doc_addr {
-                let segment_ord = doc_addr.segment_ord as usize;
-                let old_doc_id = doc_addr.doc_id;
-                
-                let vector = segment_vector_readers
-                    .get(segment_ord)
-                    .and_then(|opt_reader| opt_reader.as_ref())
-                    .and_then(|reader| reader.get(*field, old_doc_id));
-                
-                match vector {
-                    Some(vec) => {
-                        wrt.write_all(&(vec.len() as u32).to_le_bytes())?;
-                        for v in vec {
-                            wrt.write_all(&v.to_le_bytes())?;
-                        }
+            // Collect all vector IDs from all segments for this field
+            let mut all_vector_ids: BTreeSet<String> = BTreeSet::new();
+            for opt_reader in &segment_vector_readers {
+                if let Some(reader) = opt_reader {
+                    if let Some(ids) = reader.vector_ids(*field) {
+                        all_vector_ids.extend(ids.map(|s| s.to_string()));
                     }
-                    None => {
-                        wrt.write_all(&0u32.to_le_bytes())?;
+                }
+            }
+
+            // Write number of vector IDs
+            wrt.write_all(&(all_vector_ids.len() as u32).to_le_bytes())?;
+
+            // Write each vector ID's data (columnar: all docs for each ID)
+            for vector_id in &all_vector_ids {
+                // Write vector ID string
+                let id_bytes = vector_id.as_bytes();
+                wrt.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
+                wrt.write_all(id_bytes)?;
+
+                // Write vectors for all docs in new doc order
+                for doc_addr in &doc_id_mapping.new_doc_id_to_old_doc_addr {
+                    let segment_ord = doc_addr.segment_ord as usize;
+                    let old_doc_id = doc_addr.doc_id;
+
+                    let vector = segment_vector_readers
+                        .get(segment_ord)
+                        .and_then(|opt_reader| opt_reader.as_ref())
+                        .and_then(|reader| reader.get(*field, vector_id, old_doc_id));
+
+                    match vector {
+                        Some(vec) => {
+                            wrt.write_all(&(vec.len() as u32).to_le_bytes())?;
+                            for v in vec {
+                                wrt.write_all(&v.to_le_bytes())?;
+                            }
+                        }
+                        None => {
+                            wrt.write_all(&0u32.to_le_bytes())?;
+                        }
                     }
                 }
             }
         }
-        
+
         // Terminate with footer (adds magic bytes required by tantivy's file reading)
         wrt.terminate()?;
         Ok(())

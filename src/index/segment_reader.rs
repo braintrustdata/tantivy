@@ -186,15 +186,7 @@ impl SegmentReader {
         };
 
         // Try to load vector file if it exists
-        let vector_file_opt = match segment.open_read(SegmentComponent::Vectors) {
-            Ok(file) => Some(file),
-            Err(e) => {
-                // Debug: log the error  
-                #[cfg(test)]
-                eprintln!("Failed to open vector file for segment {:?}: {:?}", segment.id(), e);
-                None
-            }
-        };
+        let vector_file_opt = segment.open_read(SegmentComponent::Vectors).ok();
 
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
@@ -425,15 +417,15 @@ impl SegmentReader {
     /// Returns a VectorReader for reading vector data from this segment.
     ///
     /// Returns `None` if the segment has no vector data.
-    pub fn vector_reader(&self) -> io::Result<Option<VectorReader>> {
-        match &self.vector_file_opt {
-            Some(file_slice) => {
-                let bytes = file_slice.read_bytes()?;
-                let reader = VectorReader::open(bytes.as_slice())?;
-                Ok(Some(reader))
-            }
-            None => Ok(None),
-        }
+    /// The `field` parameter is used for API consistency but all fields' vectors
+    /// are stored in the same file.
+    pub fn vector_reader(&self, _field: Field) -> Option<VectorReader> {
+        self.vector_file_opt.as_ref().and_then(|file_slice| {
+            file_slice
+                .read_bytes()
+                .ok()
+                .and_then(|bytes| VectorReader::open(bytes.as_slice()).ok())
+        })
     }
 
     /// Returns the bitset representing the alive `DocId`s.

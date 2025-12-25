@@ -568,8 +568,9 @@ impl FieldType {
             },
             JsonValue::Array(json_array) => match self {
                 FieldType::Vector(_) => {
+                    // Parse as a single vector with default key "default"
                     let mut vector = Vec::with_capacity(json_array.len());
-                    for (i, val) in json_array.iter().enumerate() {
+                    for val in json_array.iter() {
                         match val.as_f64() {
                             Some(f) => vector.push(f as f32),
                             None => {
@@ -580,11 +581,47 @@ impl FieldType {
                             }
                         }
                     }
-                    Ok(OwnedValue::Vector(vector))
+                    let mut map = std::collections::BTreeMap::new();
+                    map.insert("default".to_string(), vector);
+                    Ok(OwnedValue::Vector(map))
                 }
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Array(json_array),
+                }),
+            },
+            JsonValue::Object(json_obj) => match self {
+                FieldType::Vector(_) => {
+                    // Parse as a map of vector ID -> vector
+                    let mut map = std::collections::BTreeMap::new();
+                    for (key, val) in json_obj.iter() {
+                        if let Some(arr) = val.as_array() {
+                            let mut vector = Vec::with_capacity(arr.len());
+                            for v in arr {
+                                match v.as_f64() {
+                                    Some(f) => vector.push(f as f32),
+                                    None => {
+                                        return Err(ValueParsingError::TypeError {
+                                            expected: "object with arrays of numbers",
+                                            json: JsonValue::Object(json_obj),
+                                        });
+                                    }
+                                }
+                            }
+                            map.insert(key.clone(), vector);
+                        } else {
+                            return Err(ValueParsingError::TypeError {
+                                expected: "object with arrays of numbers",
+                                json: JsonValue::Object(json_obj),
+                            });
+                        }
+                    }
+                    Ok(OwnedValue::Vector(map))
+                }
+                FieldType::JsonObject(_) => Ok(json_obj.into()),
+                _ => Err(ValueParsingError::TypeError {
+                    expected: self.value_type().name(),
+                    json: JsonValue::Object(json_obj),
                 }),
             },
         }

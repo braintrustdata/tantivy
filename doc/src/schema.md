@@ -17,7 +17,11 @@ Tantivy supports the following field types:
 
 ## Vector Fields
 
-Vector fields allow you to store embedding vectors alongside your documents. This is useful for semantic search, recommendation systems, and other ML-powered features.
+Vector fields allow you to store **named embedding vectors** alongside your documents. Each document can have multiple vectors per field, identified by string IDs (e.g., "chunk_0", "chunk_1", "summary"). This is useful for:
+
+- Chunked document embeddings (store vectors for each chunk)
+- Multi-representation embeddings (e.g., title vs body vs summary)
+- Semantic search and recommendation systems
 
 ### Creating a Vector Field
 
@@ -29,32 +33,49 @@ let embedding = schema_builder.add_vector_field("embedding", ());
 let schema = schema_builder.build();
 ```
 
-### Adding Vectors to Documents
+### Adding Named Vectors to Documents
 
 ```rust
 use tantivy::TantivyDocument;
 
 let mut doc = TantivyDocument::new();
-doc.add_field_value(embedding, vec![0.1f32, 0.2, 0.3, 0.4]);
+// Add multiple named vectors
+doc.add_named_vector(embedding, "chunk_0", vec![0.1, 0.2, 0.3]);
+doc.add_named_vector(embedding, "chunk_1", vec![0.4, 0.5, 0.6]);
+doc.add_named_vector(embedding, "summary", vec![1.0, 2.0]);
 ```
 
 ### Key Features
 
-- **Variable dimensions**: Each document can have vectors of different sizes
-- **Optional**: Documents don't need to have a vector for every vector field
+- **Named vectors**: Each document can have multiple vectors identified by string IDs
+- **Columnar storage**: Vectors with the same ID are stored contiguously for efficient batch access
+- **Variable dimensions**: Each vector can have different sizes
+- **Optional**: Documents don't need to have all vector IDs
 - **Segment-integrated**: Vector files are managed alongside other segment files during merges and garbage collection
 
-### Reading Vectors
+### Reading Vectors (Columnar Access)
+
+The primary access pattern is retrieving all vectors with a given ID across documents:
 
 ```rust
-// After committing and creating a reader
 let reader = index.reader()?;
 let searcher = reader.searcher();
 
 for segment_reader in searcher.segment_readers() {
-    if let Some(vector_reader) = segment_reader.vector_reader()? {
-        let vec = vector_reader.get(embedding, doc_id);
+    if let Some(vector_reader) = segment_reader.vector_reader(embedding) {
+        // Primary access pattern: iterate all "chunk_0" vectors
+        for (doc_id, vec) in vector_reader.iter_vectors(embedding, "chunk_0") {
+            println!("Doc {}: {:?}", doc_id, vec);
+        }
+        
+        // Or get a specific document's vector
+        let vec = vector_reader.get(embedding, "summary", doc_id);
         // vec is Option<&[f32]>
+        
+        // Get all vector IDs for a field
+        for id in vector_reader.vector_ids(embedding).unwrap() {
+            println!("Vector ID: {}", id);
+        }
     }
 }
 ```
