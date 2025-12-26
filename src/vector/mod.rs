@@ -102,9 +102,11 @@
 //! - Approximate nearest neighbor (ANN) search
 //! - Quantization for memory efficiency
 
+pub mod format;
 mod reader;
 mod writer;
 
+pub use format::{VectorEncoding, Int8QuantParams, PresenceBitset, VECTOR_MAGIC, VECTOR_VERSION};
 pub use reader::VectorReader;
 pub use writer::VectorFieldsWriter;
 
@@ -140,10 +142,17 @@ mod tests {
 
     #[test]
     fn test_vector_binary_format_roundtrip() {
-        // Manually write columnar binary data and read it back
+        use crate::vector::format::{VECTOR_MAGIC, VECTOR_VERSION, VectorEncoding};
+        
+        // Manually write v2 columnar binary data and read it back
         let mut buffer = Vec::new();
 
-        // Header: 1 field
+        // V2 Header
+        buffer.extend_from_slice(&VECTOR_MAGIC.to_le_bytes());
+        buffer.push(VECTOR_VERSION);
+        buffer.push(VectorEncoding::F32 as u8);
+        
+        // 1 field
         buffer.extend_from_slice(&1u32.to_le_bytes());
         // Field ID: 0
         buffer.extend_from_slice(&0u32.to_le_bytes());
@@ -157,28 +166,33 @@ mod tests {
         let main_id = b"main";
         buffer.extend_from_slice(&(main_id.len() as u32).to_le_bytes());
         buffer.extend_from_slice(main_id);
-        // Doc 0: [0.1, 0.2, 0.3]
+        // Dimensions: 3 (fixed for this vector_id)
         buffer.extend_from_slice(&3u32.to_le_bytes());
+        // Presence bitset: both docs have "main" (bits 0,1 set = 0b11)
+        let mut bitset_bytes = [0u8; 8]; // Padded to u64
+        bitset_bytes[0] = 0b00000011;
+        buffer.extend_from_slice(&bitset_bytes);
+        // Vectors (contiguous): [0.1, 0.2, 0.3], [1.0, 2.0, 3.0]
         buffer.extend_from_slice(&0.1f32.to_le_bytes());
         buffer.extend_from_slice(&0.2f32.to_le_bytes());
         buffer.extend_from_slice(&0.3f32.to_le_bytes());
-        // Doc 1: [1.0, 2.0]
-        buffer.extend_from_slice(&2u32.to_le_bytes());
         buffer.extend_from_slice(&1.0f32.to_le_bytes());
         buffer.extend_from_slice(&2.0f32.to_le_bytes());
+        buffer.extend_from_slice(&3.0f32.to_le_bytes());
 
         // Read them back
         let reader = VectorReader::open(Cursor::new(&buffer)).unwrap();
         let field = Field::from_field_id(0);
 
         assert_eq!(reader.num_docs(), 2);
+        assert_eq!(reader.encoding(), VectorEncoding::F32);
         assert_eq!(
-            reader.get(field, "main", 0),
-            Some(&[0.1f32, 0.2, 0.3][..])
+            reader.get(field, "main", 0).map(|c| c.into_owned()),
+            Some(vec![0.1f32, 0.2, 0.3])
         );
-        assert_eq!(reader.get(field, "main", 1), Some(&[1.0f32, 2.0][..]));
-        assert_eq!(reader.get(field, "main", 2), None); // out of bounds
-        assert_eq!(reader.get(field, "nonexistent", 0), None); // no such ID
+        assert_eq!(reader.get(field, "main", 1).map(|c| c.into_owned()), Some(vec![1.0f32, 2.0, 3.0]));
+        assert!(reader.get(field, "main", 2).is_none()); // out of bounds
+        assert!(reader.get(field, "nonexistent", 0).is_none()); // no such ID
     }
 
     /// End-to-end test: Create an index with named vectors, add documents, and read vectors back
@@ -225,13 +239,13 @@ mod tests {
         let mut doc1 = TantivyDocument::new();
         doc1.add_text(title_field, "First document");
         doc1.add_named_vector(embedding_field, "chunk_0", vec![0.1, 0.2, 0.3]);
-        doc1.add_named_vector(embedding_field, "summary", vec![10.0, 20.0]);
+        doc1.add_named_vector(embedding_field, "summary", vec![10.0, 20.0, 30.0]);
         index_writer.add_document(doc1).unwrap();
 
-        // Document 2: only chunk_0
+        // Document 2: only chunk_0 (same dimensions as doc1's chunk_0)
         let mut doc2 = TantivyDocument::new();
         doc2.add_text(title_field, "Second document");
-        doc2.add_named_vector(embedding_field, "chunk_0", vec![1.0, 2.0]);
+        doc2.add_named_vector(embedding_field, "chunk_0", vec![1.0, 2.0, 3.0]);
         index_writer.add_document(doc2).unwrap();
 
         // Document 3: no vectors
@@ -242,16 +256,6 @@ mod tests {
         // Commit and drop the index_writer to release the lock
         index_writer.commit().unwrap();
         drop(index_writer);
-
-        // Debug: Check what files exist
-        let segments = index.searchable_segments().unwrap();
-        eprintln!("Number of segments: {}", segments.len());
-        for segment in &segments {
-            eprintln!("Segment: {:?}", segment.id());
-            let vec_path = segment.meta().relative_path(SegmentComponent::Vectors);
-            let exists = index.directory().exists(&vec_path).unwrap();
-            eprintln!("Vector file {} exists: {}", vec_path.display(), exists);
-        }
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
@@ -299,10 +303,6 @@ mod tests {
         let searcher = reader.searcher();
 
         // After merge, should have 1 segment with all 3 documents
-        eprintln!(
-            "After merge: {} segments",
-            searcher.segment_readers().len()
-        );
         assert_eq!(
             searcher.segment_readers().len(),
             1,
@@ -319,13 +319,11 @@ mod tests {
         let chunk0_vecs: Vec<_> = vector_reader
             .iter_vectors(embedding_field, "chunk_0")
             .collect();
-        eprintln!("Merged chunk_0 vectors: {:?}", chunk0_vecs);
         assert_eq!(chunk0_vecs.len(), 2, "Expected 2 chunk_0 vectors after merge");
 
         let summary_vecs: Vec<_> = vector_reader
             .iter_vectors(embedding_field, "summary")
             .collect();
-        eprintln!("Merged summary vectors: {:?}", summary_vecs);
         assert_eq!(
             summary_vecs.len(),
             1,

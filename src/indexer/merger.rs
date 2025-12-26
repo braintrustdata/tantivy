@@ -853,7 +853,13 @@ impl IndexMerger {
             }
         }
 
-        // Write header
+        use crate::vector::format::{PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+        
+        // Write V2 header
+        wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
+        wrt.write_all(&[VECTOR_VERSION])?;
+        wrt.write_all(&[VectorEncoding::F32 as u8])?;  // Always use F32 for merges
+        
         let num_fields = vector_fields.len() as u32;
         wrt.write_all(&num_fields.to_le_bytes())?;
 
@@ -885,26 +891,39 @@ impl IndexMerger {
                 wrt.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
                 wrt.write_all(id_bytes)?;
 
-                // Write vectors for all docs in new doc order
-                for doc_addr in &doc_id_mapping.new_doc_id_to_old_doc_addr {
+                // First pass: collect vectors and determine dimensions
+                let mut presence = PresenceBitset::new(self.max_doc);
+                let mut ordered_vectors: Vec<Vec<f32>> = Vec::new();
+                let mut dimensions = 0u32;
+
+                for (new_doc_id, doc_addr) in doc_id_mapping.new_doc_id_to_old_doc_addr.iter().enumerate() {
                     let segment_ord = doc_addr.segment_ord as usize;
                     let old_doc_id = doc_addr.doc_id;
 
-                    let vector = segment_vector_readers
+                    if let Some(vec) = segment_vector_readers
                         .get(segment_ord)
                         .and_then(|opt_reader| opt_reader.as_ref())
-                        .and_then(|reader| reader.get(*field, vector_id, old_doc_id));
+                        .and_then(|reader| reader.get(*field, vector_id, old_doc_id))
+                    {
+                        if dimensions == 0 {
+                            dimensions = vec.len() as u32;
+                        }
+                        presence.set(new_doc_id as u32);
+                        ordered_vectors.push(vec.into_owned());
+                    }
+                }
 
-                    match vector {
-                        Some(vec) => {
-                            wrt.write_all(&(vec.len() as u32).to_le_bytes())?;
-                            for v in vec {
-                                wrt.write_all(&v.to_le_bytes())?;
-                            }
-                        }
-                        None => {
-                            wrt.write_all(&0u32.to_le_bytes())?;
-                        }
+                // Write dimensions
+                wrt.write_all(&dimensions.to_le_bytes())?;
+                
+                // Write presence bitset
+                let bitset_bytes = presence.as_bytes();
+                wrt.write_all(&bitset_bytes)?;
+
+                // Write vectors contiguously
+                for vec in &ordered_vectors {
+                    for &v in vec {
+                        wrt.write_all(&v.to_le_bytes())?;
                     }
                 }
             }

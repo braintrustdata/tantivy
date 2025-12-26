@@ -63,6 +63,8 @@ tokenizer-api = { version= "0.3", path="./tokenizer-api", package="tantivy-token
 sketches-ddsketch = { version = "0.2.1", features = ["use_serde"] }
 futures-util = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
+half = "2"
+bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"

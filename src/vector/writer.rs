@@ -5,34 +5,40 @@
 //!
 //! - Collecting named vectors from documents during `add_document`
 //! - Columnar storage: vectors with the same string ID are stored together
-//! - Serializing to binary format with proper doc_id mapping
+//! - Presence bitsets for efficient sparse storage
+//! - Multiple encoding formats (f32, f16, int8)
 //! - Supporting document reordering during segment merges
 //!
-//! ## Storage Format (Columnar by Vector ID)
-//!
-//! The format is optimized for accessing all vectors with a given ID across documents:
+//! ## Storage Format (Columnar)
 //!
 //! ```text
 //! Header:
+//!   - magic: u32 (0x43455654 = "TVEC")
+//!   - version: u8 (1)
+//!   - encoding: u8 (0=f32, 1=f16, 2=int8)
 //!   - num_fields: u32
 //!   - field_ids: [u32; num_fields]
 //!   - num_docs: u32
 //!
 //! Per field (ordered by field_id):
-//!   - num_vector_ids: u32 (number of distinct string IDs)
+//!   - num_vector_ids: u32
 //!   - For each vector_id (sorted alphabetically):
 //!     - vector_id_len: u32
 //!     - vector_id: [u8; vector_id_len]
-//!     - For each doc (0..num_docs, in doc_id order):
-//!       - vector_len: u32 (0 if doc doesn't have this vector_id)
-//!       - vector_data: [f32; vector_len] (if vector_len > 0)
+//!     - dimensions: u32 (fixed for this vector_id)
+//!     - presence_bitset: [u8; ceil(num_docs/8)] padded to u64
+//!     - [if int8: scale: f32, zero_point: f32]
+//!     - vectors: [encoded; dims × popcount(bitset)] (contiguous)
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{self, Write};
+use std::io;
 
 use common::TerminatingWrite;
 
+use super::format::{
+    encode_vector, Int8QuantParams, PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
+};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::{Field, FieldType, Schema};
@@ -49,11 +55,18 @@ pub struct VectorFieldsWriter {
     /// List of vector field IDs
     vector_fields: Vec<Field>,
     num_docs: DocId,
+    /// Encoding to use for serialization
+    encoding: VectorEncoding,
 }
 
 impl VectorFieldsWriter {
     /// Creates a new VectorFieldsWriter from a schema.
     pub fn from_schema(schema: &Schema) -> Self {
+        Self::from_schema_with_encoding(schema, VectorEncoding::default())
+    }
+
+    /// Creates a new VectorFieldsWriter with a specific encoding.
+    pub fn from_schema_with_encoding(schema: &Schema, encoding: VectorEncoding) -> Self {
         let vector_fields: Vec<Field> = schema
             .fields()
             .filter_map(|(field, entry)| {
@@ -74,12 +87,18 @@ impl VectorFieldsWriter {
             field_vectors,
             vector_fields,
             num_docs: 0,
+            encoding,
         }
     }
 
     /// Returns true if there are any vector fields in the schema.
     pub fn has_vector_fields(&self) -> bool {
         !self.vector_fields.is_empty()
+    }
+
+    /// Returns the encoding being used.
+    pub fn encoding(&self) -> VectorEncoding {
+        self.encoding
     }
 
     /// Indexes vectors from a document.
@@ -125,7 +144,7 @@ impl VectorFieldsWriter {
         total
     }
 
-    /// Serializes all vectors to the writer in columnar format.
+    /// Serializes all vectors to the writer in optimized columnar format.
     ///
     /// If `doc_id_map` is provided, vectors are remapped to the new doc_id order.
     /// The writer is terminated with a footer after serialization.
@@ -134,7 +153,12 @@ impl VectorFieldsWriter {
         mut wrt: W,
         doc_id_map: Option<&DocIdMapping>,
     ) -> io::Result<()> {
-        // Write header: field count and field IDs
+        // Write header
+        wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
+        wrt.write_all(&[VECTOR_VERSION])?;
+        wrt.write_all(&[self.encoding as u8])?;
+
+        // Write field count and field IDs
         let num_fields = self.vector_fields.len() as u32;
         wrt.write_all(&num_fields.to_le_bytes())?;
 
@@ -163,39 +187,59 @@ impl VectorFieldsWriter {
                 wrt.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
                 wrt.write_all(id_bytes)?;
 
-                // Write vectors for all docs in order
+                // Determine dimensions (from first vector)
+                let dimensions = doc_vectors
+                    .values()
+                    .next()
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+                wrt.write_all(&dimensions.to_le_bytes())?;
+
+                // Build presence bitset and collect vectors in order
+                let mut bitset = PresenceBitset::new(effective_num_docs);
+                let mut ordered_vectors: Vec<&Vec<f32>> = Vec::new();
+
                 if let Some(doc_id_mapping) = doc_id_map {
-                    for old_doc_id in doc_id_mapping.iter_old_doc_ids() {
-                        Self::write_vector_entry(&mut wrt, doc_vectors.get(&old_doc_id))?;
+                    for (new_doc_id, old_doc_id) in doc_id_mapping.iter_old_doc_ids().enumerate() {
+                        if let Some(vec) = doc_vectors.get(&old_doc_id) {
+                            bitset.set(new_doc_id as u32);
+                            ordered_vectors.push(vec);
+                        }
                     }
                 } else {
                     for doc_id in 0..self.num_docs {
-                        Self::write_vector_entry(&mut wrt, doc_vectors.get(&doc_id))?;
+                        if let Some(vec) = doc_vectors.get(&doc_id) {
+                            bitset.set(doc_id);
+                            ordered_vectors.push(vec);
+                        }
                     }
+                }
+
+                // Write presence bitset
+                let bitset_bytes = bitset.as_bytes();
+                wrt.write_all(&bitset_bytes)?;
+
+                // For int8 encoding, compute and write quantization params
+                let quant_params = if self.encoding == VectorEncoding::Int8 {
+                    let params =
+                        Int8QuantParams::from_vectors(ordered_vectors.iter().map(|v| v.as_slice()));
+                    wrt.write_all(&params.scale.to_le_bytes())?;
+                    wrt.write_all(&params.zero_point.to_le_bytes())?;
+                    Some(params)
+                } else {
+                    None
+                };
+
+                // Write vectors contiguously
+                for vec in ordered_vectors {
+                    let encoded = encode_vector(vec, self.encoding, quant_params.as_ref());
+                    wrt.write_all(&encoded)?;
                 }
             }
         }
 
         // Terminate with footer (adds magic bytes required by tantivy's file reading)
         wrt.terminate()
-    }
-
-    fn write_vector_entry<W: Write>(wrt: &mut W, vector: Option<&Vec<f32>>) -> io::Result<()> {
-        match vector {
-            Some(vec) => {
-                // Write vector length followed by vector data
-                let len = vec.len() as u32;
-                wrt.write_all(&len.to_le_bytes())?;
-                for v in vec {
-                    wrt.write_all(&v.to_le_bytes())?;
-                }
-            }
-            None => {
-                // Write length 0 for missing vector
-                wrt.write_all(&0u32.to_le_bytes())?;
-            }
-        }
-        Ok(())
     }
 
     /// Gets all vector IDs across all fields (for merging).
@@ -208,11 +252,7 @@ impl VectorFieldsWriter {
     }
 
     /// Gets vectors for a specific field and vector ID.
-    pub fn get_vectors(
-        &self,
-        field: Field,
-        vector_id: &str,
-    ) -> Option<&HashMap<DocId, Vec<f32>>> {
+    pub fn get_vectors(&self, field: Field, vector_id: &str) -> Option<&HashMap<DocId, Vec<f32>>> {
         self.field_vectors
             .get(&field.field_id())
             .and_then(|field_data| field_data.get(vector_id))
@@ -275,4 +315,3 @@ mod tests {
         assert!(!writer.has_vector_fields());
     }
 }
-
