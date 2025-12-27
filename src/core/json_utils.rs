@@ -226,8 +226,8 @@ fn index_json_value<'a, V: Value<'a>>(
             ReferenceValueLeaf::IpAddr(_) => {
                 unimplemented!("IP address support in dynamic fields is not yet implemented")
             }
-            ReferenceValueLeaf::Vector(_) => {
-                // Vectors are not indexed in JSON fields
+            ReferenceValueLeaf::VectorMap(_) => {
+                // VectorMaps are not indexed in JSON fields
             }
         },
         ReferenceValue::Array(elements) => {

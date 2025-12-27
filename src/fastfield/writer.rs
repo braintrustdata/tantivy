@@ -201,8 +201,8 @@ impl FastFieldsWriter {
                             .record_str(doc_id, field_name, &token.text);
                     }
                 }
-                ReferenceValueLeaf::Vector(_) => {
-                    // Vectors are stored separately, not as fast fields
+                ReferenceValueLeaf::VectorMap(_) => {
+                    // VectorMaps are stored separately, not as fast fields
                 }
             },
             ReferenceValue::Array(val) => {
@@ -342,8 +342,8 @@ fn record_json_value_to_columnar_writer<'a, V: Value<'a>>(
                     "Pre-tokenized string support in dynamic fields is not yet implemented"
                 )
             }
-            ReferenceValueLeaf::Vector(_) => {
-                // Vectors are stored separately, not in dynamic fields
+            ReferenceValueLeaf::VectorMap(_) => {
+                // VectorMaps are stored separately, not in dynamic fields
             }
         },
         ReferenceValue::Array(elements) => {

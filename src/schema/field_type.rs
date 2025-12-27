@@ -527,6 +527,33 @@ impl FieldType {
                     }
                 }
                 FieldType::JsonObject(_) => Ok(OwnedValue::from(json_map)),
+                FieldType::VectorMap(_) => {
+                    // Parse as a map of vector ID -> vector
+                    let mut map = std::collections::BTreeMap::new();
+                    for (key, val) in json_map.iter() {
+                        if let Some(arr) = val.as_array() {
+                            let mut vector = Vec::with_capacity(arr.len());
+                            for v in arr {
+                                match v.as_f64() {
+                                    Some(f) => vector.push(f as f32),
+                                    None => {
+                                        return Err(ValueParsingError::TypeError {
+                                            expected: "object with arrays of numbers",
+                                            json: JsonValue::Object(json_map),
+                                        });
+                                    }
+                                }
+                            }
+                            map.insert(key.clone(), vector);
+                        } else {
+                            return Err(ValueParsingError::TypeError {
+                                expected: "object with arrays of numbers",
+                                json: JsonValue::Object(json_map),
+                            });
+                        }
+                    }
+                    Ok(OwnedValue::VectorMap(map))
+                }
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Object(json_map),
@@ -588,40 +615,6 @@ impl FieldType {
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Array(json_array),
-                }),
-            },
-            JsonValue::Object(json_obj) => match self {
-                FieldType::VectorMap(_) => {
-                    // Parse as a map of vector ID -> vector
-                    let mut map = std::collections::BTreeMap::new();
-                    for (key, val) in json_obj.iter() {
-                        if let Some(arr) = val.as_array() {
-                            let mut vector = Vec::with_capacity(arr.len());
-                            for v in arr {
-                                match v.as_f64() {
-                                    Some(f) => vector.push(f as f32),
-                                    None => {
-                                        return Err(ValueParsingError::TypeError {
-                                            expected: "object with arrays of numbers",
-                                            json: JsonValue::Object(json_obj),
-                                        });
-                                    }
-                                }
-                            }
-                            map.insert(key.clone(), vector);
-                        } else {
-                            return Err(ValueParsingError::TypeError {
-                                expected: "object with arrays of numbers",
-                                json: JsonValue::Object(json_obj),
-                            });
-                        }
-                    }
-                    Ok(OwnedValue::VectorMap(map))
-                }
-                FieldType::JsonObject(_) => Ok(json_obj.into()),
-                _ => Err(ValueParsingError::TypeError {
-                    expected: self.value_type().name(),
-                    json: JsonValue::Object(json_obj),
                 }),
             },
         }
