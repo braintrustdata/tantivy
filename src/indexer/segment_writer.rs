@@ -383,8 +383,8 @@ impl SegmentWriter {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
-                FieldType::Vector(_) => {
-                    // Vector fields are handled separately in the vector writer
+                FieldType::VectorMap(_) => {
+                    // VectorMap fields are handled separately in the vector writer
                     // They are not indexed in postings
                 }
             }

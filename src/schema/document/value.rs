@@ -101,8 +101,8 @@ pub trait Value<'a>: Send + Sync + Debug {
 
     #[inline]
     /// If the Value is a vector map, returns the associated map. Returns None otherwise.
-    fn as_vector(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
-        self.as_leaf().and_then(|leaf| leaf.as_vector())
+    fn as_vector_map(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
+        self.as_leaf().and_then(|leaf| leaf.as_vector_map())
     }
 
     #[inline]
@@ -163,8 +163,8 @@ pub enum ReferenceValueLeaf<'a> {
     Bool(bool),
     /// Pre-tokenized str type,
     PreTokStr(&'a PreTokenizedString),
-    /// Vector embeddings - a map of string IDs to f32 arrays.
-    Vector(&'a BTreeMap<String, Vec<f32>>),
+    /// VectorMap embeddings - a map of string IDs to f32 arrays.
+    VectorMap(&'a BTreeMap<String, Vec<f32>>),
 }
 
 impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<'a, T> {
@@ -186,8 +186,8 @@ impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<
             ReferenceValueLeaf::PreTokStr(val) => {
                 ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(val))
             }
-            ReferenceValueLeaf::Vector(val) => {
-                ReferenceValue::Leaf(ReferenceValueLeaf::Vector(val))
+            ReferenceValueLeaf::VectorMap(val) => {
+                ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(val))
             }
         }
     }
@@ -303,8 +303,8 @@ impl<'a> ReferenceValueLeaf<'a> {
 
     #[inline]
     /// If the Value is a vector map, returns the associated map. Returns None otherwise.
-    pub fn as_vector(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
-        if let Self::Vector(val) = self {
+    pub fn as_vector_map(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
+        if let Self::VectorMap(val) = self {
             Some(val)
         } else {
             None
@@ -407,8 +407,8 @@ where V: Value<'a>
 
     #[inline]
     /// If the Value is a vector map, returns the associated map. Returns None otherwise.
-    pub fn as_vector(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
-        self.as_leaf().and_then(|leaf| leaf.as_vector())
+    pub fn as_vector_map(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
+        self.as_leaf().and_then(|leaf| leaf.as_vector_map())
     }
 
     #[inline]

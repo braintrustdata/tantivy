@@ -518,9 +518,9 @@ where B: AsRef<[u8]>
             Type::IpAddr => {
                 write_opt(f, self.as_ip_addr())?;
             }
-            Type::Vector => {
-                // Vectors are not typically used as term values
-                write!(f, "<vector>")?;
+            Type::VectorMap => {
+                // VectorMaps are not typically used as term values
+                write!(f, "<vectormap>")?;
             }
         }
         Ok(())

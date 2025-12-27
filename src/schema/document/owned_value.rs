@@ -48,9 +48,9 @@ pub enum OwnedValue {
     Object(BTreeMap<String, Self>),
     /// IpV6 Address. Internally there is no IpV4, it needs to be converted to `Ipv6Addr`.
     IpAddr(Ipv6Addr),
-    /// Vector embeddings - a map of string IDs to f32 arrays.
-    /// Each document can have multiple named vectors for a single vector field.
-    Vector(BTreeMap<String, Vec<f32>>),
+    /// VectorMap embeddings - a map of string IDs to f32 arrays.
+    /// Each document can have multiple named vectors for a single vector map field.
+    VectorMap(BTreeMap<String, Vec<f32>>),
 }
 
 impl AsRef<OwnedValue> for OwnedValue {
@@ -77,7 +77,7 @@ impl<'a> Value<'a> for &'a OwnedValue {
             OwnedValue::Facet(val) => ReferenceValueLeaf::Facet(val).into(),
             OwnedValue::Bytes(val) => ReferenceValueLeaf::Bytes(val).into(),
             OwnedValue::IpAddr(val) => ReferenceValueLeaf::IpAddr(*val).into(),
-            OwnedValue::Vector(val) => ReferenceValueLeaf::Vector(val).into(),
+            OwnedValue::VectorMap(val) => ReferenceValueLeaf::VectorMap(val).into(),
             OwnedValue::Array(array) => ReferenceValue::Array(array.iter()),
             OwnedValue::Object(object) => ReferenceValue::Object(ObjectMapIter(object.iter())),
         }
@@ -161,11 +161,11 @@ impl ValueDeserialize for OwnedValue {
                 Ok(OwnedValue::Object(elements))
             }
 
-            fn visit_vector(
+            fn visit_vector_map(
                 &self,
                 val: BTreeMap<String, Vec<f32>>,
             ) -> Result<Self::Value, DeserializeError> {
-                Ok(OwnedValue::Vector(val))
+                Ok(OwnedValue::VectorMap(val))
             }
         }
 
@@ -201,7 +201,7 @@ impl serde::Serialize for OwnedValue {
                 }
             }
             OwnedValue::Array(ref array) => array.serialize(serializer),
-            OwnedValue::Vector(ref vector) => vector.serialize(serializer),
+            OwnedValue::VectorMap(ref vector_map) => vector_map.serialize(serializer),
         }
     }
 }
@@ -289,7 +289,7 @@ impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
                 ReferenceValueLeaf::IpAddr(val) => OwnedValue::IpAddr(val),
                 ReferenceValueLeaf::Bool(val) => OwnedValue::Bool(val),
                 ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(val.clone()),
-                ReferenceValueLeaf::Vector(val) => OwnedValue::Vector(val.clone()),
+                ReferenceValueLeaf::VectorMap(val) => OwnedValue::VectorMap(val.clone()),
             },
             ReferenceValue::Array(val) => {
                 OwnedValue::Array(val.map(|v| v.as_value().into()).collect())
@@ -376,7 +376,7 @@ impl From<PreTokenizedString> for OwnedValue {
 
 impl From<BTreeMap<String, Vec<f32>>> for OwnedValue {
     fn from(vector_map: BTreeMap<String, Vec<f32>>) -> OwnedValue {
-        OwnedValue::Vector(vector_map)
+        OwnedValue::VectorMap(vector_map)
     }
 }
 

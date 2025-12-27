@@ -809,7 +809,7 @@ impl IndexMerger {
     fn has_vector_fields(&self) -> bool {
         self.schema
             .fields()
-            .any(|(_, entry)| matches!(entry.field_type(), FieldType::Vector(_)))
+            .any(|(_, entry)| matches!(entry.field_type(), FieldType::VectorMap(_)))
     }
     
     /// Writes merged vectors from all segments to the output in columnar format.
@@ -826,7 +826,7 @@ impl IndexMerger {
             .schema
             .fields()
             .filter_map(|(field, entry)| {
-                if matches!(entry.field_type(), FieldType::Vector(_)) {
+                if matches!(entry.field_type(), FieldType::VectorMap(_)) {
                     Some(field)
                 } else {
                     None

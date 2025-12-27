@@ -194,9 +194,9 @@ impl SchemaBuilder {
         self.add_field(field_entry)
     }
 
-    /// Adds a vector field to the schema.
+    /// Adds a vector map field to the schema.
     ///
-    /// Vector fields store embedding vectors (arrays of f32) per document.
+    /// VectorMap fields store named embedding vectors (BTreeMap<String, Vec<f32>>) per document.
     /// They are stored in a separate `.vec` file per segment.
     ///
     /// # Example
@@ -204,15 +204,15 @@ impl SchemaBuilder {
     /// ```
     /// use tantivy::schema::*;
     /// let mut schema_builder = Schema::builder();
-    /// let embedding_field = schema_builder.add_vector_field("embedding", VectorOptions::default());
+    /// let embedding_field = schema_builder.add_vector_map_field("embedding", VectorMapOptions::default());
     /// let schema = schema_builder.build();
     /// ```
-    pub fn add_vector_field<T: Into<VectorOptions>>(
+    pub fn add_vector_map_field<T: Into<VectorMapOptions>>(
         &mut self,
         field_name: &str,
         field_options: T,
     ) -> Field {
-        let field_entry = FieldEntry::new_vector(field_name.to_string(), field_options.into());
+        let field_entry = FieldEntry::new_vector_map(field_name.to_string(), field_options.into());
         self.add_field(field_entry)
     }
 

@@ -70,7 +70,7 @@ impl VectorFieldsWriter {
         let vector_fields: Vec<Field> = schema
             .fields()
             .filter_map(|(field, entry)| {
-                if matches!(entry.field_type(), FieldType::Vector(_)) {
+                if matches!(entry.field_type(), FieldType::VectorMap(_)) {
                     Some(field)
                 } else {
                     None
@@ -111,7 +111,7 @@ impl VectorFieldsWriter {
         for (field, value) in doc.iter_fields_and_values() {
             if let Some(field_data) = self.field_vectors.get_mut(&field.field_id()) {
                 let value_access = value as D::Value<'_>;
-                if let ReferenceValue::Leaf(ReferenceValueLeaf::Vector(vector_map)) =
+                if let ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vector_map)) =
                     value_access.as_value()
                 {
                     // Add each named vector to the columnar storage
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn test_columnar_vector_writer() {
         let mut schema_builder = SchemaBuilder::new();
-        let vec_field = schema_builder.add_vector_field("embedding", ());
+        let vec_field = schema_builder.add_vector_map_field("embedding", ());
         let schema = schema_builder.build();
 
         let mut writer = VectorFieldsWriter::from_schema(&schema);

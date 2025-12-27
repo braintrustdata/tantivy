@@ -145,7 +145,7 @@ where W: Write
 
                     val.serialize(self.writer)
                 }
-                ReferenceValueLeaf::Vector(val) => {
+                ReferenceValueLeaf::VectorMap(val) => {
                     self.write_type_code(type_codes::VECTOR_CODE)?;
                     // Write number of entries in the map
                     let num_entries = val.len() as u64;

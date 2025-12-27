@@ -249,7 +249,7 @@ pub trait ValueVisitor {
 
     #[inline]
     /// Called when the deserializer visits a vector map value.
-    fn visit_vector(
+    fn visit_vector_map(
         &self,
         _val: BTreeMap<String, Vec<f32>>,
     ) -> Result<Self::Value, DeserializeError> {
@@ -585,7 +585,7 @@ where R: Read
             }
             ValueType::Vector => {
                 let val = self.deserialize_vector()?;
-                visitor.visit_vector(val)
+                visitor.visit_vector_map(val)
             }
         }
     }

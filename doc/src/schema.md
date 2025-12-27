@@ -13,23 +13,23 @@ Tantivy supports the following field types:
 - **IP Address**: IPv4/IPv6 addresses
 - **Facet**: Hierarchical categorization
 - **JSON**: Dynamic JSON objects
-- **Vector**: Embedding vectors (arrays of f32)
+- **VectorMap**: Embedding vectors - maps of string IDs to f32 arrays
 
-## Vector Fields
+## VectorMap Fields
 
-Vector fields allow you to store **named embedding vectors** alongside your documents. Each document can have multiple vectors per field, identified by string IDs (e.g., "chunk_0", "chunk_1", "summary"). This is useful for:
+VectorMap fields allow you to store **named embedding vectors** alongside your documents. Each document can have multiple vectors per field, identified by string IDs (e.g., "chunk_0", "chunk_1", "summary"). This is useful for:
 
 - Chunked document embeddings (store vectors for each chunk)
 - Multi-representation embeddings (e.g., title vs body vs summary)
 - Semantic search and recommendation systems
 
-### Creating a Vector Field
+### Creating a VectorMap Field
 
 ```rust
 use tantivy::schema::SchemaBuilder;
 
 let mut schema_builder = SchemaBuilder::new();
-let embedding = schema_builder.add_vector_field("embedding", ());
+let embedding = schema_builder.add_vector_map_field("embedding", ());
 let schema = schema_builder.build();
 ```
 

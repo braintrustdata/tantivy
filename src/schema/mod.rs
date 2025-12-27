@@ -149,7 +149,7 @@ pub use self::numeric_options::NumericOptions;
 pub use self::schema::{Schema, SchemaBuilder};
 pub use self::term::{Term, ValueBytes, JSON_END_OF_PATH};
 pub use self::text_options::{TextFieldIndexing, TextOptions, STRING, TEXT};
-pub use self::vector_options::VectorOptions;
+pub use self::vector_options::VectorMapOptions;
 
 /// Validator for a potential `field_name`.
 /// Returns true if the name can be use for a field name.
@@ -172,7 +172,7 @@ pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
         Type::Bytes => Some(ColumnType::Bytes),
         Type::IpAddr => Some(ColumnType::IpAddr),
         Type::Json => None,
-        Type::Vector => None, // Vectors are stored separately, not as columnar data
+        Type::VectorMap => None, // VectorMaps are stored separately, not as columnar data
     }
 }
 

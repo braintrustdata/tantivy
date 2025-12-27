@@ -172,7 +172,7 @@ impl TantivyDocument {
         // Check if we already have a vector map for this field
         for field_value in &mut self.field_values {
             if field_value.field() == field {
-                if let OwnedValue::Vector(ref mut map) = field_value.value {
+                if let OwnedValue::VectorMap(ref mut map) = field_value.value {
                     map.insert(vector_id, vector);
                     return;
                 }

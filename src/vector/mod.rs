@@ -84,7 +84,7 @@
 //! use tantivy::schema::SchemaBuilder;
 //!
 //! let mut schema_builder = SchemaBuilder::new();
-//! let embedding = schema_builder.add_vector_field("embedding", ());
+//! let embedding = schema_builder.add_vector_map_field("embedding", ());
 //! let schema = schema_builder.build();
 //! ```
 //!
@@ -158,7 +158,7 @@ mod tests {
     fn test_vector_fields_roundtrip() {
         // Create a schema with a vector field
         let mut schema_builder = SchemaBuilder::new();
-        let vec_field = schema_builder.add_vector_field("embedding", ());
+        let vec_field = schema_builder.add_vector_map_field("embedding", ());
         let schema = schema_builder.build();
 
         let mut writer = VectorFieldsWriter::from_schema(&schema);
@@ -239,7 +239,7 @@ mod tests {
         // Create schema with a text field and a vector field
         let mut schema_builder = SchemaBuilder::new();
         let title_field = schema_builder.add_text_field("title", TEXT | STORED);
-        let embedding_field = schema_builder.add_vector_field("embedding", ());
+        let embedding_field = schema_builder.add_vector_map_field("embedding", ());
         let schema = schema_builder.build();
 
         // First, test that named vectors are stored correctly in TantivyDocument
@@ -252,7 +252,7 @@ mod tests {
         let mut found_vector = false;
         for (field, value) in doc1.iter_fields_and_values() {
             if field == embedding_field {
-                if let ReferenceValue::Leaf(ReferenceValueLeaf::Vector(vec_map)) = value.as_value()
+                if let ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vec_map)) = value.as_value()
                 {
                     assert_eq!(vec_map.get("chunk_0"), Some(&vec![0.1f32, 0.2, 0.3]));
                     assert_eq!(vec_map.get("summary"), Some(&vec![10.0f32, 20.0]));
@@ -381,7 +381,7 @@ mod tests {
 
         // Create schema with vector field
         let mut schema_builder = SchemaBuilder::new();
-        let embedding_field = schema_builder.add_vector_field("embedding", ());
+        let embedding_field = schema_builder.add_vector_map_field("embedding", ());
         let schema = schema_builder.build();
 
         // Create index
