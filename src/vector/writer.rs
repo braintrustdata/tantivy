@@ -52,6 +52,9 @@ pub struct VectorFieldsWriter {
     /// Map from field_id to (vector_id -> (doc_id -> vector))
     /// Organized for efficient columnar serialization
     field_vectors: HashMap<u32, BTreeMap<String, HashMap<DocId, Vec<f32>>>>,
+    /// Map from (field_id, vector_id) to expected dimensions.
+    /// Used to validate that all vectors with the same ID have the same dimensions.
+    vector_dimensions: HashMap<(u32, String), usize>,
     /// List of vector field IDs
     vector_fields: Vec<Field>,
     num_docs: DocId,
@@ -85,6 +88,7 @@ impl VectorFieldsWriter {
 
         VectorFieldsWriter {
             field_vectors,
+            vector_dimensions: HashMap::new(),
             vector_fields,
             num_docs: 0,
             encoding,
@@ -104,18 +108,38 @@ impl VectorFieldsWriter {
     /// Indexes vectors from a document.
     ///
     /// Vectors are stored as a map of string IDs to f32 arrays.
+    /// Vectors with dimensions that don't match the first vector for a given ID are skipped
+    /// (with a warning logged).
     pub fn add_document<D: Document>(&mut self, doc: &D) {
         let doc_id = self.num_docs;
 
         // Extract vectors from the document
         for (field, value) in doc.iter_fields_and_values() {
-            if let Some(field_data) = self.field_vectors.get_mut(&field.field_id()) {
+            let field_id = field.field_id();
+            if let Some(field_data) = self.field_vectors.get_mut(&field_id) {
                 let value_access = value as D::Value<'_>;
                 if let ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vector_map)) =
                     value_access.as_value()
                 {
                     // Add each named vector to the columnar storage
                     for (vector_id, vec) in vector_map {
+                        let dim_key = (field_id, vector_id.clone());
+                        let vec_dims = vec.len();
+
+                        // Check if we already have a dimension for this vector_id
+                        if let Some(&expected_dims) = self.vector_dimensions.get(&dim_key) {
+                            if vec_dims != expected_dims {
+                                log::warn!(
+                                    "Vector '{}' in doc {} has {} dimensions, expected {}. Skipping.",
+                                    vector_id, doc_id, vec_dims, expected_dims
+                                );
+                                continue;
+                            }
+                        } else {
+                            // First vector for this ID - record its dimensions
+                            self.vector_dimensions.insert(dim_key, vec_dims);
+                        }
+
                         field_data
                             .entry(vector_id.clone())
                             .or_default()
@@ -141,6 +165,9 @@ impl VectorFieldsWriter {
                 }
             }
         }
+        // Add vector_dimensions map size
+        total += self.vector_dimensions.len()
+            * (std::mem::size_of::<(u32, String)>() + std::mem::size_of::<usize>());
         total
     }
 

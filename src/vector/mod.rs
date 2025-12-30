@@ -583,5 +583,60 @@ mod tests {
 
         centroids
     }
+
+    /// Test that vectors with different dimensions for the same vector_id
+    /// are handled gracefully (currently they log a warning and skip).
+    #[test]
+    fn test_vector_dimension_mismatch() {
+        // Create schema with vector field
+        let mut schema_builder = SchemaBuilder::new();
+        let embedding_field = schema_builder.add_vector_map_field("embedding", ());
+        let schema = schema_builder.build();
+
+        // Create index
+        let directory = RamDirectory::create();
+        let index = Index::create(directory, schema.clone(), Default::default()).unwrap();
+        let mut index_writer = index.writer::<TantivyDocument>(50_000_000).unwrap();
+
+        // Document 1: 3-dimensional vector
+        let mut doc1 = TantivyDocument::new();
+        doc1.add_named_vector(embedding_field, "chunk", vec![0.1, 0.2, 0.3]);
+        index_writer.add_document(doc1).unwrap();
+
+        // Document 2: 5-dimensional vector (DIFFERENT dimensions for same vector_id)
+        let mut doc2 = TantivyDocument::new();
+        doc2.add_named_vector(embedding_field, "chunk", vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        index_writer.add_document(doc2).unwrap();
+
+        // Document 3: 3-dimensional vector (same as doc1)
+        let mut doc3 = TantivyDocument::new();
+        doc3.add_named_vector(embedding_field, "chunk", vec![0.4, 0.5, 0.6]);
+        index_writer.add_document(doc3).unwrap();
+
+        // Commit - this should not panic, but may log warnings about dimension mismatches
+        index_writer.commit().unwrap();
+        drop(index_writer);
+
+        // Read vectors back
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let mut vectors: Vec<(u32, Vec<f32>)> = Vec::new();
+        for segment_reader in searcher.segment_readers() {
+            if let Some(vector_reader) = segment_reader.vector_reader(embedding_field) {
+                for (doc_id, vec) in vector_reader.iter_vectors(embedding_field, "chunk") {
+                    vectors.push((doc_id, vec.into_owned()));
+                }
+            }
+        }
+
+        // The current behavior is that only vectors with matching dimensions are kept.
+        // Doc1 has 3 dims, Doc2 has 5 dims (skipped), Doc3 has 3 dims.
+        // So we should have 2 vectors, both 3-dimensional.
+        assert_eq!(vectors.len(), 2, "Expected 2 vectors (dimension mismatch skipped)");
+        for (doc_id, vec) in &vectors {
+            assert_eq!(vec.len(), 3, "Doc {} has wrong dimensions: {:?}", doc_id, vec);
+        }
+    }
 }
 
