@@ -239,10 +239,13 @@ impl IndexMerger {
         let mut fieldnorms_data = Vec::with_capacity(self.max_doc as usize);
         for field in fields {
             fieldnorms_data.clear();
+            // Use get_fieldnorms_reader_or_default to handle segments created before a field
+            // was added to the schema. Those segments will return a constant fieldnorm of 0
+            // (meaning "no tokens indexed") for documents that don't have the field.
             let fieldnorms_readers: Vec<FieldNormReader> = self
                 .readers
                 .iter()
-                .map(|reader| reader.get_fieldnorms_reader(field))
+                .map(|reader| reader.get_fieldnorms_reader_or_default(field))
                 .collect::<Result<_, _>>()?;
             for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
                 let fieldnorms_reader = &fieldnorms_readers[old_doc_addr.segment_ord as usize];
