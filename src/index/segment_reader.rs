@@ -129,6 +129,23 @@ impl SegmentReader {
         })
     }
 
+    /// Returns a fieldnorm reader for the given field.
+    ///
+    /// Unlike [`get_fieldnorms_reader`](Self::get_fieldnorms_reader), this method returns a
+    /// constant fieldnorm reader (with fieldnorm 0) if the field doesn't have fieldnorms in this
+    /// segment. This is useful for merging segments where a field was added after some segments
+    /// were already created.
+    pub fn get_fieldnorms_reader_or_default(&self, field: Field) -> crate::Result<FieldNormReader> {
+        match self.fieldnorm_readers.get_field(field)? {
+            Some(reader) => Ok(reader),
+            None => {
+                // Return a constant fieldnorm reader with fieldnorm 0 for all documents.
+                // This represents "no tokens indexed in this field for any document".
+                Ok(FieldNormReader::constant(self.max_doc, 0))
+            }
+        }
+    }
+
     #[doc(hidden)]
     pub fn fieldnorms_readers(&self) -> &FieldNormReaders {
         &self.fieldnorm_readers
