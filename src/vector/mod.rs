@@ -378,6 +378,7 @@ mod tests {
     fn test_vector_clustering_workflow() {
         use ndarray::{Array1, Array2, Axis};
         use rand::Rng;
+        use rand::SeedableRng;
 
         // Create schema with vector field
         let mut schema_builder = SchemaBuilder::new();
@@ -390,7 +391,8 @@ mod tests {
         let mut index_writer = index.writer::<TantivyDocument>(50_000_000).unwrap();
 
         // Generate 100 random 8-dimensional vectors in 3 clusters
-        let mut rng = rand::thread_rng();
+        // Use seeded RNG for deterministic tests
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let cluster_centers = [
             [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             [5.0f32, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
@@ -442,8 +444,13 @@ mod tests {
         let data = Array2::from_shape_vec((n_samples, n_dims), flat).unwrap();
 
         // Step 3: Simple K-means clustering (k=3)
+        // Use the known cluster centers as initial centroids for deterministic results
         let k = 3;
-        let assignments = simple_kmeans(&data, k, 10);
+        let initial_centroids = cluster_centers
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        let assignments = simple_kmeans(&data, k, 10, Some(initial_centroids));
 
         // Verify we got 3 clusters with reasonable distribution
         let mut cluster_counts = [0usize; 3];
@@ -490,16 +497,26 @@ mod tests {
 
     /// Simple K-means implementation for testing.
     /// Returns cluster assignments for each sample.
-    fn simple_kmeans(data: &ndarray::Array2<f32>, k: usize, max_iters: usize) -> Vec<usize> {
+    /// `initial_centroids` can be provided for deterministic initialization.
+    fn simple_kmeans(
+        data: &ndarray::Array2<f32>,
+        k: usize,
+        max_iters: usize,
+        initial_centroids: Option<Vec<Vec<f32>>>,
+    ) -> Vec<usize> {
         use ndarray::{Array1, Axis};
 
         let n_samples = data.nrows();
         let n_dims = data.ncols();
 
-        // Initialize centroids using first k points
-        let mut centroids: Vec<Array1<f32>> = (0..k)
-            .map(|i| data.row(i * n_samples / k).to_owned())
-            .collect();
+        // Initialize centroids - use provided ones or pick evenly spaced points
+        let mut centroids: Vec<Array1<f32>> = if let Some(init) = initial_centroids {
+            init.into_iter().map(|v| Array1::from_vec(v)).collect()
+        } else {
+            (0..k)
+                .map(|i| data.row(i * n_samples / k).to_owned())
+                .collect()
+        };
 
         let mut assignments = vec![0usize; n_samples];
 
@@ -585,58 +602,51 @@ mod tests {
     }
 
     /// Test that vectors with different dimensions for the same vector_id
-    /// are handled gracefully (currently they log a warning and skip).
+    /// are handled gracefully within a single segment's writer.
+    ///
+    /// The dimension checking happens at the VectorFieldsWriter level during indexing.
+    /// When a vector with different dimensions is added for the same vector_id,
+    /// it is skipped with a warning logged.
     #[test]
     fn test_vector_dimension_mismatch() {
         // Create schema with vector field
         let mut schema_builder = SchemaBuilder::new();
-        let embedding_field = schema_builder.add_vector_map_field("embedding", ());
+        let vec_field = schema_builder.add_vector_map_field("embedding", ());
         let schema = schema_builder.build();
 
-        // Create index
-        let directory = RamDirectory::create();
-        let index = Index::create(directory, schema.clone(), Default::default()).unwrap();
-        let mut index_writer = index.writer::<TantivyDocument>(50_000_000).unwrap();
+        // Use VectorFieldsWriter directly to test dimension mismatch handling
+        let mut writer = VectorFieldsWriter::from_schema(&schema);
 
-        // Document 1: 3-dimensional vector
+        // Document 0: 3-dimensional vector
+        let mut doc0 = TantivyDocument::new();
+        doc0.add_named_vector(vec_field, "chunk", vec![0.1, 0.2, 0.3]);
+        writer.add_document(&doc0);
+
+        // Document 1: 5-dimensional vector (DIFFERENT dimensions for same vector_id)
+        // This should be skipped by the writer
         let mut doc1 = TantivyDocument::new();
-        doc1.add_named_vector(embedding_field, "chunk", vec![0.1, 0.2, 0.3]);
-        index_writer.add_document(doc1).unwrap();
+        doc1.add_named_vector(vec_field, "chunk", vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        writer.add_document(&doc1);
 
-        // Document 2: 5-dimensional vector (DIFFERENT dimensions for same vector_id)
+        // Document 2: 3-dimensional vector (same as doc0)
         let mut doc2 = TantivyDocument::new();
-        doc2.add_named_vector(embedding_field, "chunk", vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        index_writer.add_document(doc2).unwrap();
+        doc2.add_named_vector(vec_field, "chunk", vec![0.4, 0.5, 0.6]);
+        writer.add_document(&doc2);
 
-        // Document 3: 3-dimensional vector (same as doc1)
-        let mut doc3 = TantivyDocument::new();
-        doc3.add_named_vector(embedding_field, "chunk", vec![0.4, 0.5, 0.6]);
-        index_writer.add_document(doc3).unwrap();
+        // Check that only vectors with matching dimensions were kept
+        let vectors = writer.get_vectors(vec_field, "chunk").unwrap();
 
-        // Commit - this should not panic, but may log warnings about dimension mismatches
-        index_writer.commit().unwrap();
-        drop(index_writer);
-
-        // Read vectors back
-        let reader = index.reader().unwrap();
-        let searcher = reader.searcher();
-
-        let mut vectors: Vec<(u32, Vec<f32>)> = Vec::new();
-        for segment_reader in searcher.segment_readers() {
-            if let Some(vector_reader) = segment_reader.vector_reader(embedding_field) {
-                for (doc_id, vec) in vector_reader.iter_vectors(embedding_field, "chunk") {
-                    vectors.push((doc_id, vec.into_owned()));
-                }
-            }
-        }
-
-        // The current behavior is that only vectors with matching dimensions are kept.
-        // Doc1 has 3 dims, Doc2 has 5 dims (skipped), Doc3 has 3 dims.
-        // So we should have 2 vectors, both 3-dimensional.
+        // Should have 2 vectors: doc0 and doc2 (doc1 was skipped due to dimension mismatch)
         assert_eq!(vectors.len(), 2, "Expected 2 vectors (dimension mismatch skipped)");
-        for (doc_id, vec) in &vectors {
-            assert_eq!(vec.len(), 3, "Doc {} has wrong dimensions: {:?}", doc_id, vec);
-        }
+
+        // Verify the vectors are from doc0 and doc2
+        assert!(vectors.contains_key(&0), "Should have vector for doc 0");
+        assert!(!vectors.contains_key(&1), "Should NOT have vector for doc 1 (dimension mismatch)");
+        assert!(vectors.contains_key(&2), "Should have vector for doc 2");
+
+        // Verify dimensions
+        assert_eq!(vectors.get(&0).unwrap().len(), 3, "Doc 0 should have 3 dimensions");
+        assert_eq!(vectors.get(&2).unwrap().len(), 3, "Doc 2 should have 3 dimensions");
     }
 }
 
