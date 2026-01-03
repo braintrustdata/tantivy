@@ -15,7 +15,7 @@
 //!     for (doc_id, vec) in vector_reader.iter_vectors(embedding_field, "chunk_0") {
 //!         println!("Doc {}: {:?}", doc_id, vec);
 //!     }
-//!     
+//!
 //!     // Or get a specific document's vector by ID
 //!     let vec = vector_reader.get(field, "chunk_0", doc_id);
 //! }
@@ -344,6 +344,49 @@ impl VectorReader {
         result
     }
 
+    /// Batch retrieves vectors for multiple documents and multiple vector IDs.
+    ///
+    /// This is the most efficient method for retrieving a set of specific vectors
+    /// across multiple documents, as it minimizes HashMap and BTreeMap lookups.
+    ///
+    /// Returns a Vec where each entry corresponds to a doc_id in the input slice,
+    /// containing a BTreeMap of vector_id -> owned Vec<f32> for vectors found.
+    pub fn get_batch(
+        &self,
+        field: Field,
+        doc_ids: &[DocId],
+        vector_ids: &[&str],
+    ) -> Vec<BTreeMap<String, Vec<f32>>> {
+        let mut results = Vec::with_capacity(doc_ids.len());
+
+        // Single field lookup
+        let vector_id_map = match self.field_vectors.get(&field.field_id()) {
+            Some(map) => map,
+            None => {
+                results.resize_with(doc_ids.len(), BTreeMap::new);
+                return results;
+            }
+        };
+
+        // Pre-lookup the columns we need
+        let columns: Vec<_> = vector_ids
+            .iter()
+            .filter_map(|&vid| vector_id_map.get(vid).map(|col| (vid.to_string(), col)))
+            .collect();
+
+        for &doc_id in doc_ids {
+            let mut doc_result = BTreeMap::new();
+            for (vector_id, column) in &columns {
+                if let Some(vec) = column.get(doc_id, self.encoding) {
+                    doc_result.insert(vector_id.clone(), vec.into_owned());
+                }
+            }
+            results.push(doc_result);
+        }
+
+        results
+    }
+
     /// Returns an iterator over all field IDs that have vectors.
     pub fn field_ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.field_vectors.keys().copied()
@@ -467,5 +510,35 @@ mod tests {
         let field = Field::from_field_id(0);
         assert_eq!(reader.num_docs(), 0);
         assert!(reader.get(field, "any", 0).is_none());
+    }
+
+    #[test]
+    fn test_get_batch() {
+        let data = write_test_data();
+        let reader = VectorReader::open(Cursor::new(data)).unwrap();
+        let field = Field::from_field_id(0);
+
+        // Batch get for all docs, both vector IDs
+        let results = reader.get_batch(field, &[0, 1, 2], &["chunk_0", "summary"]);
+        assert_eq!(results.len(), 3);
+
+        // Doc 0: has both
+        assert_eq!(results[0].get("chunk_0"), Some(&vec![1.0f32, 2.0]));
+        assert_eq!(results[0].get("summary"), Some(&vec![10.0f32, 20.0, 30.0]));
+
+        // Doc 1: has only chunk_0
+        assert_eq!(results[1].get("chunk_0"), Some(&vec![3.0f32, 4.0]));
+        assert!(results[1].get("summary").is_none());
+
+        // Doc 2: has only summary
+        assert!(results[2].get("chunk_0").is_none());
+        assert_eq!(results[2].get("summary"), Some(&vec![40.0f32, 50.0, 60.0]));
+
+        // Batch get with filtered vector IDs
+        let results = reader.get_batch(field, &[0, 2], &["summary"]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].get("chunk_0").is_none());
+        assert_eq!(results[0].get("summary"), Some(&vec![10.0f32, 20.0, 30.0]));
+        assert_eq!(results[1].get("summary"), Some(&vec![40.0f32, 50.0, 60.0]));
     }
 }
