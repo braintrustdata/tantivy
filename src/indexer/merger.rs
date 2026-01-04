@@ -195,7 +195,11 @@ impl IndexMerger {
 
         let max_doc = readers.iter().map(|reader| reader.num_docs()).sum();
         if let Some(sort_by_field) = index_settings.sort_by_field.as_ref() {
-            let sorted = Self::sort_readers_and_segments_by_min_sort_field(readers, kept_segments, sort_by_field)?;
+            let sorted = Self::sort_readers_and_segments_by_min_sort_field(
+                readers,
+                kept_segments,
+                sort_by_field,
+            )?;
             readers = sorted.0;
             kept_segments = sorted.1;
         }
@@ -793,7 +797,7 @@ impl IndexMerger {
         self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping.clone())?;
-        
+
         // Write vectors if there are any vector fields
         if self.has_vector_fields() {
             debug!("write-vectors");
@@ -807,14 +811,14 @@ impl IndexMerger {
         serializer.close()?;
         Ok(self.max_doc)
     }
-    
+
     /// Returns true if the schema contains any vector fields.
     fn has_vector_fields(&self) -> bool {
         self.schema
             .fields()
             .any(|(_, entry)| matches!(entry.field_type(), FieldType::VectorMap(_)))
     }
-    
+
     /// Writes merged vectors from all segments to the output in columnar format.
     fn write_vectors(
         &self,
@@ -844,25 +848,27 @@ impl IndexMerger {
         // Load vector readers for each segment
         let mut segment_vector_readers: Vec<Option<VectorReader>> = Vec::new();
         for segment in &self.segments {
-            let vec_path = segment.meta().relative_path(SegmentComponent::Vectors);
-
-            if segment.index().directory().exists(&vec_path)? {
-                let vec_data = segment.open_read(SegmentComponent::Vectors)?;
-                let vec_bytes = vec_data.read_bytes()?;
-                let vec_reader = VectorReader::open(vec_bytes.as_slice())?;
-                segment_vector_readers.push(Some(vec_reader));
-            } else {
-                segment_vector_readers.push(None);
+            match segment.open_read(SegmentComponent::Vectors) {
+                Ok(vec_data) => {
+                    let vec_bytes = vec_data.read_bytes()?;
+                    let vec_reader = VectorReader::open(vec_bytes.as_slice())?;
+                    segment_vector_readers.push(Some(vec_reader));
+                }
+                Err(crate::directory::error::OpenReadError::FileDoesNotExist(_)) => {
+                    // Segment was created before vectors field existed - no .vec file
+                    segment_vector_readers.push(None);
+                }
+                Err(e) => return Err(e.into()),
             }
         }
 
         use crate::vector::format::{PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
-        
+
         // Write V2 header
         wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
         wrt.write_all(&[VECTOR_VERSION])?;
-        wrt.write_all(&[VectorEncoding::F32 as u8])?;  // Always use F32 for merges
-        
+        wrt.write_all(&[VectorEncoding::F32 as u8])?; // Always use F32 for merges
+
         let num_fields = vector_fields.len() as u32;
         wrt.write_all(&num_fields.to_le_bytes())?;
 
@@ -899,7 +905,9 @@ impl IndexMerger {
                 let mut ordered_vectors: Vec<Vec<f32>> = Vec::new();
                 let mut dimensions = 0u32;
 
-                for (new_doc_id, doc_addr) in doc_id_mapping.new_doc_id_to_old_doc_addr.iter().enumerate() {
+                for (new_doc_id, doc_addr) in
+                    doc_id_mapping.new_doc_id_to_old_doc_addr.iter().enumerate()
+                {
                     let segment_ord = doc_addr.segment_ord as usize;
                     let old_doc_id = doc_addr.doc_id;
 
@@ -918,7 +926,7 @@ impl IndexMerger {
 
                 // Write dimensions
                 wrt.write_all(&dimensions.to_le_bytes())?;
-                
+
                 // Write presence bitset
                 let bitset_bytes = presence.as_bytes();
                 wrt.write_all(&bitset_bytes)?;
