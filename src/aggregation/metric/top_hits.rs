@@ -506,10 +506,13 @@ impl TopHitsSegmentCollector {
         req: &TopHitsAggregation,
         accessor_idx: usize,
         segment_ordinal: SegmentOrdinal,
+        segment_size: usize,
     ) -> Self {
+        let requested_size = req.size + req.from.unwrap_or(0);
+        let capped_size = requested_size.min(segment_size);
         Self {
             req: req.clone(),
-            top_n: TopNComputer::new(req.size + req.from.unwrap_or(0)),
+            top_n: TopNComputer::new(capped_size),
             segment_ordinal,
             accessor_idx,
         }
@@ -535,6 +538,13 @@ impl TopHitsSegmentCollector {
         }
 
         top_hits_computer
+    }
+
+    #[cfg(test)]
+    /// Returns the capacity of the internal TopNComputer buffer.
+    /// This is a test-only function to verify buffer allocation is capped correctly.
+    pub fn buffer_capacity(&self) -> usize {
+        self.top_n.buffer_capacity()
     }
 }
 
@@ -893,5 +903,63 @@ mod tests {
     #[test]
     fn test_aggregation_top_hits_multi_segment() -> crate::Result<()> {
         test_aggregation_top_hits(false)
+    }
+
+    #[test]
+    fn test_top_hits_segment_collector_capped_by_segment_size() -> crate::Result<()> {
+        use crate::schema::{Schema, TEXT};
+        use crate::Index;
+
+        // Create a small index with only 2 documents
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+        index_writer.add_document(doc!(text_field=>"Hello world"))?;
+        index_writer.add_document(doc!(text_field=>"Another document"))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let segment_size = segment_reader.num_docs() as usize;
+        
+        // Verify segment has 2 documents
+        assert_eq!(segment_size, 2);
+
+        // Create a TopHitsAggregation requesting more than segment size
+        use super::KeyOrder;
+        use crate::aggregation::bucket::Order;
+        let top_hits_req = super::TopHitsAggregation {
+            size: 100,
+            from: None,
+            sort: vec![KeyOrder {
+                field: "_score".to_string(),
+                order: Order::Desc,
+            }],
+            doc_value_fields: vec![],
+            _source: None,
+            fields: None,
+            script_fields: None,
+            highlight: None,
+            explain: None,
+            version: None,
+        };
+
+        // Create TopHitsSegmentCollector - it should be capped to segment_size (2)
+        let segment_collector = super::TopHitsSegmentCollector::from_req(
+            &top_hits_req,
+            0,
+            0,
+            segment_size,
+        );
+
+        // The internal TopNComputer should have been created with capped size (2)
+        // Buffer capacity should be 2 * capped_size = 2 * 2 = 4
+        // If it wasn't capped, it would be 2 * 100 = 200
+        let buffer_capacity = segment_collector.buffer_capacity();
+        assert_eq!(buffer_capacity, 4, "Buffer should be capped to 2 * segment_size (4), but got {}", buffer_capacity);
+        Ok(())
     }
 }

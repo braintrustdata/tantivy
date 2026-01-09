@@ -665,7 +665,9 @@ impl Collector for TopDocs {
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
         let heap_len = self.0.limit + self.0.offset;
-        let mut top_n: TopNComputer<_, _> = TopNComputer::new(heap_len);
+        let segment_size = reader.num_docs() as usize;
+        let capped_heap_len = heap_len.min(segment_size);
+        let mut top_n: TopNComputer<_, _> = TopNComputer::new(capped_heap_len);
 
         if let Some(alive_bitset) = reader.alive_bitset() {
             let mut threshold = Score::MIN;
@@ -714,6 +716,15 @@ impl SegmentCollector for TopScoreSegmentCollector {
 
     fn harvest(self) -> Vec<(Score, DocAddress)> {
         self.0.harvest()
+    }
+}
+
+#[cfg(test)]
+impl TopScoreSegmentCollector {
+    /// Returns the capacity of the internal TopNComputer buffer.
+    /// This is a test-only function to verify buffer allocation is capped correctly.
+    pub fn buffer_capacity(&self) -> usize {
+        self.0.buffer_capacity()
     }
 }
 
@@ -859,6 +870,13 @@ where
             self.truncate_top_n();
         }
         self.buffer
+    }
+
+    #[cfg(test)]
+    /// Returns the capacity of the internal buffer.
+    /// This is a test-only function to verify buffer allocation is capped correctly.
+    pub fn buffer_capacity(&self) -> usize {
+        self.buffer.capacity()
     }
 }
 
@@ -1369,6 +1387,86 @@ mod tests {
                 (18446744073709551615, DocAddress::new(0, 3)),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_docs_capped_by_segment_size() -> crate::Result<()> {
+        // Create a small index with only 2 documents
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+        index_writer.add_document(doc!(text_field=>"Hello world"))?;
+        index_writer.add_document(doc!(text_field=>"Another document"))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let segment_size = segment_reader.num_docs() as usize;
+        
+        // Verify segment has 2 documents
+        assert_eq!(segment_size, 2);
+
+        // Create collector and get segment collector to check buffer capacity
+        let collector = TopDocs::with_limit(100);
+        let segment_collector = collector.for_segment(0, segment_reader)?;
+        
+        // Buffer capacity should be 2 * capped_limit = 2 * 2 = 4
+        // If it wasn't capped, it would be 2 * 100 = 200
+        let buffer_capacity = segment_collector.buffer_capacity();
+        assert_eq!(buffer_capacity, 4, "Buffer should be capped to 2 * segment_size (4), but got {}", buffer_capacity);
+
+        // Also verify it works correctly when searching
+        // Use AllQuery to match all documents in the segment
+        let top_docs: Vec<(Score, DocAddress)> = searcher
+            .search(&AllQuery, &TopDocs::with_limit(100))?;
+
+        // Should only return 2 documents (capped by segment size)
+        assert_eq!(top_docs.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_docs_with_offset_capped_by_segment_size() -> crate::Result<()> {
+        // Create a small index with only 3 documents
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+        index_writer.add_document(doc!(text_field=>"First document"))?;
+        index_writer.add_document(doc!(text_field=>"Second document"))?;
+        index_writer.add_document(doc!(text_field=>"Third document"))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let segment_size = segment_reader.num_docs() as usize;
+        
+        // Verify segment has 3 documents
+        assert_eq!(segment_size, 3);
+
+        // Create collector with offset and get segment collector to check buffer capacity
+        let collector = TopDocs::with_limit(100).and_offset(1);
+        let segment_collector = collector.for_segment(0, segment_reader)?;
+        
+        // Requested limit is 100 + 1 = 101, but should be capped to segment_size (3)
+        // Buffer capacity should be 2 * capped_limit = 2 * 3 = 6
+        // If it wasn't capped, it would be 2 * 101 = 202
+        let buffer_capacity = segment_collector.buffer_capacity();
+        assert_eq!(buffer_capacity, 6, "Buffer should be capped to 2 * segment_size (6), but got {}", buffer_capacity);
+
+        // Also verify it works correctly when searching
+        // Use AllQuery to match all documents in the segment
+        let top_docs: Vec<(Score, DocAddress)> = searcher
+            .search(&AllQuery, &TopDocs::with_limit(100).and_offset(1))?;
+
+        // Should only return 2 documents (3 total - 1 offset, capped by segment size)
+        assert_eq!(top_docs.len(), 2);
         Ok(())
     }
 }
