@@ -35,6 +35,8 @@ pub struct TopHitsAggReqData {
     pub name: String,
     /// The top_hits aggregation request.
     pub req: TopHitsAggregationReq,
+    /// The number of documents in the segment.
+    pub segment_num_docs: u32,
 }
 
 impl TopHitsAggReqData {
@@ -525,13 +527,22 @@ impl TopHitsSegmentCollector {
         req: &TopHitsAggregationReq,
         accessor_idx: usize,
         segment_ordinal: SegmentOrdinal,
+        segment_num_docs: u32,
     ) -> Self {
+        let requested_size = req.size + req.from.unwrap_or(0);
+        let capped_size = requested_size.min(segment_num_docs as usize);
         Self {
-            top_n: TopNComputer::new(req.size + req.from.unwrap_or(0)),
+            top_n: TopNComputer::new(capped_size),
             segment_ordinal,
             accessor_idx,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn topn_capacity(&self) -> usize {
+        self.top_n.buffer_capacity()
+    }
+
     fn into_top_hits_collector(
         self,
         value_accessors: &HashMap<String, Vec<DynamicColumn>>,
@@ -923,5 +934,110 @@ mod tests {
     #[test]
     fn test_aggregation_top_hits_multi_segment() -> crate::Result<()> {
         test_aggregation_top_hits(false)
+    }
+
+    #[test]
+    fn test_top_hits_segment_collector_caps_buffer() {
+        use super::{TopHitsAggregationReq, TopHitsSegmentCollector};
+
+        // Test that buffer is capped when size > segment_num_docs
+        let req = TopHitsAggregationReq {
+            size: 50000,
+            from: Some(0),
+            sort: vec![],
+            doc_value_fields: vec![],
+            _source: None,
+            fields: None,
+            script_fields: None,
+            highlight: None,
+            explain: None,
+            version: None,
+        };
+
+        // Create collector for a small segment with only 10 docs
+        let collector = TopHitsSegmentCollector::from_req(&req, 0, 0, 10);
+
+        // Buffer should be capped at 2 * min(50000, 10) = 20
+        assert_eq!(collector.topn_capacity(), 20);
+    }
+
+    #[test]
+    fn test_top_hits_segment_collector_with_offset_caps_buffer() {
+        use super::{TopHitsAggregationReq, TopHitsSegmentCollector};
+
+        // Test that size + offset is capped to segment_num_docs
+        let req = TopHitsAggregationReq {
+            size: 10000,
+            from: Some(5000),
+            sort: vec![],
+            doc_value_fields: vec![],
+            _source: None,
+            fields: None,
+            script_fields: None,
+            highlight: None,
+            explain: None,
+            version: None,
+        };
+
+        // Create collector for a segment with 100 docs
+        let collector = TopHitsSegmentCollector::from_req(&req, 0, 0, 100);
+
+        // Buffer should be capped at 2 * min(15000, 100) = 200
+        assert_eq!(collector.topn_capacity(), 200);
+    }
+
+    #[test]
+    fn test_top_hits_segment_collector_no_cap_when_size_smaller() {
+        use super::{TopHitsAggregationReq, TopHitsSegmentCollector};
+
+        // Test that when size < segment_num_docs, no capping occurs
+        let req = TopHitsAggregationReq {
+            size: 10,
+            from: Some(0),
+            sort: vec![],
+            doc_value_fields: vec![],
+            _source: None,
+            fields: None,
+            script_fields: None,
+            highlight: None,
+            explain: None,
+            version: None,
+        };
+
+        // Create collector for a large segment with 10000 docs
+        let collector = TopHitsSegmentCollector::from_req(&req, 0, 0, 10000);
+
+        // Buffer should be 2 * min(10, 10000) = 20 (not affected by large segment)
+        assert_eq!(collector.topn_capacity(), 20);
+    }
+
+    #[test]
+    fn test_top_hits_segment_collector_simulates_user_case() {
+        use super::{TopHitsAggregationReq, TopHitsSegmentCollector};
+
+        // Simulate the user's actual scenario: 1300 segments with ~77 docs, size=50000
+        let req = TopHitsAggregationReq {
+            size: 50000,
+            from: Some(0),
+            sort: vec![],
+            doc_value_fields: vec![],
+            _source: None,
+            fields: None,
+            script_fields: None,
+            highlight: None,
+            explain: None,
+            version: None,
+        };
+
+        // Each segment has approximately 77 docs
+        let segment_num_docs = 77;
+        let collector = TopHitsSegmentCollector::from_req(&req, 0, 0, segment_num_docs);
+
+        // Buffer should be capped at 2 * min(50000, 77) = 154
+        assert_eq!(collector.topn_capacity(), 154);
+
+        // Without the fix: would allocate 2 * 50000 = 100,000 elements
+        // With the fix: allocates only 2 * 77 = 154 elements
+        // For 1300 segments: saves 130M - 200K = ~129.8M elements!
     }
 }

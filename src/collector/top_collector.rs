@@ -124,9 +124,11 @@ where T: PartialOrd + Clone
     pub(crate) fn for_segment<F: PartialOrd + Clone>(
         &self,
         segment_id: SegmentOrdinal,
-        _: &SegmentReader,
+        reader: &SegmentReader,
     ) -> TopSegmentCollector<F> {
-        TopSegmentCollector::new(segment_id, self.limit + self.offset)
+        let requested_size = self.limit + self.offset;
+        let capped_size = requested_size.min(reader.num_docs() as usize);
+        TopSegmentCollector::new(segment_id, capped_size)
     }
 
     /// Create a new TopCollector with the same limit and offset.
@@ -166,6 +168,11 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
 }
 
 impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
+    #[cfg(test)]
+    pub(crate) fn topn_capacity(&self) -> usize {
+        self.topn_computer.buffer_capacity()
+    }
+
     pub fn harvest(self) -> Vec<(T, DocAddress)> {
         let segment_ord = self.segment_ord;
         self.topn_computer
@@ -303,6 +310,110 @@ mod tests {
             .unwrap();
 
         assert_eq!(results, vec![]);
+    }
+
+    #[test]
+    fn test_for_segment_caps_buffer_to_segment_size() -> crate::Result<()> {
+        use crate::schema::{Schema, TEXT};
+        use crate::Index;
+
+        // Create an index with a small segment
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+
+        // Add only 5 documents
+        for i in 0..5 {
+            index_writer.add_document(doc!(text_field => format!("doc {}", i)))?;
+        }
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+
+        // Verify segment has 5 docs
+        assert_eq!(segment_reader.num_docs(), 5);
+
+        // Request a limit much larger than segment size
+        let collector = TopCollector::<f32>::with_limit(1000);
+        let segment_collector: TopSegmentCollector<f32> = collector.for_segment(0, segment_reader);
+
+        // The buffer capacity should be capped at 2 * segment_size = 10
+        // (TopNComputer allocates 2x the requested size)
+        assert_eq!(segment_collector.topn_capacity(), 10);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_for_segment_with_offset_caps_buffer() -> crate::Result<()> {
+        use crate::schema::{Schema, TEXT};
+        use crate::Index;
+
+        // Create an index with a small segment
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+
+        // Add 10 documents
+        for i in 0..10 {
+            index_writer.add_document(doc!(text_field => format!("doc {}", i)))?;
+        }
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+
+        assert_eq!(segment_reader.num_docs(), 10);
+
+        // Request limit=1000 + offset=500 = 1500 total, but segment only has 10 docs
+        let collector = TopCollector::<f32>::with_limit(1000).and_offset(500);
+        let segment_collector: TopSegmentCollector<f32> = collector.for_segment(0, segment_reader);
+
+        // Buffer should be capped at 2 * min(1500, 10) = 20
+        assert_eq!(segment_collector.topn_capacity(), 20);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_for_segment_doesnt_cap_when_limit_smaller() -> crate::Result<()> {
+        use crate::schema::{Schema, TEXT};
+        use crate::Index;
+
+        // Create an index with a larger segment
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+
+        // Add 100 documents
+        for i in 0..100 {
+            index_writer.add_document(doc!(text_field => format!("doc {}", i)))?;
+        }
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+
+        assert_eq!(segment_reader.num_docs(), 100);
+
+        // Request a small limit (10) from a large segment (100)
+        let collector = TopCollector::<f32>::with_limit(10);
+        let segment_collector: TopSegmentCollector<f32> = collector.for_segment(0, segment_reader);
+
+        // Buffer should be 2 * min(10, 100) = 20 (not affected by segment size)
+        assert_eq!(segment_collector.topn_capacity(), 20);
+
+        Ok(())
     }
 }
 

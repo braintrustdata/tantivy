@@ -383,6 +383,7 @@ pub(crate) fn build_segment_agg_collector(
                 &req_data.req,
                 node.idx_in_req_data,
                 req_data.segment_ordinal,
+                req_data.segment_num_docs,
             )))
         }
         AggKind::Histogram => Ok(Box::new(SegmentHistogramCollector::from_req_and_validate(
@@ -678,6 +679,7 @@ fn build_nodes(
                 segment_ordinal,
                 name: agg_name.to_string(),
                 req: top_hits.clone(),
+                segment_num_docs: reader.num_docs(),
             });
             let children = build_children(&req.sub_aggregation, reader, segment_ordinal, data)?;
             Ok(vec![AggRefNode {
