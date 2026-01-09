@@ -796,6 +796,11 @@ where
     /// Internally it will allocate a buffer of size `2 * top_n`.
     pub fn new(top_n: usize) -> Self {
         let vec_cap = top_n.max(1) * 2;
+        eprintln!(
+            "TopNComputer capacity: {}, bytes: {}",
+            vec_cap,
+            vec_cap * std::mem::size_of::<ComparableDoc<Score, D, R>>()
+        );
         TopNComputer {
             buffer: Vec::with_capacity(vec_cap),
             top_n,
