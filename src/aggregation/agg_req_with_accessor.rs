@@ -36,6 +36,7 @@ impl AggregationsWithAccessor {
 
 pub struct AggregationWithAccessor {
     pub(crate) segment_ordinal: SegmentOrdinal,
+    pub(crate) segment_size: usize,
     /// In general there can be buckets without fast field access, e.g. buckets that are created
     /// based on search terms. That is not that case currently, but eventually this needs to be
     /// Option or moved.
@@ -72,6 +73,7 @@ impl AggregationWithAccessor {
     ) -> crate::Result<Vec<AggregationWithAccessor>> {
         let mut agg = agg.clone();
 
+        let segment_size = reader.num_docs() as usize;
         let add_agg_with_accessor = |agg: &Aggregation,
                                      accessor: Column<u64>,
                                      column_type: ColumnType,
@@ -79,6 +81,7 @@ impl AggregationWithAccessor {
          -> crate::Result<()> {
             let res = AggregationWithAccessor {
                 segment_ordinal,
+                segment_size,
                 accessor,
                 accessors: Default::default(),
                 value_accessors: Default::default(),
@@ -107,6 +110,7 @@ impl AggregationWithAccessor {
             let (accessor, field_type) = accessors.first().expect("at least one accessor");
             let res = AggregationWithAccessor {
                 segment_ordinal,
+                segment_size,
                 // TODO: We should do away with the `accessor` field altogether
                 accessor: accessor.clone(),
                 value_accessors,
@@ -236,6 +240,7 @@ impl AggregationWithAccessor {
 
                     let agg = AggregationWithAccessor {
                         segment_ordinal,
+                        segment_size,
                         missing_value_for_accessor,
                         accessor,
                         accessors: Default::default(),

@@ -128,9 +128,12 @@ where T: PartialOrd + Clone
     pub(crate) fn for_segment<F: PartialOrd + Clone>(
         &self,
         segment_id: SegmentOrdinal,
-        _: &SegmentReader,
+        reader: &SegmentReader,
     ) -> TopSegmentCollector<F> {
-        TopSegmentCollector::new(segment_id, self.limit + self.offset)
+        let requested_limit = self.limit + self.offset;
+        let segment_size = reader.num_docs() as usize;
+        let capped_limit = requested_limit.min(segment_size);
+        TopSegmentCollector::new(segment_id, capped_limit)
     }
 
     /// Create a new TopCollector with the same limit and offset.
@@ -194,6 +197,13 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
     #[inline]
     pub fn collect(&mut self, doc: DocId, feature: T) {
         self.topn_computer.push(feature, doc);
+    }
+
+    #[cfg(test)]
+    /// Returns the capacity of the internal TopNComputer buffer.
+    /// This is a test-only function to verify buffer allocation is capped correctly.
+    pub fn buffer_capacity(&self) -> usize {
+        self.topn_computer.buffer_capacity()
     }
 }
 
@@ -307,6 +317,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(results, vec![]);
+    }
+
+    #[test]
+    fn test_top_collector_capped_by_segment_size() -> crate::Result<()> {
+        use crate::schema::{Schema, TEXT};
+        use crate::Index;
+
+        // Create a small index with only 2 documents
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+        index_writer.add_document(doc!(text_field=>"Hello world"))?;
+        index_writer.add_document(doc!(text_field=>"Another document"))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let segment_size = segment_reader.num_docs() as usize;
+        
+        // Verify segment has 2 documents
+        assert_eq!(segment_size, 2);
+
+        // Create a TopCollector requesting more than segment size
+        let collector: TopCollector<crate::Score> = TopCollector::with_limit(100);
+        
+        // Get the segment collector - it should be capped to segment_size
+        let segment_collector: TopSegmentCollector<crate::Score> = collector.for_segment(0, segment_reader);
+        
+        // The internal TopNComputer should have been created with capped size (2)
+        // Buffer capacity should be 2 * capped_limit = 2 * 2 = 4
+        // If it wasn't capped, it would be 2 * 100 = 200
+        let buffer_capacity = segment_collector.buffer_capacity();
+        assert_eq!(buffer_capacity, 4, "Buffer should be capped to 2 * segment_size (4), but got {}", buffer_capacity);
+        Ok(())
     }
 }
 
