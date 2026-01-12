@@ -166,11 +166,26 @@ pub fn decode_vector(bytes: &[u8], encoding: VectorEncoding, quant: Option<&Int8
     }
 }
 
-/// A simple bitset for tracking presence of vectors.
+/// A bitset for tracking presence of vectors with O(1) rank queries.
+///
+/// Inspired by Tantivy's OptionalIndex, this bitset maintains a cumulative
+/// popcount cache for efficient offset calculations. This is critical for
+/// random access performance in columnar vector storage.
+///
+/// # Performance
+///
+/// Without cache: `count_ones_before(N)` requires O(N/64) operations
+/// With cache: `count_ones_before(N)` requires O(1) operations
+///
+/// For 1M docs: reduces ~15,625 u64 reads → 1 u32 read + 1 u64 operation
 #[derive(Debug, Clone)]
 pub struct PresenceBitset {
     bits: Vec<u64>,
     len: u32,
+    /// Cumulative popcount at each u64 boundary: cumulative_counts[i] = popcount(bits[0..i])
+    /// This enables O(1) rank queries inspired by Tantivy's OptionalIndex.
+    /// Space cost: 4 bytes per 64 docs = ~62 KB per 1M docs
+    cumulative_counts: Vec<u32>,
 }
 
 impl PresenceBitset {
@@ -180,10 +195,24 @@ impl PresenceBitset {
         Self {
             bits: vec![0; num_words],
             len,
+            cumulative_counts: vec![0; num_words],
+        }
+    }
+
+    /// Build cumulative popcount cache from the current bits.
+    /// Call this after all bits have been set during construction.
+    pub fn build_cache(&mut self) {
+        self.cumulative_counts.clear();
+        self.cumulative_counts.reserve(self.bits.len());
+        let mut cumulative = 0u32;
+        for &word in &self.bits {
+            self.cumulative_counts.push(cumulative);
+            cumulative += word.count_ones();
         }
     }
 
     /// Create from raw bytes (little-endian u64 words).
+    /// Automatically builds the popcount cache.
     pub fn from_bytes(bytes: &[u8], len: u32) -> Self {
         let num_words = (len as usize + 63) / 64;
         let mut bits = vec![0u64; num_words];
@@ -194,7 +223,20 @@ impl PresenceBitset {
                 bits[i] = u64::from_le_bytes(word_bytes);
             }
         }
-        Self { bits, len }
+
+        // Build cumulative popcount cache
+        let mut cumulative_counts = Vec::with_capacity(num_words);
+        let mut cumulative = 0u32;
+        for &word in &bits {
+            cumulative_counts.push(cumulative);
+            cumulative += word.count_ones();
+        }
+
+        Self {
+            bits,
+            len,
+            cumulative_counts,
+        }
     }
 
     /// Get the raw bytes (little-endian u64 words).
@@ -211,11 +253,13 @@ impl PresenceBitset {
     }
 
     /// Set bit at index.
+    /// Note: After setting bits, call `build_cache()` before performing rank queries.
     pub fn set(&mut self, index: u32) {
         if index < self.len {
             let word = index as usize / 64;
             let bit = index % 64;
             self.bits[word] |= 1 << bit;
+            // Note: Cache is rebuilt in bulk via build_cache() after all sets
         }
     }
 
@@ -235,25 +279,44 @@ impl PresenceBitset {
     }
 
     /// Count number of set bits before index (for computing offset).
+    ///
+    /// This is the critical operation for random vector access. Uses the cumulative
+    /// popcount cache for O(1) performance.
+    ///
+    /// # Performance
+    ///
+    /// Old: O(index/64) - iterate through all words before index
+    /// New: O(1) - lookup cached count + one popcount operation
+    ///
+    /// For doc_id = 500K: reduces ~7,813 u64 operations → 1 lookup + 1 popcount
+    #[inline]
     pub fn count_ones_before(&self, index: u32) -> u32 {
         if index == 0 {
             return 0;
         }
-        let full_words = index as usize / 64;
-        let remaining_bits = index % 64;
 
-        let mut count: u32 = self.bits[..full_words]
-            .iter()
-            .map(|w| w.count_ones())
-            .sum();
+        let word_idx = (index / 64) as usize;
+        let bit_offset = index % 64;
 
-        if remaining_bits > 0 && full_words < self.bits.len() {
-            // Mask off bits at and after the index
-            let mask = (1u64 << remaining_bits) - 1;
-            count += (self.bits[full_words] & mask).count_ones();
+        // O(1) lookup of cumulative count up to this word
+        let base_count = if word_idx < self.cumulative_counts.len() {
+            self.cumulative_counts[word_idx]
+        } else {
+            // Beyond the bitset
+            return self.count_ones();
+        };
+
+        if bit_offset == 0 {
+            return base_count;
         }
 
-        count
+        // Add popcount of partial word up to bit_offset
+        if word_idx < self.bits.len() {
+            let mask = (1u64 << bit_offset) - 1;
+            base_count + (self.bits[word_idx] & mask).count_ones()
+        } else {
+            base_count
+        }
     }
 
     /// Iterate over indices where bit is set.
@@ -329,6 +392,9 @@ mod tests {
         bitset.set(50);
         bitset.set(99);
 
+        // Build cache after setting bits
+        bitset.build_cache();
+
         assert!(bitset.get(0));
         assert!(bitset.get(50));
         assert!(bitset.get(99));
@@ -355,6 +421,9 @@ mod tests {
         bitset.set(127);
         bitset.set(149);
 
+        // Build cache after setting bits
+        bitset.build_cache();
+
         let bytes = bitset.as_bytes();
         let restored = PresenceBitset::from_bytes(&bytes, 150);
 
@@ -365,6 +434,13 @@ mod tests {
         assert!(restored.get(149));
         assert!(!restored.get(1));
         assert!(!restored.get(148));
+
+        // Verify cache was rebuilt correctly on deserialization
+        assert_eq!(restored.count_ones_before(0), 0);
+        assert_eq!(restored.count_ones_before(1), 1);
+        assert_eq!(restored.count_ones_before(64), 2);
+        assert_eq!(restored.count_ones_before(65), 3);
+        assert_eq!(restored.count_ones_before(150), 5);
     }
 }
 

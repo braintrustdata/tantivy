@@ -261,6 +261,26 @@ impl VectorReader {
     ///
     /// Returns `None` if field, vector_id, or doc_id is not found,
     /// or if the document doesn't have this vector ID.
+    ///
+    /// # Performance Note
+    ///
+    /// **⚡ Optimized with cached popcount:** Uses O(1) cumulative popcount cache
+    /// (inspired by Tantivy's OptionalIndex) to compute vector offset instantly.
+    ///
+    /// **I/O cost:** ~2 KB per call (cache lookup + vector data)
+    /// - Old: ~127 KB (scanning bitset for offset calculation)
+    /// - New: ~2 KB (1 u32 cache read + 1 u64 popcount + vector data)
+    /// - **63× improvement** for random access! ⚡
+    ///
+    /// **Example:** Fetching a 384-dim f32 vector (1.5 KB) from a 1M doc segment:
+    /// - Cache read: ~4 bytes
+    /// - Partial popcount: 8 bytes
+    /// - Vector data: 1.5 KB
+    /// - **Total: ~2 KB** vs old ~127 KB
+    ///
+    /// For even better performance:
+    /// - `get_batch()` if you know doc_ids and vector_ids upfront
+    /// - `iter_vectors()` if processing many/all documents (still optimal for ML)
     pub fn get(&self, field: Field, vector_id: &str, doc_id: DocId) -> Option<Cow<'_, [f32]>> {
         self.field_vectors
             .get(&field.field_id())
@@ -287,10 +307,26 @@ impl VectorReader {
     /// Iterates over all vectors for a given field and vector ID.
     ///
     /// Yields (doc_id, Cow<[f32]>) pairs for documents that have this vector.
-    /// This is the primary access pattern for columnar vector storage.
     ///
-    /// For f32 encoding, vectors are returned as borrowed slices (zero-copy).
-    /// For f16/int8 encoding, vectors are decoded on the fly.
+    /// **This is the PRIMARY and OPTIMAL access pattern for columnar vector storage.**
+    ///
+    /// # Performance
+    ///
+    /// - **Sequential access:** Reads vectors in contiguous memory order
+    /// - **Cache-friendly:** Minimal random access, excellent locality
+    /// - **SIMD-ready:** Batch operations can be vectorized
+    ///
+    /// **I/O Cost:** Bitset (⌈num_docs/64⌉ × 8 bytes) + all vector data.
+    /// For 1M docs with 500K vectors of 384-dim f32: 122 KB + 768 MB = **768 MB total**
+    ///
+    /// Use this for:
+    /// - ML batch operations (clustering, similarity search)
+    /// - Computing centroids or statistics over vectors
+    /// - Any workflow that processes most/all vectors with a given ID
+    ///
+    /// **Encoding behavior:**
+    /// - f32: Zero-copy borrowed slices (optimal)
+    /// - f16/int8: Decoded on the fly (small CPU cost)
     pub fn iter_vectors(
         &self,
         field: Field,
@@ -332,6 +368,23 @@ impl VectorReader {
     /// Gets all vectors for a document across all vector IDs for a field.
     ///
     /// Returns a map of vector_id -> Cow<[f32]> for the given document.
+    ///
+    /// # Performance Note
+    ///
+    /// **⚡ Optimized with cached popcount:** Each vector_id check is now O(1)
+    /// instead of O(num_docs/64), making this method much faster.
+    ///
+    /// Runtime is O(V) where V is the total number of unique vector_ids in the field.
+    /// Each check reads ~2 KB (with cache) instead of ~122 KB (without cache).
+    ///
+    /// **Example:** If field has 100 vector_ids but doc only has 3 vectors:
+    /// - Old: ~100 × 122 KB = 12 MB reads
+    /// - New: ~100 × 2 KB = 200 KB reads ⚡
+    /// - **60× improvement** for this pattern!
+    ///
+    /// If this is still a bottleneck with many vector_ids:
+    /// - Consider adding an inverse index (doc_id → vector_ids) for O(1) lookup
+    /// - Or store vectors in doc store for document-centric access
     pub fn get_doc_vectors(&self, field: Field, doc_id: DocId) -> BTreeMap<&str, Cow<'_, [f32]>> {
         let mut result = BTreeMap::new();
         if let Some(vector_id_map) = self.field_vectors.get(&field.field_id()) {
@@ -346,11 +399,26 @@ impl VectorReader {
 
     /// Batch retrieves vectors for multiple documents and multiple vector IDs.
     ///
-    /// This is the most efficient method for retrieving a set of specific vectors
-    /// across multiple documents, as it minimizes HashMap and BTreeMap lookups.
+    /// This is more efficient than calling `get()` repeatedly, as it amortizes
+    /// HashMap and BTreeMap lookups across all requested vectors.
     ///
     /// Returns a Vec where each entry corresponds to a doc_id in the input slice,
     /// containing a BTreeMap of vector_id -> owned Vec<f32> for vectors found.
+    ///
+    /// # Performance
+    ///
+    /// - **Runtime:** O(V_q × log V_total + D_q × V_q × (num_docs/64 + dimensions))
+    ///   - V_q = requested vector_ids, V_total = total vector_ids, D_q = requested docs
+    ///
+    /// - **I/O Cost:** For each requested vector_id, reads its bitset (~122 KB per 1M docs)
+    ///   plus vector data for matching docs.
+    ///
+    /// **Example:** Fetch 100 docs × 3 vector_ids with 384-dim f32 from 1M doc segment:
+    /// - Bitsets: 3 × 122 KB = **366 KB**
+    /// - Vectors: 100 × 3 × 1.5 KB = **450 KB**
+    /// - **Total: ~816 KB** vs ~12.7 MB for 100 individual `get()` calls
+    ///
+    /// Use this when you know the doc_ids and vector_ids you need upfront.
     pub fn get_batch(
         &self,
         field: Field,

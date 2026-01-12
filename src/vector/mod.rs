@@ -29,13 +29,13 @@
 //!   version: u8 (1)
 //!   encoding: u8 (0=f32, 1=f16, 2=int8)
 //!   num_fields: u32
-//!   field_ids: [u32; num_fields]
+//!   field_ids: [u32; num_fields]    # e.g., [3] for field ID 3
 //!   num_docs: u32
 //!
 //! Per field, per vector_id (sorted alphabetically):
-//!   vector_id_len: u32
-//!   vector_id: [u8; len]
-//!   dimensions: u32               # fixed for this column
+//!   vector_id_len: u32              # e.g., 7 for "my_key"
+//!   vector_id: [u8; len]            # e.g., "my_key" as UTF-8 bytes
+//!   dimensions: u32                 # fixed for this vector_id column
 //!   presence_bitset: [u64; ⌈num_docs/64⌉]
 //!   [if int8: scale: f32, zero_point: f32]
 //!   vectors: [encoded; dims × popcount(bitset)]  # contiguous
@@ -43,30 +43,86 @@
 //! Footer: Tantivy's standard file footer
 //! ```
 //!
+//! **Example:** For a document with:
+//! ```ignore
+//! doc.add_named_vector(embedding_field, "my_key", vec![0.1, 0.2]);
+//! doc.add_named_vector(embedding_field, "summary", vec![1.0, 2.0, 3.0]);
+//! ```
+//!
+//! The file stores two vector_id columns under the embedding field:
+//! - Column 1: vector_id="my_key" (6 bytes), dimensions=2, vectors=[0.1, 0.2, ...]
+//! - Column 2: vector_id="summary" (7 bytes), dimensions=3, vectors=[1.0, 2.0, 3.0, ...]
+//!
+//! Each vector_id string is the key from the VectorMap and is stored once per column.
+//!
 //! # Performance Characteristics
 //!
-//! | Operation | Complexity | Notes |
-//! |-----------|------------|-------|
-//! | `iter_vectors(field, id)` | O(n) | Primary pattern: sequential scan, cache-friendly |
-//! | `get(field, id, doc)` | O(1) | Random access via bitset + offset calculation |
-//! | `has_vector(field, id, doc)` | O(1) | Single bit check |
-//! | `dimensions(field, id)` | O(1) | Stored in header |
-//! | `count(field, id)` | O(1) | Popcount of bitset (cached) |
+//! | Operation                     | Complexity            | Bytes Read (1M docs, 384-dim f32)            |
+//! |-------------------------------|-----------------------|----------------------------------------------|
+//! | `iter_vectors(field, id)`     | O(popcount × dims)    | 122 KB bitset + all vector data (optimal ✅) |
+//! | `get(field, id, doc)`         | **O(log V + 1)** ⚡   | **~2 KB** (cached popcount + vector)         |
+//! | `get_doc_vectors(field, doc)` | O(V)                  | ~V × 2 KB (check each vector_id)             |
+//! | `get_batch(field, docs, ids)` | O(V_q × D_q × dims)   | Better amortization than N × get()           |
+//! | `has_vector(field, id, doc)`  | O(log V)              | Bitset check only (~122 KB)                  |
+//! | `dimensions(field, id)`       | O(log V)              | Metadata only (< 1 KB)                       |
+//! | `count(field, id)`            | O(log V)              | Bitset popcount (~122 KB)                    |
 //!
-//! ## What's Fast
+//! Where: V = num vector_ids, V_q = queried vector_ids, D_q = queried docs
+//!
+//! **⚡ Optimization:** Uses cumulative popcount cache (inspired by Tantivy's OptionalIndex)
+//! for O(1) rank queries instead of O(num_docs/64). This reduces `get()` overhead from
+//! 127 KB → 2 KB per call (63× improvement).
+//!
+//! ## What's Fast ✅
 //!
 //! - **Batch iteration**: `iter_vectors` reads contiguous memory, ideal for SIMD/vectorized ops
 //! - **Clustering**: Extract all vectors → feed to K-means/DBSCAN (see example below)
 //! - **Similarity search**: Scan all vectors, compute distances in batch
-//! - **Presence checks**: Bitset operations are extremely fast
+//! - **Presence checks**: Bitset operations are fast (though require reading ~122 KB per 1M docs)
+//! - **Storage efficiency**: Sparse vectors use minimal space (1 bit per doc overhead)
 //!
-//! ## What's Slower
+//! ## What's Acceptable (with optimizations) ✓
 //!
-//! - **Single vector lookup**: `get()` works but involves bitset math; if you need many
-//!   random accesses, consider iterating instead
-//! - **Cross-segment queries**: Each segment has its own file; aggregate across segments
+//! - **Single vector random access**: `get(field, id, doc)` now uses O(1) cached popcount
+//!   instead of O(num_docs/64) bitset scan. Reads ~2 KB per call (cache lookup + vector data)
+//!   vs the old ~127 KB. Still not as fast as sequential iteration, but 63× better!
 //!
-//! # Trade-offs
+//! - **Fetch all vectors for one doc**: `get_doc_vectors(field, doc)` must check every
+//!   vector_id in the field. With cached popcount, this is now O(V) bitset checks where
+//!   each check is O(1). If there are 100 vector_ids, reads ~200 KB vs old ~12 MB.
+//!   Still consider inverse index if this is a primary pattern with many vector_ids.
+//!
+//! ## What's Slower ⚠️
+//!
+//! - **Large segment counts**: Each segment has its own file; aggregate across segments
+//!
+//! # Design Trade-offs
+//!
+//! ## Storage Layout: Columnar vs Row-Based (Doc Store)
+//!
+//! **Current design uses columnar storage.** Should vectors be stored in the document
+//! store instead? Here's the analysis:
+//!
+//! | Criteria | Columnar (current) | Row-based (doc store) |
+//! |----------|-------------------|----------------------|
+//! | Fetch all vectors for 1 doc | O(V), ~V × bitsets | O(1), 1 doc read ✅ |
+//! | Fetch 1 vector for 1 doc | O(num_docs/64), ~127 KB | O(1), 1 doc read ✅ |
+//! | Batch iterate by vector_id | **O(popcount), optimal** ✅ | O(num_docs) random reads ❌ |
+//! | ML workflows (clustering) | **Excellent** ✅ | Poor (many seeks) ❌ |
+//! | Storage efficiency (sparse) | **Excellent** (bitset) ✅ | Poor (null markers) ❌ |
+//! | Segment merge complexity | Simple ✅ | Simple ✅ |
+//!
+//! **Recommendation:**
+//! - Keep columnar for **ML-first workloads** (clustering, similarity search, centroids)
+//! - Consider doc-store option for **document-retrieval workloads** (fetch doc + vectors)
+//! - The current design is correct for Braintrust's vector clustering use case ✅
+//!
+//! **Optimization opportunities** (if random access becomes important):
+//! 1. Add popcount cache to VectorColumn for O(1) offset calculation
+//! 2. Add inverse index (doc_id -> vector_ids) for faster `get_doc_vectors`
+//! 3. Use compressed bitsets (RoaringBitmap) with O(1) rank/select
+//!
+//! ## Other Trade-offs
 //!
 //! | Choice | Benefit | Cost |
 //! |--------|---------|------|

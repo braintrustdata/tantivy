@@ -242,6 +242,9 @@ impl VectorFieldsWriter {
                     }
                 }
 
+                // Build popcount cache for O(1) rank queries
+                bitset.build_cache();
+
                 // Write presence bitset
                 let bitset_bytes = bitset.as_bytes();
                 wrt.write_all(&bitset_bytes)?;
