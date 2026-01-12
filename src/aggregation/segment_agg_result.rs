@@ -165,6 +165,7 @@ pub(crate) fn build_single_agg_segment_collector(
             top_hits_req,
             accessor_idx,
             req.segment_ordinal,
+            req.segment_size,
         ))),
     }
 }
