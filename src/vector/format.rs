@@ -1,5 +1,7 @@
 //! Vector storage format definitions.
 
+use std::borrow::Cow;
+
 use half::f16;
 
 /// Magic number for vector files: "TVEC" in little-endian
@@ -144,18 +146,16 @@ pub fn encode_vector(vec: &[f32], encoding: VectorEncoding, quant: Option<&Int8Q
 }
 
 /// Decode bytes to f32 vector based on encoding.
-pub fn decode_vector(bytes: &[u8], encoding: VectorEncoding, quant: Option<&Int8QuantParams>) -> Vec<f32> {
+/// Returns borrowed slice for f32 (zero-copy), owned Vec for f16/int8.
+pub fn decode_vector<'a>(bytes: &'a [u8], encoding: VectorEncoding, quant: Option<&Int8QuantParams>) -> Cow<'a, [f32]> {
     match encoding {
         VectorEncoding::F32 => {
-            bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect()
+            Cow::Borrowed(bytemuck::cast_slice(bytes))
         }
-        VectorEncoding::F16 => decode_f16(bytes),
+        VectorEncoding::F16 => Cow::Owned(decode_f16(bytes)),
         VectorEncoding::Int8 => {
             let quant = quant.expect("Int8 encoding requires quantization params");
-            quant.dequantize_vec(bytes)
+            Cow::Owned(quant.dequantize_vec(bytes))
         }
     }
 }

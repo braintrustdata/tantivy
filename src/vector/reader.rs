@@ -40,17 +40,7 @@ impl VectorColumn {
         }
 
         let bytes = &self.data[start..end];
-
-        // For f32, we can return a zero-copy slice
-        if encoding == VectorEncoding::F32 {
-            // Safety: f32 is 4 bytes, properly aligned in our format
-            let floats = bytemuck::cast_slice(bytes);
-            Some(Cow::Borrowed(floats))
-        } else {
-            // For f16/int8, we need to decode
-            let decoded = decode_vector(bytes, encoding, self.quant_params.as_ref());
-            Some(Cow::Owned(decoded))
-        }
+        Some(decode_vector(bytes, encoding, self.quant_params.as_ref()))
     }
 
     /// Iterate over all vectors in this column.
@@ -64,14 +54,7 @@ impl VectorColumn {
             let start = idx * bytes_per_vec;
             let end = start + bytes_per_vec;
             let bytes = &self.data[start..end];
-
-            let vec = if encoding == VectorEncoding::F32 {
-                Cow::Borrowed(bytemuck::cast_slice(bytes))
-            } else {
-                Cow::Owned(decode_vector(bytes, encoding, self.quant_params.as_ref()))
-            };
-
-            (doc_id, vec)
+            (doc_id, decode_vector(bytes, encoding, self.quant_params.as_ref()))
         })
     }
 
