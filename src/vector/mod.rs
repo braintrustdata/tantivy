@@ -14,21 +14,26 @@
 //! # File Format
 //!
 //! ```text
-//! Header:
-//!   magic: u32 ("TVEC")
-//!   version: u8 (1)
-//!   encoding: u8 (0=f32, 1=f16, 2=int8)
+//! Header {
+//!   magic: u32              // "TVEC"
+//!   version: u8             // 1
+//!   encoding: u8            // 0=f32, 1=f16, 2=int8
 //!   num_fields: u32
 //!   field_ids: [u32; num_fields]
 //!   num_docs: u32
+//! }
 //!
-//! Per field, per vector_id (sorted alphabetically):
+//! Per field, per vector_id (sorted alphabetically) {
 //!   vector_id_len: u32
-//!   vector_id: [u8; len]
+//!   vector_id: [u8; vector_id_len]
 //!   dimensions: u32
 //!   presence_bitset: [u64; ceil(num_docs/64)]
-//!   [if int8: scale: f32, zero_point: f32]
-//!   vectors: [encoded; dims * popcount(bitset)]
+//!   if encoding == int8 {
+//!     scale: f32
+//!     zero_point: f32
+//!   }
+//!   vectors: [encoded; dimensions * popcount(presence_bitset)]
+//! }
 //! ```
 //!
 //! # Usage
