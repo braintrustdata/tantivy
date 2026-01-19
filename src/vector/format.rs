@@ -166,18 +166,16 @@ pub fn decode_vector(bytes: &[u8], encoding: VectorEncoding, quant: Option<&Int8
 #[derive(Debug, Clone)]
 pub struct PresenceBitset {
     bits: Vec<u64>,
-    len: u32,
     /// Cumulative popcount at each u64 boundary for O(1) rank queries.
     cumulative_counts: Vec<u32>,
 }
 
 impl PresenceBitset {
-    /// Create a new bitset with all bits set to false.
+    /// Create a new bitset with capacity for `len` bits (rounded up to 64).
     pub fn new(len: u32) -> Self {
         let num_words = (len as usize + 63) / 64;
         Self {
             bits: vec![0; num_words],
-            len,
             cumulative_counts: vec![0; num_words],
         }
     }
@@ -217,7 +215,6 @@ impl PresenceBitset {
 
         Self {
             bits,
-            len,
             cumulative_counts,
         }
     }
@@ -238,44 +235,41 @@ impl PresenceBitset {
     /// Set bit at index.
     /// Note: After setting bits, call `build_cache()` before performing rank queries.
     pub fn set(&mut self, index: u32) {
-        if index < self.len {
-            let word = index as usize / 64;
+        let word = index as usize / 64;
+        if word < self.bits.len() {
             let bit = index % 64;
             self.bits[word] |= 1 << bit;
-            // Note: Cache is rebuilt in bulk via build_cache() after all sets
         }
     }
 
     /// Check if bit is set at index.
     pub fn get(&self, index: u32) -> bool {
-        if index >= self.len {
+        let word = index as usize / 64;
+        if word >= self.bits.len() {
             return false;
         }
-        let word = index as usize / 64;
         let bit = index % 64;
         (self.bits[word] >> bit) & 1 == 1
     }
 
     /// Count number of set bits (popcount).
     pub fn count_ones(&self) -> u32 {
-        self.bits.iter().map(|w| w.count_ones()).sum()
+        if self.bits.is_empty() {
+            return 0;
+        }
+        let last_idx = self.bits.len() - 1;
+        self.cumulative_counts[last_idx] + self.bits[last_idx].count_ones()
     }
 
     /// Count number of set bits before index (for computing vector offset).
     #[inline]
     pub fn count_ones_before(&self, index: u32) -> u32 {
-        if index == 0 {
-            return 0;
-        }
-
         let word_idx = (index / 64) as usize;
         let bit_offset = index % 64;
 
-        // O(1) lookup of cumulative count up to this word
         let base_count = if word_idx < self.cumulative_counts.len() {
             self.cumulative_counts[word_idx]
         } else {
-            // Beyond the bitset
             return self.count_ones();
         };
 
@@ -283,24 +277,17 @@ impl PresenceBitset {
             return base_count;
         }
 
-        // Add popcount of partial word up to bit_offset
-        if word_idx < self.bits.len() {
-            let mask = (1u64 << bit_offset) - 1;
-            base_count + (self.bits[word_idx] & mask).count_ones()
-        } else {
-            base_count
-        }
+        let mask = (1u64 << bit_offset) - 1;
+        base_count + (self.bits[word_idx] & mask).count_ones()
     }
 
     /// Iterate over indices where bit is set.
     pub fn iter_ones(&self) -> impl Iterator<Item = u32> + '_ {
-        let len = self.len;
-        self.bits.iter().enumerate().flat_map(move |(word_idx, &word)| {
+        self.bits.iter().enumerate().flat_map(|(word_idx, &word)| {
             let base = (word_idx * 64) as u32;
             (0..64).filter_map(move |bit| {
-                let index = base + bit;
-                if index < len && (word >> bit) & 1 == 1 {
-                    Some(index)
+                if (word >> bit) & 1 == 1 {
+                    Some(base + bit)
                 } else {
                     None
                 }
@@ -308,14 +295,14 @@ impl PresenceBitset {
         })
     }
 
-    /// Length (number of bits, not bytes).
-    pub fn len(&self) -> u32 {
-        self.len
+    /// Capacity in bits (rounded up to multiple of 64).
+    pub fn capacity(&self) -> u32 {
+        (self.bits.len() * 64) as u32
     }
 
     /// Returns true if empty.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bits.is_empty()
     }
 }
 
