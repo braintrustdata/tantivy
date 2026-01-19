@@ -11,6 +11,22 @@
 //! - **Multiple encodings**: f32 (full precision), f16 (50% smaller), int8 (75% smaller)
 //! - **Named vectors**: Each document can have multiple vectors identified by string IDs
 //!
+//! # Performance
+//!
+//! | Operation                     | Complexity         |
+//! |-------------------------------|--------------------|
+//! | `iter_vectors(field, id)`     | O(N)               |
+//! | `get(field, id, doc)`         | O(log V)           |
+//! | `get_doc_vectors(field, doc)` | O(V)               |
+//! | `get_batch(field, docs, ids)` | O(V_q × D_q)       |
+//! | `has_vector(field, id, doc)`  | O(log V)           |
+//! | `dimensions(field, id)`       | O(log V)           |
+//! | `count(field, id)`            | O(log V)           |
+//!
+//! Where: N = num_docs in segment, V = vector_ids in field,
+//! V_q = queried vector_ids, D_q = queried docs.
+//! Note: O(log V) is acceptable since V is expected to be small (typically 1-10).
+//!
 //! # File Format
 //!
 //! ```text
