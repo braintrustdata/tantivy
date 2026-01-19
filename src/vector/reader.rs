@@ -72,7 +72,7 @@ impl VectorColumn {
 /// This allows efficient retrieval of all vectors with a given ID across documents.
 pub struct VectorReader {
     /// Map from field_id to (vector_id -> VectorColumn)
-    field_vectors: HashMap<u32, BTreeMap<String, VectorColumn>>,
+    field_vectors: HashMap<u32, HashMap<String, VectorColumn>>,
     /// Number of documents
     num_docs: u32,
     /// Encoding used in this file
@@ -132,7 +132,7 @@ impl VectorReader {
         let mut field_vectors = HashMap::new();
         for field_id in field_ids {
             let num_vector_ids = Self::read_u32(&mut reader)?;
-            let mut vector_id_map = BTreeMap::new();
+            let mut vector_id_map = HashMap::new();
 
             for _ in 0..num_vector_ids {
                 // Read vector ID string

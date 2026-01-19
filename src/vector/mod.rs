@@ -13,19 +13,17 @@
 //!
 //! # Performance
 //!
-//! | Operation                     | Complexity         |
-//! |-------------------------------|--------------------|
-//! | `iter_vectors(field, id)`     | O(N)               |
-//! | `get(field, id, doc)`         | O(log V)           |
-//! | `get_doc_vectors(field, doc)` | O(V)               |
-//! | `get_batch(field, docs, ids)` | O(V_q × D_q)       |
-//! | `has_vector(field, id, doc)`  | O(log V)           |
-//! | `dimensions(field, id)`       | O(log V)           |
-//! | `count(field, id)`            | O(log V)           |
+//! | Operation                     | Complexity   |
+//! |-------------------------------|--------------|
+//! | `iter_vectors(field, id)`     | O(n)         |
+//! | `get(field, id, doc)`         | O(1)         |
+//! | `get_doc_vectors(field, doc)` | O(V)         |
+//! | `get_batch(field, docs, ids)` | O(D × V)     |
+//! | `has_vector(field, id, doc)`  | O(1)         |
+//! | `dimensions(field, id)`       | O(1)         |
+//! | `count(field, id)`            | O(1)         |
 //!
-//! Where: N = num_docs in segment, V = vector_ids in field,
-//! V_q = queried vector_ids, D_q = queried docs.
-//! Note: O(log V) is acceptable since V is expected to be small (typically 1-10).
+//! Where: n = vectors returned, V = vector_ids in field, D = docs queried.
 //!
 //! # File Format
 //!
