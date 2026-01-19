@@ -15,7 +15,7 @@
 //!
 //! | Operation                     | Complexity   |
 //! |-------------------------------|--------------|
-//! | `iter_vectors(field, id)`     | O(n)         |
+//! | `iter_vectors(field, id)`     | O(N)         |
 //! | `get(field, id, doc)`         | O(1)         |
 //! | `get_doc_vectors(field, doc)` | O(V)         |
 //! | `get_batch(field, docs, ids)` | O(D × V)     |
@@ -23,7 +23,7 @@
 //! | `dimensions(field, id)`       | O(1)         |
 //! | `count(field, id)`            | O(1)         |
 //!
-//! Where: n = vectors returned, V = vector_ids in field, D = docs queried.
+//! Where: N = total docs in segment, V = vector_ids in field, D = docs queried.
 //!
 //! # File Format
 //!

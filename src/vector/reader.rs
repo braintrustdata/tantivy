@@ -1,4 +1,15 @@
 //! Vector reader for reading embedding vectors from segment files.
+//!
+//! # Future optimization: lazy loading
+//!
+//! The current implementation loads all vector data into memory on open.
+//! The file format supports lazy/on-demand loading:
+//! 1. Read header and build an index of byte offsets for each (field, vector_id)
+//! 2. Store `FileSlice` handles instead of `Vec<u8>`
+//! 3. Compute vector offsets on access: `base + n * dimensions * bytes_per_dim`
+//!
+//! This would reduce memory usage for large segments where only a subset of
+//! vectors are accessed.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};

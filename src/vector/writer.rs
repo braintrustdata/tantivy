@@ -6,7 +6,8 @@ use std::io;
 use common::TerminatingWrite;
 
 use super::format::{
-    encode_vector, Int8QuantParams, PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
+    encode_vector, Int8QuantParams, PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC,
+    VECTOR_VERSION,
 };
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
@@ -114,7 +115,7 @@ impl VectorFieldsWriter {
                     }
                     _ => {
                         return Err(crate::TantivyError::InvalidArgument(
-                            "Expected VectorMap for vector field".to_string()
+                            "Expected VectorMap for vector field".to_string(),
                         ));
                     }
                 }
@@ -202,6 +203,12 @@ impl VectorFieldsWriter {
                 if let Some(doc_id_mapping) = doc_id_map {
                     for (new_doc_id, old_doc_id) in doc_id_mapping.iter_old_doc_ids().enumerate() {
                         if let Some(vec) = doc_vectors.get(&old_doc_id) {
+                            if new_doc_id as u32 >= num_new_doc_ids {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("DocIdMapping contains doc ID ({}) outside of expected range (0..{})", new_doc_id, num_new_doc_ids)
+                                ));
+                            }
                             bitset_builder.set(new_doc_id as u32);
                             ordered_vectors.push(vec);
                         }

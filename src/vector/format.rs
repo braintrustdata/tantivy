@@ -130,13 +130,13 @@ pub fn decode_f16(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Encode f32 vector to bytes based on encoding.
-pub fn encode_vector(vec: &[f32], encoding: VectorEncoding, quant: Option<&Int8QuantParams>) -> Vec<u8> {
+pub fn encode_vector(
+    vec: &[f32],
+    encoding: VectorEncoding,
+    quant: Option<&Int8QuantParams>,
+) -> Vec<u8> {
     match encoding {
-        VectorEncoding::F32 => {
-            vec.iter()
-                .flat_map(|&v| v.to_le_bytes())
-                .collect()
-        }
+        VectorEncoding::F32 => vec.iter().flat_map(|&v| v.to_le_bytes()).collect(),
         VectorEncoding::F16 => encode_f16(vec),
         VectorEncoding::Int8 => {
             let quant = quant.expect("Int8 encoding requires quantization params");
@@ -147,11 +147,13 @@ pub fn encode_vector(vec: &[f32], encoding: VectorEncoding, quant: Option<&Int8Q
 
 /// Decode bytes to f32 vector based on encoding.
 /// Returns borrowed slice for f32 (zero-copy), owned Vec for f16/int8.
-pub fn decode_vector<'a>(bytes: &'a [u8], encoding: VectorEncoding, quant: Option<&Int8QuantParams>) -> Cow<'a, [f32]> {
+pub fn decode_vector<'a>(
+    bytes: &'a [u8],
+    encoding: VectorEncoding,
+    quant: Option<&Int8QuantParams>,
+) -> Cow<'a, [f32]> {
     match encoding {
-        VectorEncoding::F32 => {
-            Cow::Borrowed(bytemuck::cast_slice(bytes))
-        }
+        VectorEncoding::F32 => Cow::Borrowed(bytemuck::cast_slice(bytes)),
         VectorEncoding::F16 => Cow::Owned(decode_f16(bytes)),
         VectorEncoding::Int8 => {
             let quant = quant.expect("Int8 encoding requires quantization params");
@@ -181,6 +183,8 @@ impl PresenceBitsetBuilder {
         if word < self.bits.len() {
             let bit = index % 64;
             self.bits[word] |= 1 << bit;
+        } else {
+            panic!("Index out of bounds in PresenceBitsetBuilder::set");
         }
     }
 
@@ -200,10 +204,7 @@ impl PresenceBitsetBuilder {
 
     /// Get the raw bytes (little-endian u64 words) for serialization.
     pub fn as_bytes(&self) -> Vec<u8> {
-        self.bits
-            .iter()
-            .flat_map(|&w| w.to_le_bytes())
-            .collect()
+        self.bits.iter().flat_map(|&w| w.to_le_bytes()).collect()
     }
 }
 
@@ -327,10 +328,7 @@ mod tests {
 
     #[test]
     fn test_int8_quantization() {
-        let vectors = vec![
-            vec![0.0, 0.5, 1.0],
-            vec![0.25, 0.75, 0.9],
-        ];
+        let vectors = vec![vec![0.0, 0.5, 1.0], vec![0.25, 0.75, 0.9]];
         let params = Int8QuantParams::from_vectors(vectors.iter().map(|v| v.as_slice()));
 
         for vec in &vectors {
@@ -398,4 +396,3 @@ mod tests {
         assert_eq!(restored.count_ones_before(150), 5);
     }
 }
-
