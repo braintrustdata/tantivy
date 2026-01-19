@@ -1,35 +1,4 @@
 //! Vector writer for writing embedding vectors to segment files.
-//!
-//! The `VectorFieldsWriter` collects vectors during indexing and serializes them
-//! to the segment's `.vec` file during flush. It handles:
-//!
-//! - Collecting named vectors from documents during `add_document`
-//! - Columnar storage: vectors with the same string ID are stored together
-//! - Presence bitsets for efficient sparse storage
-//! - Multiple encoding formats (f32, f16, int8)
-//! - Supporting document reordering during segment merges
-//!
-//! ## Storage Format (Columnar)
-//!
-//! ```text
-//! Header:
-//!   - magic: u32 (0x43455654 = "TVEC")
-//!   - version: u8 (1)
-//!   - encoding: u8 (0=f32, 1=f16, 2=int8)
-//!   - num_fields: u32
-//!   - field_ids: [u32; num_fields]
-//!   - num_docs: u32
-//!
-//! Per field (ordered by field_id):
-//!   - num_vector_ids: u32
-//!   - For each vector_id (sorted alphabetically):
-//!     - vector_id_len: u32
-//!     - vector_id: [u8; vector_id_len]
-//!     - dimensions: u32 (fixed for this vector_id)
-//!     - presence_bitset: [u8; ceil(num_docs/8)] padded to u64
-//!     - [if int8: scale: f32, zero_point: f32]
-//!     - vectors: [encoded; dims × popcount(bitset)] (contiguous)
-//! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;

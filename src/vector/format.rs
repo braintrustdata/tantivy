@@ -1,10 +1,4 @@
-//! Optimized vector storage format.
-//!
-//! This module defines the binary format for efficient vector storage with:
-//! - Presence bitset for sparse vectors
-//! - Fixed dimensions per vector_id (enables contiguous storage)
-//! - Multiple encoding options (f32, f16, int8)
-//! - Memory-mappable layout
+//! Vector storage format definitions.
 
 use half::f16;
 
@@ -166,25 +160,14 @@ pub fn decode_vector(bytes: &[u8], encoding: VectorEncoding, quant: Option<&Int8
     }
 }
 
-/// A bitset for tracking presence of vectors with O(1) rank queries.
+/// A bitset for tracking presence of vectors.
 ///
-/// Inspired by Tantivy's OptionalIndex, this bitset maintains a cumulative
-/// popcount cache for efficient offset calculations. This is critical for
-/// random access performance in columnar vector storage.
-///
-/// # Performance
-///
-/// Without cache: `count_ones_before(N)` requires O(N/64) operations
-/// With cache: `count_ones_before(N)` requires O(1) operations
-///
-/// For 1M docs: reduces ~15,625 u64 reads → 1 u32 read + 1 u64 operation
+/// Maintains a cumulative popcount cache for O(1) rank queries.
 #[derive(Debug, Clone)]
 pub struct PresenceBitset {
     bits: Vec<u64>,
     len: u32,
-    /// Cumulative popcount at each u64 boundary: cumulative_counts[i] = popcount(bits[0..i])
-    /// This enables O(1) rank queries inspired by Tantivy's OptionalIndex.
-    /// Space cost: 4 bytes per 64 docs = ~62 KB per 1M docs
+    /// Cumulative popcount at each u64 boundary for O(1) rank queries.
     cumulative_counts: Vec<u32>,
 }
 
@@ -278,17 +261,7 @@ impl PresenceBitset {
         self.bits.iter().map(|w| w.count_ones()).sum()
     }
 
-    /// Count number of set bits before index (for computing offset).
-    ///
-    /// This is the critical operation for random vector access. Uses the cumulative
-    /// popcount cache for O(1) performance.
-    ///
-    /// # Performance
-    ///
-    /// Old: O(index/64) - iterate through all words before index
-    /// New: O(1) - lookup cached count + one popcount operation
-    ///
-    /// For doc_id = 500K: reduces ~7,813 u64 operations → 1 lookup + 1 popcount
+    /// Count number of set bits before index (for computing vector offset).
     #[inline]
     pub fn count_ones_before(&self, index: u32) -> u32 {
         if index == 0 {
