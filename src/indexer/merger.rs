@@ -862,7 +862,7 @@ impl IndexMerger {
             }
         }
 
-        use crate::vector::format::{PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+        use crate::vector::format::{PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
 
         // Write V2 header
         wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
@@ -901,7 +901,7 @@ impl IndexMerger {
                 wrt.write_all(id_bytes)?;
 
                 // First pass: collect vectors and determine dimensions
-                let mut presence = PresenceBitset::new(self.max_doc);
+                let mut presence_builder = PresenceBitsetBuilder::new(self.max_doc);
                 let mut ordered_vectors: Vec<Vec<f32>> = Vec::new();
                 let mut dimensions = 0u32;
 
@@ -919,7 +919,7 @@ impl IndexMerger {
                         if dimensions == 0 {
                             dimensions = vec.len() as u32;
                         }
-                        presence.set(new_doc_id as u32);
+                        presence_builder.set(new_doc_id as u32);
                         ordered_vectors.push(vec.into_owned());
                     }
                 }
@@ -928,7 +928,7 @@ impl IndexMerger {
                 wrt.write_all(&dimensions.to_le_bytes())?;
 
                 // Write presence bitset
-                let bitset_bytes = presence.as_bytes();
+                let bitset_bytes = presence_builder.as_bytes();
                 wrt.write_all(&bitset_bytes)?;
 
                 // Write vectors contiguously

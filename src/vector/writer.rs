@@ -6,7 +6,7 @@ use std::io;
 use common::TerminatingWrite;
 
 use super::format::{
-    encode_vector, Int8QuantParams, PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
+    encode_vector, Int8QuantParams, PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
 };
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
@@ -192,30 +192,27 @@ impl VectorFieldsWriter {
                 wrt.write_all(&dimensions.to_le_bytes())?;
 
                 // Build presence bitset and collect vectors in order
-                let mut bitset = PresenceBitset::new(effective_num_docs);
+                let mut bitset_builder = PresenceBitsetBuilder::new(effective_num_docs);
                 let mut ordered_vectors: Vec<&Vec<f32>> = Vec::new();
 
                 if let Some(doc_id_mapping) = doc_id_map {
                     for (new_doc_id, old_doc_id) in doc_id_mapping.iter_old_doc_ids().enumerate() {
                         if let Some(vec) = doc_vectors.get(&old_doc_id) {
-                            bitset.set(new_doc_id as u32);
+                            bitset_builder.set(new_doc_id as u32);
                             ordered_vectors.push(vec);
                         }
                     }
                 } else {
                     for doc_id in 0..self.num_docs {
                         if let Some(vec) = doc_vectors.get(&doc_id) {
-                            bitset.set(doc_id);
+                            bitset_builder.set(doc_id);
                             ordered_vectors.push(vec);
                         }
                     }
                 }
 
-                // Build popcount cache for O(1) rank queries
-                bitset.build_cache();
-
                 // Write presence bitset
-                let bitset_bytes = bitset.as_bytes();
+                let bitset_bytes = bitset_builder.as_bytes();
                 wrt.write_all(&bitset_bytes)?;
 
                 // For int8 encoding, compute and write quantization params

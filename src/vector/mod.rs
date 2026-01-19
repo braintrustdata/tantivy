@@ -74,7 +74,7 @@ pub mod format;
 mod reader;
 mod writer;
 
-pub use format::{VectorEncoding, Int8QuantParams, PresenceBitset, VECTOR_MAGIC, VECTOR_VERSION};
+pub use format::{VectorEncoding, Int8QuantParams, PresenceBitset, PresenceBitsetBuilder, VECTOR_MAGIC, VECTOR_VERSION};
 pub use reader::VectorReader;
 pub use writer::VectorFieldsWriter;
 

@@ -160,9 +160,57 @@ pub fn decode_vector<'a>(bytes: &'a [u8], encoding: VectorEncoding, quant: Optio
     }
 }
 
-/// A bitset for tracking presence of vectors.
+/// Builder for constructing a PresenceBitset.
+#[derive(Debug, Clone)]
+pub struct PresenceBitsetBuilder {
+    bits: Vec<u64>,
+}
+
+impl PresenceBitsetBuilder {
+    /// Create a new builder with capacity for `len` bits (rounded up to 64).
+    pub fn new(len: u32) -> Self {
+        let num_words = (len as usize + 63) / 64;
+        Self {
+            bits: vec![0; num_words],
+        }
+    }
+
+    /// Set bit at index.
+    pub fn set(&mut self, index: u32) {
+        let word = index as usize / 64;
+        if word < self.bits.len() {
+            let bit = index % 64;
+            self.bits[word] |= 1 << bit;
+        }
+    }
+
+    /// Build the final PresenceBitset, computing the cumulative popcount cache.
+    pub fn build(self) -> PresenceBitset {
+        let mut cumulative_counts = Vec::with_capacity(self.bits.len());
+        let mut cumulative = 0u32;
+        for &word in &self.bits {
+            cumulative_counts.push(cumulative);
+            cumulative += word.count_ones();
+        }
+        PresenceBitset {
+            bits: self.bits,
+            cumulative_counts,
+        }
+    }
+
+    /// Get the raw bytes (little-endian u64 words) for serialization.
+    pub fn as_bytes(&self) -> Vec<u8> {
+        self.bits
+            .iter()
+            .flat_map(|&w| w.to_le_bytes())
+            .collect()
+    }
+}
+
+/// A read-only bitset for tracking presence of vectors.
 ///
 /// Maintains a cumulative popcount cache for O(1) rank queries.
+/// Construct via `PresenceBitsetBuilder::build()` or `PresenceBitset::from_bytes()`.
 #[derive(Debug, Clone)]
 pub struct PresenceBitset {
     bits: Vec<u64>,
@@ -171,29 +219,7 @@ pub struct PresenceBitset {
 }
 
 impl PresenceBitset {
-    /// Create a new bitset with capacity for `len` bits (rounded up to 64).
-    pub fn new(len: u32) -> Self {
-        let num_words = (len as usize + 63) / 64;
-        Self {
-            bits: vec![0; num_words],
-            cumulative_counts: vec![0; num_words],
-        }
-    }
-
-    /// Build cumulative popcount cache from the current bits.
-    /// Call this after all bits have been set during construction.
-    pub fn build_cache(&mut self) {
-        self.cumulative_counts.clear();
-        self.cumulative_counts.reserve(self.bits.len());
-        let mut cumulative = 0u32;
-        for &word in &self.bits {
-            self.cumulative_counts.push(cumulative);
-            cumulative += word.count_ones();
-        }
-    }
-
     /// Create from raw bytes (little-endian u64 words).
-    /// Automatically builds the popcount cache.
     pub fn from_bytes(bytes: &[u8], len: u32) -> Self {
         let num_words = (len as usize + 63) / 64;
         let mut bits = vec![0u64; num_words];
@@ -216,29 +242,6 @@ impl PresenceBitset {
         Self {
             bits,
             cumulative_counts,
-        }
-    }
-
-    /// Get the raw bytes (little-endian u64 words).
-    pub fn as_bytes(&self) -> Vec<u8> {
-        self.bits
-            .iter()
-            .flat_map(|&w| w.to_le_bytes())
-            .collect()
-    }
-
-    /// Number of bytes needed to store this bitset.
-    pub fn byte_len(&self) -> usize {
-        self.bits.len() * 8
-    }
-
-    /// Set bit at index.
-    /// Note: After setting bits, call `build_cache()` before performing rank queries.
-    pub fn set(&mut self, index: u32) {
-        let word = index as usize / 64;
-        if word < self.bits.len() {
-            let bit = index % 64;
-            self.bits[word] |= 1 << bit;
         }
     }
 
@@ -342,18 +345,13 @@ mod tests {
 
     #[test]
     fn test_presence_bitset() {
-        let mut bitset = PresenceBitset::new(100);
+        let mut builder = PresenceBitsetBuilder::new(100);
 
-        assert!(!bitset.get(0));
-        assert!(!bitset.get(50));
-        assert!(!bitset.get(99));
+        builder.set(0);
+        builder.set(50);
+        builder.set(99);
 
-        bitset.set(0);
-        bitset.set(50);
-        bitset.set(99);
-
-        // Build cache after setting bits
-        bitset.build_cache();
+        let bitset = builder.build();
 
         assert!(bitset.get(0));
         assert!(bitset.get(50));
@@ -374,17 +372,14 @@ mod tests {
 
     #[test]
     fn test_bitset_serialization() {
-        let mut bitset = PresenceBitset::new(150);
-        bitset.set(0);
-        bitset.set(63);
-        bitset.set(64);
-        bitset.set(127);
-        bitset.set(149);
+        let mut builder = PresenceBitsetBuilder::new(150);
+        builder.set(0);
+        builder.set(63);
+        builder.set(64);
+        builder.set(127);
+        builder.set(149);
 
-        // Build cache after setting bits
-        bitset.build_cache();
-
-        let bytes = bitset.as_bytes();
+        let bytes = builder.as_bytes();
         let restored = PresenceBitset::from_bytes(&bytes, 150);
 
         assert!(restored.get(0));
@@ -395,7 +390,7 @@ mod tests {
         assert!(!restored.get(1));
         assert!(!restored.get(148));
 
-        // Verify cache was rebuilt correctly on deserialization
+        // Verify cache was built correctly on deserialization
         assert_eq!(restored.count_ones_before(0), 0);
         assert_eq!(restored.count_ones_before(1), 1);
         assert_eq!(restored.count_ones_before(64), 2);
