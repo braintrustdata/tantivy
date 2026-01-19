@@ -98,7 +98,7 @@ mod tests {
         let mut doc = TantivyDocument::new();
         doc.add_named_vector(vec_field, "chunk_0", vec![1.0, 2.0]);
         doc.add_named_vector(vec_field, "summary", vec![10.0, 20.0, 30.0]);
-        writer.add_document(&doc);
+        writer.add_document(&doc).unwrap();
 
         // Verify we can retrieve the vectors
         let chunk_vecs = writer.get_vectors(vec_field, "chunk_0").unwrap();
@@ -549,33 +549,34 @@ mod tests {
         // Document 0: 3-dimensional vector
         let mut doc0 = TantivyDocument::new();
         doc0.add_named_vector(vec_field, "chunk", vec![0.1, 0.2, 0.3]);
-        writer.add_document(&doc0);
+        writer.add_document(&doc0).unwrap();
 
         // Document 1: 5-dimensional vector (DIFFERENT dimensions for same vector_id)
-        // This should be skipped by the writer
+        // This should return an error
         let mut doc1 = TantivyDocument::new();
         doc1.add_named_vector(vec_field, "chunk", vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        writer.add_document(&doc1);
+        let result = writer.add_document(&doc1);
+        assert!(result.is_err(), "Expected error for dimension mismatch");
 
-        // Document 2: 3-dimensional vector (same as doc0)
+        // Document 2: 3-dimensional vector (same as doc0) should still work
         let mut doc2 = TantivyDocument::new();
         doc2.add_named_vector(vec_field, "chunk", vec![0.4, 0.5, 0.6]);
-        writer.add_document(&doc2);
+        writer.add_document(&doc2).unwrap();
 
-        // Check that only vectors with matching dimensions were kept
+        // Check that we have the correct vectors
         let vectors = writer.get_vectors(vec_field, "chunk").unwrap();
 
-        // Should have 2 vectors: doc0 and doc2 (doc1 was skipped due to dimension mismatch)
-        assert_eq!(vectors.len(), 2, "Expected 2 vectors (dimension mismatch skipped)");
+        // Should have 2 vectors: doc0 and doc2 (doc1 returned error)
+        // doc2 is at index 1 because num_docs was not incremented for failed doc1
+        assert_eq!(vectors.len(), 2, "Expected 2 vectors");
 
         // Verify the vectors are from doc0 and doc2
         assert!(vectors.contains_key(&0), "Should have vector for doc 0");
-        assert!(!vectors.contains_key(&1), "Should NOT have vector for doc 1 (dimension mismatch)");
-        assert!(vectors.contains_key(&2), "Should have vector for doc 2");
+        assert!(vectors.contains_key(&1), "Should have vector for doc 2 (at index 1)");
 
         // Verify dimensions
         assert_eq!(vectors.get(&0).unwrap().len(), 3, "Doc 0 should have 3 dimensions");
-        assert_eq!(vectors.get(&2).unwrap().len(), 3, "Doc 2 should have 3 dimensions");
+        assert_eq!(vectors.get(&1).unwrap().len(), 3, "Doc 2 should have 3 dimensions");
     }
 }
 

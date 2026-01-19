@@ -74,12 +74,11 @@ impl VectorFieldsWriter {
         self.encoding
     }
 
-    /// Indexes vectors from a document.
+    /// Adds vectors from a document to the writer.
     ///
-    /// Vectors are stored as a map of string IDs to f32 arrays.
-    /// Vectors with dimensions that don't match the first vector for a given ID are skipped
-    /// (with a warning logged).
-    pub fn add_document<D: Document>(&mut self, doc: &D) {
+    /// Returns an error if a vector has different dimensions than previously seen
+    /// vectors with the same ID.
+    pub fn add_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.num_docs;
 
         // Extract vectors from the document
@@ -98,11 +97,10 @@ impl VectorFieldsWriter {
                         // Check if we already have a dimension for this vector_id
                         if let Some(&expected_dims) = self.vector_dimensions.get(&dim_key) {
                             if vec_dims != expected_dims {
-                                log::warn!(
-                                    "Vector '{}' in doc {} has {} dimensions, expected {}. Skipping.",
-                                    vector_id, doc_id, vec_dims, expected_dims
-                                );
-                                continue;
+                                return Err(crate::TantivyError::InvalidArgument(format!(
+                                    "Vector '{}' has {} dimensions, expected {}",
+                                    vector_id, vec_dims, expected_dims
+                                )));
                             }
                         } else {
                             // First vector for this ID - record its dimensions
@@ -119,6 +117,7 @@ impl VectorFieldsWriter {
         }
 
         self.num_docs += 1;
+        Ok(())
     }
 
     /// Returns the memory usage estimate.
@@ -276,21 +275,21 @@ mod tests {
         vectors0.insert("chunk_0".to_string(), vec![1.0, 2.0]);
         vectors0.insert("summary".to_string(), vec![10.0, 20.0, 30.0]);
         doc0.add_field_value(vec_field, vectors0);
-        writer.add_document(&doc0);
+        writer.add_document(&doc0).unwrap();
 
         // Doc 1: only chunk_0
         let mut doc1 = TantivyDocument::new();
         let mut vectors1 = BTreeMap::new();
         vectors1.insert("chunk_0".to_string(), vec![3.0, 4.0]);
         doc1.add_field_value(vec_field, vectors1);
-        writer.add_document(&doc1);
+        writer.add_document(&doc1).unwrap();
 
         // Doc 2: only summary
         let mut doc2 = TantivyDocument::new();
         let mut vectors2 = BTreeMap::new();
         vectors2.insert("summary".to_string(), vec![40.0, 50.0, 60.0]);
         doc2.add_field_value(vec_field, vectors2);
-        writer.add_document(&doc2);
+        writer.add_document(&doc2).unwrap();
 
         // Verify columnar structure
         let chunk0_vecs = writer.get_vectors(vec_field, "chunk_0").unwrap();

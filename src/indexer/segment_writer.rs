@@ -402,7 +402,7 @@ impl SegmentWriter {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
-        self.vector_fields_writer.add_document(&document);
+        self.vector_fields_writer.add_document(&document)?;
         self.index_document(&document)?;
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema)?;
