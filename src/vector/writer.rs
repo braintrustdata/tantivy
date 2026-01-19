@@ -86,31 +86,36 @@ impl VectorFieldsWriter {
             let field_id = field.field_id();
             if let Some(field_data) = self.field_vectors.get_mut(&field_id) {
                 let value_access = value as D::Value<'_>;
-                if let ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vector_map)) =
-                    value_access.as_value()
-                {
-                    // Add each named vector to the columnar storage
-                    for (vector_id, vec) in vector_map {
-                        let dim_key = (field_id, vector_id.clone());
-                        let vec_dims = vec.len();
+                match value_access.as_value() {
+                    ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vector_map)) => {
+                        // Add each named vector to the columnar storage
+                        for (vector_id, vec) in vector_map {
+                            let dim_key = (field_id, vector_id.clone());
+                            let vec_dims = vec.len();
 
-                        // Check if we already have a dimension for this vector_id
-                        if let Some(&expected_dims) = self.vector_dimensions.get(&dim_key) {
-                            if vec_dims != expected_dims {
-                                return Err(crate::TantivyError::InvalidArgument(format!(
-                                    "Vector '{}' has {} dimensions, expected {}",
-                                    vector_id, vec_dims, expected_dims
-                                )));
+                            // Check if we already have a dimension for this vector_id
+                            if let Some(&expected_dims) = self.vector_dimensions.get(&dim_key) {
+                                if vec_dims != expected_dims {
+                                    return Err(crate::TantivyError::InvalidArgument(format!(
+                                        "Vector '{}' has {} dimensions, expected {}",
+                                        vector_id, vec_dims, expected_dims
+                                    )));
+                                }
+                            } else {
+                                // First vector for this ID - record its dimensions
+                                self.vector_dimensions.insert(dim_key, vec_dims);
                             }
-                        } else {
-                            // First vector for this ID - record its dimensions
-                            self.vector_dimensions.insert(dim_key, vec_dims);
-                        }
 
-                        field_data
-                            .entry(vector_id.clone())
-                            .or_default()
-                            .insert(doc_id, vec.clone());
+                            field_data
+                                .entry(vector_id.clone())
+                                .or_default()
+                                .insert(doc_id, vec.clone());
+                        }
+                    }
+                    _ => {
+                        return Err(crate::TantivyError::InvalidArgument(
+                            "Expected VectorMap for vector field".to_string()
+                        ));
                     }
                 }
             }
@@ -162,10 +167,10 @@ impl VectorFieldsWriter {
         }
 
         // Write number of docs
-        let effective_num_docs = doc_id_map
+        let num_new_doc_ids = doc_id_map
             .map(|m| m.iter_old_doc_ids().count() as u32)
             .unwrap_or(self.num_docs);
-        wrt.write_all(&effective_num_docs.to_le_bytes())?;
+        wrt.write_all(&num_new_doc_ids.to_le_bytes())?;
 
         // Write vectors for each field in columnar format
         for field in &self.vector_fields {
@@ -191,7 +196,7 @@ impl VectorFieldsWriter {
                 wrt.write_all(&dimensions.to_le_bytes())?;
 
                 // Build presence bitset and collect vectors in order
-                let mut bitset_builder = PresenceBitsetBuilder::new(effective_num_docs);
+                let mut bitset_builder = PresenceBitsetBuilder::new(num_new_doc_ids);
                 let mut ordered_vectors: Vec<&Vec<f32>> = Vec::new();
 
                 if let Some(doc_id_mapping) = doc_id_map {
