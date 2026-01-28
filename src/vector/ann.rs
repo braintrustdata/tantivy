@@ -524,6 +524,7 @@ mod tests {
     fn bench_vector_ann_size_estimate() {
         let dims = 768;
         let count = 100_000;
+        let build_start = std::time::Instant::now();
 
         let mut options = IndexOptions::default();
         options.dimensions = dims;
@@ -543,12 +544,19 @@ mod tests {
             let f16 = usearch::f16::from_i16s(&bits);
             index.add(doc_id as u64, f16).unwrap();
         }
+        let build_elapsed = build_start.elapsed();
 
         let bytes = index.serialized_length();
         let mib = bytes as f64 / (1024.0 * 1024.0);
         println!(
             "ANN size ({} vectors x {} dims f16): {} bytes ({:.2} MiB)",
             count, dims, bytes, mib
+        );
+        println!(
+            "ANN build time ({} vectors x {} dims f16): {:.3}s",
+            count,
+            dims,
+            build_elapsed.as_secs_f64()
         );
     }
 
@@ -623,5 +631,118 @@ mod tests {
             (read_len as f64 / file_len as f64) * 100.0
         );
         assert!(read_len < file_len, "expected range reads only");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_vector_ann_speed_vs_scan() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::time::Instant;
+
+        let dims = 768;
+        let count = 100_000;
+        let queries = 20;
+        let k = 10;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut vectors = Vec::with_capacity(count * dims);
+        for _ in 0..(count * dims) {
+            vectors.push(rng.gen_range(-1.0f32..1.0f32));
+        }
+
+        let mut query_vectors = Vec::with_capacity(queries * dims);
+        for _ in 0..(queries * dims) {
+            query_vectors.push(rng.gen_range(-1.0f32..1.0f32));
+        }
+
+        let mut options = IndexOptions::default();
+        options.dimensions = dims;
+        options.metric = MetricKind::Cos;
+        options.quantization = ScalarKind::F16;
+        let index = usearch::Index::new(&options).unwrap();
+        index.reserve(count).unwrap();
+        for doc_id in 0..count {
+            let start = doc_id * dims;
+            let vec_slice = &vectors[start..start + dims];
+            let bits = f32_to_f16_bits(vec_slice);
+            let f16 = usearch::f16::from_i16s(&bits);
+            index.add(doc_id as u64, f16).unwrap();
+        }
+
+        let ann_start = Instant::now();
+        let mut ann_total = 0.0f32;
+        for q in 0..queries {
+            let start = q * dims;
+            let query_slice = &query_vectors[start..start + dims];
+            let bits = f32_to_f16_bits(query_slice);
+            let f16 = usearch::f16::from_i16s(&bits);
+            let matches = index.search(f16, k).unwrap();
+            ann_total += matches.distances.iter().copied().sum::<f32>();
+        }
+        let ann_elapsed = ann_start.elapsed();
+
+        let brute_start = Instant::now();
+        let mut brute_total = 0.0f32;
+        for q in 0..queries {
+            let start = q * dims;
+            let query_slice = &query_vectors[start..start + dims];
+            let query_norm = l2_norm(query_slice);
+            if query_norm == 0.0 {
+                continue;
+            }
+            let mut best: Vec<(f32, u32)> = Vec::with_capacity(k);
+            for doc_id in 0..count {
+                let start = doc_id * dims;
+                let vec_slice = &vectors[start..start + dims];
+                if let Some(sim) = cosine_similarity(query_slice, vec_slice, query_norm) {
+                    if best.len() < k {
+                        best.push((sim, doc_id as u32));
+                        if best.len() == k {
+                            best.sort_by(|a, b| {
+                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        }
+                    } else if sim > best[0].0 {
+                        best[0] = (sim, doc_id as u32);
+                        best.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                }
+            }
+            brute_total += best.iter().map(|(s, _)| *s).sum::<f32>();
+        }
+        let brute_elapsed = brute_start.elapsed();
+
+        let ann_secs = ann_elapsed.as_secs_f64();
+        let brute_secs = brute_elapsed.as_secs_f64();
+        println!(
+            "ANN search: {:.3}s for {} queries (top {})",
+            ann_secs, queries, k
+        );
+        println!(
+            "Brute scan: {:.3}s for {} queries (top {})",
+            brute_secs, queries, k
+        );
+        println!("Speedup: {:.2}x", brute_secs / ann_secs);
+        assert!(ann_total.is_finite());
+        assert!(brute_total.is_finite());
+    }
+
+    fn l2_norm(vec: &[f32]) -> f32 {
+        vec.iter().map(|v| v * v).sum::<f32>().sqrt()
+    }
+
+    fn cosine_similarity(query: &[f32], vector: &[f32], query_norm: f32) -> Option<f32> {
+        if query.len() != vector.len() || vector.is_empty() {
+            return None;
+        }
+        let vector_norm = l2_norm(vector);
+        if vector_norm == 0.0 {
+            return None;
+        }
+        let dot = query.iter().zip(vector.iter()).map(|(a, b)| a * b).sum::<f32>();
+        Some(dot / (query_norm * vector_norm))
     }
 }
