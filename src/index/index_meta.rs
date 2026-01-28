@@ -143,6 +143,7 @@ impl SegmentMeta {
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
             SegmentComponent::Vectors => ".vec".to_string(),
+            SegmentComponent::VectorAnn => ".ann".to_string(),
         });
         PathBuf::from(path)
     }

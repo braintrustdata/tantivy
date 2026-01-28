@@ -69,10 +69,12 @@
 //! ```
 
 pub mod format;
+pub mod ann;
 mod reader;
 mod writer;
 
 pub use format::{VectorEncoding, Int8QuantParams, PresenceBitset, PresenceBitsetBuilder, VECTOR_MAGIC, VECTOR_VERSION};
+pub use ann::{VectorAnnReader, VectorAnnWriter};
 pub use reader::VectorReader;
 pub use writer::VectorFieldsWriter;
 

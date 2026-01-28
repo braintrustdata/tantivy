@@ -75,6 +75,16 @@ impl VectorFieldsWriter {
         self.encoding
     }
 
+    pub fn vector_fields(&self) -> &[Field] {
+        &self.vector_fields
+    }
+
+    pub fn vector_ids_for_field(&self, field: Field) -> Option<Vec<String>> {
+        self.field_vectors
+            .get(&field.field_id())
+            .map(|map| map.keys().cloned().collect())
+    }
+
     /// Adds vectors from a document to the writer.
     ///
     /// Returns an error if a vector has different dimensions than previously seen

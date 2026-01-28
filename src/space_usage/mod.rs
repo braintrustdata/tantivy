@@ -126,6 +126,7 @@ impl SegmentSpaceUsage {
             SegmentComponent::TempStore => ComponentSpaceUsage::Store(self.store().clone()),
             Delete => Basic(self.deletes()),
             Vectors => Basic(ByteCount::default()), // TODO: Implement proper vector size tracking
+            VectorAnn => Basic(ByteCount::default()),
         }
     }
 

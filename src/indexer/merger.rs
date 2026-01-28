@@ -10,7 +10,7 @@ use measure_time::debug_time;
 
 use common::TerminatingWrite;
 
-use crate::directory::{Directory, WritePtr};
+use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
@@ -22,7 +22,7 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::vector::VectorReader;
+use crate::vector::{VectorAnnWriter, VectorReader};
 use crate::{
     DocAddress, DocId, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
     SegmentComponent, SegmentOrdinal,
@@ -804,7 +804,18 @@ impl IndexMerger {
             let vector_write = serializer
                 .segment_mut()
                 .open_write(SegmentComponent::Vectors)?;
-            self.write_vectors(vector_write, &doc_id_mapping)?;
+            let (vector_fields, ann_entries) =
+                self.write_vectors(vector_write, &doc_id_mapping)?;
+
+            debug!("write-vector-ann");
+            let vector_ann_write = serializer
+                .segment_mut()
+                .open_write(SegmentComponent::VectorAnn)?;
+            VectorAnnWriter::serialize_from_merged(
+                vector_ann_write,
+                &vector_fields,
+                ann_entries,
+            )?;
         }
 
         debug!("close-serializer");
@@ -824,7 +835,7 @@ impl IndexMerger {
         &self,
         mut wrt: WritePtr,
         doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<(Vec<Field>, Vec<(Field, String, u32, Vec<(DocId, Vec<f32>)>)>)> {
         use std::collections::BTreeSet;
         use std::io::Write;
 
@@ -842,7 +853,7 @@ impl IndexMerger {
             .collect();
 
         if vector_fields.is_empty() {
-            return Ok(());
+            return Ok((vector_fields, Vec::new()));
         }
 
         // Load vector readers for each segment
@@ -878,6 +889,8 @@ impl IndexMerger {
 
         wrt.write_all(&self.max_doc.to_le_bytes())?;
 
+        let mut ann_entries: Vec<(Field, String, u32, Vec<(DocId, Vec<f32>)>)> = Vec::new();
+
         // Write vectors for each field in columnar format
         for field in &vector_fields {
             // Collect all vector IDs from all segments for this field
@@ -903,6 +916,7 @@ impl IndexMerger {
                 // First pass: collect vectors and determine dimensions
                 let mut presence_builder = PresenceBitsetBuilder::new(self.max_doc);
                 let mut ordered_vectors: Vec<Vec<f32>> = Vec::new();
+                let mut ordered_doc_vectors: Vec<(DocId, Vec<f32>)> = Vec::new();
                 let mut dimensions = 0u32;
 
                 for (new_doc_id, doc_addr) in
@@ -920,7 +934,9 @@ impl IndexMerger {
                             dimensions = vec.len() as u32;
                         }
                         presence_builder.set(new_doc_id as u32);
-                        ordered_vectors.push(vec.into_owned());
+                        let owned = vec.into_owned();
+                        ordered_vectors.push(owned.clone());
+                        ordered_doc_vectors.push((new_doc_id as u32, owned));
                     }
                 }
 
@@ -937,12 +953,21 @@ impl IndexMerger {
                         wrt.write_all(&v.to_le_bytes())?;
                     }
                 }
+
+                if !ordered_doc_vectors.is_empty() && dimensions > 0 {
+                    ann_entries.push((
+                        *field,
+                        vector_id.clone(),
+                        dimensions,
+                        ordered_doc_vectors,
+                    ));
+                }
             }
         }
 
         // Terminate with footer (adds magic bytes required by tantivy's file reading)
         wrt.terminate()?;
-        Ok(())
+        Ok((vector_fields, ann_entries))
     }
 }
 

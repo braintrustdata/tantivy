@@ -18,7 +18,7 @@ use crate::schema::document::{Document, ReferenceValue, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
 use crate::store::{StoreReader, StoreWriter};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::vector::VectorFieldsWriter;
+use crate::vector::{VectorAnnWriter, VectorFieldsWriter};
 use crate::{DocId, Opstamp, SegmentComponent, TantivyError};
 
 /// Computes the initial size of the hash table.
@@ -472,6 +472,12 @@ fn remap_and_write(
             .segment_mut()
             .open_write(SegmentComponent::Vectors)?;
         vector_fields_writer.serialize(vector_write, doc_id_map)?;
+
+        debug!("vector-ann-serialize");
+        let vector_ann_write = serializer
+            .segment_mut()
+            .open_write(SegmentComponent::VectorAnn)?;
+        VectorAnnWriter::serialize_from_writer(&vector_fields_writer, vector_ann_write, doc_id_map)?;
     }
 
     // finalize temp docstore and create version, which reflects the doc_id_map
