@@ -8,7 +8,9 @@ use common::ReadOnlyBitSet;
 use itertools::Itertools;
 use measure_time::debug_time;
 
-use crate::directory::WritePtr;
+use common::TerminatingWrite;
+
+use crate::directory::{Directory, WritePtr};
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
@@ -20,6 +22,7 @@ use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
+use crate::vector::VectorReader;
 use crate::{
     DocAddress, DocId, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
     SegmentComponent, SegmentOrdinal,
@@ -84,6 +87,8 @@ pub struct IndexMerger {
     index_settings: IndexSettings,
     schema: Schema,
     pub(crate) readers: Vec<SegmentReader>,
+    /// The original segments (stored for accessing vector files during merge)
+    segments: Vec<Segment>,
     max_doc: u32,
 }
 
@@ -178,17 +183,25 @@ impl IndexMerger {
         alive_bitset_opt: Vec<Option<AliveBitSet>>,
     ) -> crate::Result<IndexMerger> {
         let mut readers = vec![];
+        let mut kept_segments = vec![];
         for (segment, new_alive_bitset_opt) in segments.iter().zip(alive_bitset_opt) {
             if segment.meta().num_docs() > 0 {
                 let reader =
                     SegmentReader::open_with_custom_alive_set(segment, new_alive_bitset_opt)?;
                 readers.push(reader);
+                kept_segments.push(segment.clone());
             }
         }
 
         let max_doc = readers.iter().map(|reader| reader.num_docs()).sum();
         if let Some(sort_by_field) = index_settings.sort_by_field.as_ref() {
-            readers = Self::sort_readers_by_min_sort_field(readers, sort_by_field)?;
+            let sorted = Self::sort_readers_and_segments_by_min_sort_field(
+                readers,
+                kept_segments,
+                sort_by_field,
+            )?;
+            readers = sorted.0;
+            kept_segments = sorted.1;
         }
         // sort segments by their natural sort setting
         if max_doc >= MAX_DOC_LIMIT {
@@ -202,32 +215,36 @@ impl IndexMerger {
             index_settings,
             schema,
             readers,
+            segments: kept_segments,
             max_doc,
         })
     }
 
-    fn sort_readers_by_min_sort_field(
+    fn sort_readers_and_segments_by_min_sort_field(
         readers: Vec<SegmentReader>,
+        segments: Vec<Segment>,
         sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Vec<SegmentReader>> {
+    ) -> crate::Result<(Vec<SegmentReader>, Vec<Segment>)> {
         // presort the readers by their min_values, so that when they are disjunct, we can use
         // the regular merge logic (implicitly sorted)
-        let mut readers_with_min_sort_values = readers
+        let mut items_with_min_sort_values = readers
             .into_iter()
-            .map(|reader| {
+            .zip(segments.into_iter())
+            .map(|(reader, segment)| {
                 let accessor = Self::get_sort_field_accessor(&reader, sort_by_field)?;
-                Ok((reader, accessor.min_value()))
+                Ok((reader, segment, accessor.min_value()))
             })
             .collect::<crate::Result<Vec<_>>>()?;
         if sort_by_field.order.is_asc() {
-            readers_with_min_sort_values.sort_by_key(|(_, min_val)| *min_val);
+            items_with_min_sort_values.sort_by_key(|(_, _, min_val)| *min_val);
         } else {
-            readers_with_min_sort_values.sort_by_key(|(_, min_val)| std::cmp::Reverse(*min_val));
+            items_with_min_sort_values.sort_by_key(|(_, _, min_val)| std::cmp::Reverse(*min_val));
         }
-        Ok(readers_with_min_sort_values
+        let (readers, segments): (Vec<_>, Vec<_>) = items_with_min_sort_values
             .into_iter()
-            .map(|(reader, _)| reader)
-            .collect())
+            .map(|(reader, segment, _)| (reader, segment))
+            .unzip();
+        Ok((readers, segments))
     }
 
     fn write_fieldnorms(
@@ -779,11 +796,153 @@ impl IndexMerger {
         debug!("write-storagefields");
         self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
         debug!("write-fastfields");
-        self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
+        self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping.clone())?;
+
+        // Write vectors if there are any vector fields
+        if self.has_vector_fields() {
+            debug!("write-vectors");
+            let vector_write = serializer
+                .segment_mut()
+                .open_write(SegmentComponent::Vectors)?;
+            self.write_vectors(vector_write, &doc_id_mapping)?;
+        }
 
         debug!("close-serializer");
         serializer.close()?;
         Ok(self.max_doc)
+    }
+
+    /// Returns true if the schema contains any vector fields.
+    fn has_vector_fields(&self) -> bool {
+        self.schema
+            .fields()
+            .any(|(_, entry)| matches!(entry.field_type(), FieldType::VectorMap(_)))
+    }
+
+    /// Writes merged vectors from all segments to the output in columnar format.
+    fn write_vectors(
+        &self,
+        mut wrt: WritePtr,
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> crate::Result<()> {
+        use std::collections::BTreeSet;
+        use std::io::Write;
+
+        // Get vector fields from schema
+        let vector_fields: Vec<Field> = self
+            .schema
+            .fields()
+            .filter_map(|(field, entry)| {
+                if matches!(entry.field_type(), FieldType::VectorMap(_)) {
+                    Some(field)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if vector_fields.is_empty() {
+            return Ok(());
+        }
+
+        // Load vector readers for each segment
+        let mut segment_vector_readers: Vec<Option<VectorReader>> = Vec::new();
+        for segment in &self.segments {
+            match segment.open_read(SegmentComponent::Vectors) {
+                Ok(vec_data) => {
+                    let vec_bytes = vec_data.read_bytes()?;
+                    let vec_reader = VectorReader::open(vec_bytes.as_slice())?;
+                    segment_vector_readers.push(Some(vec_reader));
+                }
+                Err(crate::directory::error::OpenReadError::FileDoesNotExist(_)) => {
+                    // Segment was created before vectors field existed - no .vec file
+                    segment_vector_readers.push(None);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        use crate::vector::format::{PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+
+        // Write V2 header
+        wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
+        wrt.write_all(&[VECTOR_VERSION])?;
+        wrt.write_all(&[VectorEncoding::F32 as u8])?; // Always use F32 for merges
+
+        let num_fields = vector_fields.len() as u32;
+        wrt.write_all(&num_fields.to_le_bytes())?;
+
+        for field in &vector_fields {
+            wrt.write_all(&field.field_id().to_le_bytes())?;
+        }
+
+        wrt.write_all(&self.max_doc.to_le_bytes())?;
+
+        // Write vectors for each field in columnar format
+        for field in &vector_fields {
+            // Collect all vector IDs from all segments for this field
+            let mut all_vector_ids: BTreeSet<String> = BTreeSet::new();
+            for opt_reader in &segment_vector_readers {
+                if let Some(reader) = opt_reader {
+                    if let Some(ids) = reader.vector_ids(*field) {
+                        all_vector_ids.extend(ids.map(|s| s.to_string()));
+                    }
+                }
+            }
+
+            // Write number of vector IDs
+            wrt.write_all(&(all_vector_ids.len() as u32).to_le_bytes())?;
+
+            // Write each vector ID's data (columnar: all docs for each ID)
+            for vector_id in &all_vector_ids {
+                // Write vector ID string
+                let id_bytes = vector_id.as_bytes();
+                wrt.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
+                wrt.write_all(id_bytes)?;
+
+                // First pass: collect vectors and determine dimensions
+                let mut presence_builder = PresenceBitsetBuilder::new(self.max_doc);
+                let mut ordered_vectors: Vec<Vec<f32>> = Vec::new();
+                let mut dimensions = 0u32;
+
+                for (new_doc_id, doc_addr) in
+                    doc_id_mapping.new_doc_id_to_old_doc_addr.iter().enumerate()
+                {
+                    let segment_ord = doc_addr.segment_ord as usize;
+                    let old_doc_id = doc_addr.doc_id;
+
+                    if let Some(vec) = segment_vector_readers
+                        .get(segment_ord)
+                        .and_then(|opt_reader| opt_reader.as_ref())
+                        .and_then(|reader| reader.get(*field, vector_id, old_doc_id))
+                    {
+                        if dimensions == 0 {
+                            dimensions = vec.len() as u32;
+                        }
+                        presence_builder.set(new_doc_id as u32);
+                        ordered_vectors.push(vec.into_owned());
+                    }
+                }
+
+                // Write dimensions
+                wrt.write_all(&dimensions.to_le_bytes())?;
+
+                // Write presence bitset
+                let bitset_bytes = presence_builder.as_bytes();
+                wrt.write_all(&bitset_bytes)?;
+
+                // Write vectors contiguously
+                for vec in &ordered_vectors {
+                    for &v in vec {
+                        wrt.write_all(&v.to_le_bytes())?;
+                    }
+                }
+            }
+        }
+
+        // Terminate with footer (adds magic bytes required by tantivy's file reading)
+        wrt.terminate()?;
+        Ok(())
     }
 }
 

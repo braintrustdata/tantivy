@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::net::Ipv6Addr;
 
@@ -99,6 +100,12 @@ pub trait Value<'a>: Send + Sync + Debug {
     }
 
     #[inline]
+    /// If the Value is a vector map, returns the associated map. Returns None otherwise.
+    fn as_vector_map(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
+        self.as_leaf().and_then(|leaf| leaf.as_vector_map())
+    }
+
+    #[inline]
     /// Returns the iterator over the array if the Value is an array.
     fn as_array(&self) -> Option<Self::ArrayIter> {
         if let ReferenceValue::Array(val) = self.as_value() {
@@ -156,6 +163,8 @@ pub enum ReferenceValueLeaf<'a> {
     Bool(bool),
     /// Pre-tokenized str type,
     PreTokStr(&'a PreTokenizedString),
+    /// VectorMap embeddings - a map of string IDs to f32 arrays.
+    VectorMap(&'a BTreeMap<String, Vec<f32>>),
 }
 
 impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<'a, T> {
@@ -176,6 +185,9 @@ impl<'a, T: Value<'a> + ?Sized> From<ReferenceValueLeaf<'a>> for ReferenceValue<
             ReferenceValueLeaf::Bool(val) => ReferenceValue::Leaf(ReferenceValueLeaf::Bool(val)),
             ReferenceValueLeaf::PreTokStr(val) => {
                 ReferenceValue::Leaf(ReferenceValueLeaf::PreTokStr(val))
+            }
+            ReferenceValueLeaf::VectorMap(val) => {
+                ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(val))
             }
         }
     }
@@ -288,6 +300,16 @@ impl<'a> ReferenceValueLeaf<'a> {
             None
         }
     }
+
+    #[inline]
+    /// If the Value is a vector map, returns the associated map. Returns None otherwise.
+    pub fn as_vector_map(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
+        if let Self::VectorMap(val) = self {
+            Some(val)
+        } else {
+            None
+        }
+    }
 }
 
 /// A enum representing a value for tantivy to index.
@@ -381,6 +403,12 @@ where V: Value<'a>
     /// If the Value is a facet, returns the associated facet. Returns None otherwise.
     pub fn as_facet(&self) -> Option<&'a Facet> {
         self.as_leaf().and_then(|leaf| leaf.as_facet())
+    }
+
+    #[inline]
+    /// If the Value is a vector map, returns the associated map. Returns None otherwise.
+    pub fn as_vector_map(&self) -> Option<&'a BTreeMap<String, Vec<f32>>> {
+        self.as_leaf().and_then(|leaf| leaf.as_vector_map())
     }
 
     #[inline]

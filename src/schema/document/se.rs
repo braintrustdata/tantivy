@@ -145,6 +145,22 @@ where W: Write
 
                     val.serialize(self.writer)
                 }
+                ReferenceValueLeaf::VectorMap(val) => {
+                    self.write_type_code(type_codes::VECTOR_CODE)?;
+                    // Write number of entries in the map
+                    let num_entries = val.len() as u64;
+                    num_entries.serialize(self.writer)?;
+                    // Write each key-vector pair
+                    for (key, vec) in val {
+                        key.serialize(self.writer)?;
+                        let vec_len = vec.len() as u64;
+                        vec_len.serialize(self.writer)?;
+                        for &v in vec {
+                            self.writer.write_all(&v.to_le_bytes())?;
+                        }
+                    }
+                    Ok(())
+                }
             },
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;

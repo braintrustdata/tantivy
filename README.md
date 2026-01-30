@@ -42,7 +42,7 @@ Details about the benchmark can be found at this [repository](https://github.com
 - SIMD integer compression when the platform/CPU includes the SSE2 instruction set
 - Single valued and multivalued u64, i64, and f64 fast fields (equivalent of doc values in Lucene)
 - `&[u8]` fast fields
-- Text, i64, u64, f64, dates, ip, bool, and hierarchical facet fields
+- Text, i64, u64, f64, dates, ip, bool, vector, and hierarchical facet fields
 - Compressed document store (LZ4, Zstd, None)
 - Range queries
 - Faceted search
@@ -51,6 +51,7 @@ Details about the benchmark can be found at this [repository](https://github.com
 - Aggregation Collector: histogram, range buckets, average, and stats metrics
 - LogMergePolicy with deletes
 - Searcher Warmer API
+- Vector fields for embedding storage (variable-length f32 arrays per document)
 - Cheesy logo with a horse
 
 ### Non-features
