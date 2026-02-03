@@ -232,7 +232,7 @@ mod tests {
         let mut summary_count = 0;
 
         for segment_reader in searcher.segment_readers() {
-            if let Some(vector_reader) = segment_reader.vector_reader(embedding_field) {
+            if let Some(vector_reader) = segment_reader.vector_reader(embedding_field).unwrap() {
                 // Count vectors using columnar iteration
                 for (_doc_id, _vec) in vector_reader.iter_vectors(embedding_field, "chunk_0") {
                     chunk0_count += 1;
@@ -273,7 +273,7 @@ mod tests {
         );
 
         let segment_reader = searcher.segment_reader(0);
-        let vector_reader = segment_reader.vector_reader(embedding_field);
+        let vector_reader = segment_reader.vector_reader(embedding_field).unwrap();
         assert!(vector_reader.is_some(), "Expected vector reader after merge");
         let vector_reader = vector_reader.unwrap();
 
@@ -355,7 +355,7 @@ mod tests {
         let mut doc_ids: Vec<u32> = Vec::new();
 
         for segment_reader in searcher.segment_readers() {
-            if let Some(vector_reader) = segment_reader.vector_reader(embedding_field) {
+            if let Some(vector_reader) = segment_reader.vector_reader(embedding_field).unwrap() {
                 for (doc_id, vec) in vector_reader.iter_vectors(embedding_field, "embedding") {
                     doc_ids.push(doc_id);
                     all_vectors.push(vec.into_owned());
