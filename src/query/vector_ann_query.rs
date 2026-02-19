@@ -112,8 +112,9 @@ fn search_segment(
     }
 
     let vector_reader = match reader.vector_reader(field) {
-        Some(reader) => reader,
-        None => return Ok(Vec::new()),
+        Ok(Some(reader)) => reader,
+        Ok(None) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
     };
 
     let mut scored: Vec<(DocId, Score)> = Vec::new();
@@ -123,7 +124,8 @@ fn search_segment(
     }
 
     for (doc_id, vector) in vector_reader.iter_vectors(field, vector_id) {
-        if let Some(sim) = cosine_similarity(query, vector.as_ref(), query_norm) {
+        let vector: &[f32] = vector.as_ref();
+        if let Some(sim) = cosine_similarity(query, vector, query_norm) {
             if min_similarity.map_or(true, |min| sim >= min) {
                 scored.push((doc_id, sim));
             }
