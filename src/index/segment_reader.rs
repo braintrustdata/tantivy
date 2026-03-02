@@ -6,6 +6,7 @@ use std::{fmt, io};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
+use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
@@ -16,7 +17,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::VectorReader;
+use crate::vector::{VectorAnnReader, VectorReader};
 use crate::{DocId, Executor, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -48,6 +49,8 @@ pub struct SegmentReader {
     store_file: FileSlice,
     /// Optional vector file data (present if segment has vector fields)
     vector_file_opt: Option<FileSlice>,
+    /// Optional vector ANN file data (present if segment has ANN indexes)
+    vector_ann_file_opt: Option<FileSlice>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -203,7 +206,12 @@ impl SegmentReader {
         };
 
         // Try to load vector file if it exists
-        let vector_file_opt = segment.open_read(SegmentComponent::Vectors).ok();
+        let vector_file_opt = match segment.open_read(SegmentComponent::Vectors) {
+            Ok(vector_file) => Some(vector_file),
+            Err(OpenReadError::FileDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let vector_ann_file_opt = segment.open_read(SegmentComponent::VectorAnn).ok();
 
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
@@ -225,6 +233,7 @@ impl SegmentReader {
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
             vector_file_opt,
+            vector_ann_file_opt,
             alive_bitset_opt,
             positions_composite,
             schema,
@@ -436,13 +445,17 @@ impl SegmentReader {
     /// Returns `None` if the segment has no vector data.
     /// The `field` parameter is used for API consistency but all fields' vectors
     /// are stored in the same file.
-    pub fn vector_reader(&self, _field: Field) -> Option<VectorReader> {
-        self.vector_file_opt.as_ref().and_then(|file_slice| {
-            file_slice
-                .read_bytes()
-                .ok()
-                .and_then(|bytes| VectorReader::open(bytes.as_slice()).ok())
-        })
+    pub fn vector_reader(&self, _field: Field) -> io::Result<Option<VectorReader>> {
+        match self.vector_file_opt.as_ref() {
+            None => Ok(None),
+            Some(file_slice) => Ok(Some(VectorReader::open(file_slice.read_bytes()?)?)),
+        }
+    }
+
+    pub fn vector_ann_reader(&self) -> Option<VectorAnnReader> {
+        self.vector_ann_file_opt
+            .as_ref()
+            .and_then(|file_slice| VectorAnnReader::open(file_slice.clone()).ok())
     }
 
     /// Returns the bitset representing the alive `DocId`s.

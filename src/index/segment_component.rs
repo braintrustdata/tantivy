@@ -29,12 +29,14 @@ pub enum SegmentComponent {
     Delete,
     /// Vector embeddings stored as JSON lines (one vector per doc_id line).
     Vectors,
+    /// Vector ANN index stored separately from vector data.
+    VectorAnn,
 }
 
 impl SegmentComponent {
     /// Iterates through the components.
     pub fn iterator() -> slice::Iter<'static, SegmentComponent> {
-        static SEGMENT_COMPONENTS: [SegmentComponent; 9] = [
+        static SEGMENT_COMPONENTS: [SegmentComponent; 10] = [
             SegmentComponent::Postings,
             SegmentComponent::Positions,
             SegmentComponent::FastFields,
@@ -44,6 +46,7 @@ impl SegmentComponent {
             SegmentComponent::TempStore,
             SegmentComponent::Delete,
             SegmentComponent::Vectors,
+            SegmentComponent::VectorAnn,
         ];
         SEGMENT_COMPONENTS.iter()
     }
