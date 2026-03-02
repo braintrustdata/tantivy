@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use half::f16 as half_f16;
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use common::{HasLen, OwnedBytes, TerminatingWrite};
@@ -16,6 +17,23 @@ use crate::DocId;
 
 pub const VECTOR_ANN_MAGIC: u32 = 0x4E415654; // "TVAN"
 pub const VECTOR_ANN_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct VectorAnnBuildParams {
+    pub connectivity: usize,
+    pub expansion_add: usize,
+    pub expansion_search: usize,
+}
+
+impl VectorAnnBuildParams {
+    fn normalized_values(&self) -> (usize, usize, usize) {
+        (
+            self.connectivity.max(1),
+            self.expansion_add.max(1),
+            self.expansion_search.max(1),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -52,11 +70,7 @@ impl VectorAnnIndexMeta {
         }
     }
 
-    fn load_index(
-        &self,
-        file: &FileSlice,
-        metric: VectorAnnMetric,
-    ) -> io::Result<&VectorAnnIndex> {
+    fn load_index(&self, file: &FileSlice, metric: VectorAnnMetric) -> io::Result<&VectorAnnIndex> {
         self.index.get_or_try_init(|| {
             let bytes = file.read_bytes_slice(self.index_range.clone())?;
             let index = build_usearch_view(self.dimensions as usize, metric, bytes.as_slice())?;
@@ -119,7 +133,10 @@ impl VectorAnnReader {
                 let id_len = cursor.read_u32()? as usize;
                 let id_bytes = cursor.read_bytes(id_len)?;
                 let vector_id = String::from_utf8(id_bytes.to_vec()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("Invalid vector id: {}", e))
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid vector id: {}", e),
+                    )
                 })?;
                 let dimensions = cursor.read_u32()?;
                 let index_len = cursor.read_u64()? as usize;
@@ -166,10 +183,7 @@ impl VectorAnnReader {
         let index = meta.load_index(&self.file, self.metric)?;
         let query_bits = f32_to_f16_bits(query);
         let query_f16 = usearch::f16::from_i16s(&query_bits);
-        let matches = index
-            .index
-            .search(query_f16, limit)
-            .map_err(usearch_err)?;
+        let matches = index.index.search(query_f16, limit).map_err(usearch_err)?;
 
         let mut results = Vec::with_capacity(matches.keys.len());
         for (key, distance) in matches.keys.iter().zip(matches.distances.iter()) {
@@ -198,6 +212,7 @@ impl VectorAnnWriter {
         writer: &crate::vector::writer::VectorFieldsWriter,
         mut out: W,
         doc_id_map: Option<&DocIdMapping>,
+        build_params: Option<&VectorAnnBuildParams>,
     ) -> io::Result<()> {
         out.write_all(&VECTOR_ANN_MAGIC.to_le_bytes())?;
         out.write_all(&[VECTOR_ANN_VERSION])?;
@@ -242,7 +257,8 @@ impl VectorAnnWriter {
 
             out.write_all(&(entries.len() as u32).to_le_bytes())?;
             for (vector_id, dimensions, ordered) in entries {
-                let index_bytes = build_ann_index_bytes(dimensions as usize, ordered)?;
+                let index_bytes =
+                    build_ann_index_bytes(dimensions as usize, ordered, build_params)?;
                 let id_bytes = vector_id.as_bytes();
                 out.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
                 out.write_all(id_bytes)?;
@@ -259,6 +275,7 @@ impl VectorAnnWriter {
         mut out: W,
         vector_fields: &[Field],
         vectors: Vec<(Field, String, u32, Vec<(DocId, Vec<f32>)>)>,
+        build_params: Option<&VectorAnnBuildParams>,
     ) -> io::Result<()> {
         out.write_all(&VECTOR_ANN_MAGIC.to_le_bytes())?;
         out.write_all(&[VECTOR_ANN_VERSION])?;
@@ -271,8 +288,7 @@ impl VectorAnnWriter {
             out.write_all(&field.field_id().to_le_bytes())?;
         }
 
-        let mut by_field: HashMap<u32, Vec<(String, u32, Vec<(DocId, Vec<f32>)>)>> =
-            HashMap::new();
+        let mut by_field: HashMap<u32, Vec<(String, u32, Vec<(DocId, Vec<f32>)>)>> = HashMap::new();
         for (field, vector_id, dimensions, vectors) in vectors {
             by_field
                 .entry(field.field_id())
@@ -287,7 +303,10 @@ impl VectorAnnWriter {
             for (vector_id, dimensions, vectors) in entries {
                 let index_bytes = build_ann_index_bytes(
                     dimensions as usize,
-                    vectors.iter().map(|(doc_id, vec)| (*doc_id, vec.as_slice())),
+                    vectors
+                        .iter()
+                        .map(|(doc_id, vec)| (*doc_id, vec.as_slice())),
+                    build_params,
                 )?;
                 let id_bytes = vector_id.as_bytes();
                 out.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
@@ -318,7 +337,11 @@ fn build_usearch_view(
     Ok(index)
 }
 
-fn build_ann_index_bytes<'a, I>(dimensions: usize, vectors: I) -> io::Result<Vec<u8>>
+fn build_ann_index_bytes<'a, I>(
+    dimensions: usize,
+    vectors: I,
+    build_params: Option<&VectorAnnBuildParams>,
+) -> io::Result<Vec<u8>>
 where
     I: IntoIterator<Item = (DocId, &'a [f32])>,
 {
@@ -327,12 +350,27 @@ where
     options.dimensions = dimensions;
     options.metric = MetricKind::Cos;
     options.quantization = ScalarKind::F16;
+    if let Some(params) = build_params {
+        let (connectivity, expansion_add, expansion_search) = params.normalized_values();
+        options.connectivity = connectivity;
+        options.expansion_add = expansion_add;
+        options.expansion_search = expansion_search;
+    }
     let index = Index::new(&options).map_err(usearch_err)?;
-    index
-        .reserve(vectors.len())
-        .map_err(usearch_err)?;
+    index.reserve(vectors.len()).map_err(usearch_err)?;
+    let mut bits = Vec::with_capacity(dimensions);
     for (doc_id, vec) in vectors {
-        let bits = f32_to_f16_bits(vec);
+        if vec.len() != dimensions {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Vector dimension mismatch while building ANN index: expected {}, got {}",
+                    dimensions,
+                    vec.len()
+                ),
+            ));
+        }
+        f32_to_f16_bits_into(vec, &mut bits);
         let f16_slice = usearch::f16::from_i16s(&bits);
         index.add(doc_id as u64, f16_slice).map_err(usearch_err)?;
     }
@@ -342,16 +380,27 @@ where
 }
 
 fn f32_to_f16_bits(vec: &[f32]) -> Vec<i16> {
-    vec.iter()
-        .map(|&v| {
-            let bits = half_f16::from_f32(v).to_bits();
-            i16::from_le_bytes(bits.to_le_bytes())
-        })
-        .collect()
+    let mut out = Vec::with_capacity(vec.len());
+    f32_to_f16_bits_into(vec, &mut out);
+    out
+}
+
+fn f32_to_f16_bits_into(vec: &[f32], out: &mut Vec<i16>) {
+    out.clear();
+    if out.capacity() < vec.len() {
+        out.reserve(vec.len() - out.capacity());
+    }
+    for &v in vec {
+        let bits = half_f16::from_f32(v).to_bits();
+        out.push(i16::from_le_bytes(bits.to_le_bytes()));
+    }
 }
 
 fn usearch_err<E: std::fmt::Display>(err: E) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("usearch error: {}", err))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("usearch error: {}", err),
+    )
 }
 
 struct FileSliceCursor {
@@ -363,7 +412,11 @@ struct FileSliceCursor {
 impl FileSliceCursor {
     fn new(file: FileSlice) -> Self {
         let len = file.len();
-        Self { file, offset: 0, len }
+        Self {
+            file,
+            offset: 0,
+            len,
+        }
     }
 
     fn offset(&self) -> usize {
@@ -562,6 +615,71 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn bench_vector_ann_build_index_bytes() {
+        let dims = 768usize;
+        let count = 100_000usize;
+        let mut vectors_flat = vec![0.0f32; count * dims];
+        for doc_id in 0..count {
+            let start = doc_id * dims;
+            for (idx, value) in vectors_flat[start..start + dims].iter_mut().enumerate() {
+                let raw = ((doc_id + idx) % 1000) as f32 / 1000.0;
+                *value = raw;
+            }
+        }
+
+        let vectors: Vec<(DocId, &[f32])> = (0..count)
+            .map(|doc_id| {
+                let start = doc_id * dims;
+                (doc_id as DocId, &vectors_flat[start..start + dims])
+            })
+            .collect();
+
+        let legacy_start = std::time::Instant::now();
+        let legacy = build_ann_index_bytes_legacy(dims, vectors.clone()).unwrap();
+        let legacy_elapsed = legacy_start.elapsed();
+
+        let optimized_start = std::time::Instant::now();
+        let optimized = build_ann_index_bytes(dims, vectors, None).unwrap();
+        let optimized_elapsed = optimized_start.elapsed();
+
+        println!(
+            "ANN build_ann_index_bytes legacy: {:.3}s, optimized: {:.3}s, speedup: {:.2}x",
+            legacy_elapsed.as_secs_f64(),
+            optimized_elapsed.as_secs_f64(),
+            legacy_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64()
+        );
+        println!(
+            "ANN serialized bytes legacy={} optimized={}",
+            legacy.len(),
+            optimized.len()
+        );
+        assert!(!legacy.is_empty());
+        assert!(!optimized.is_empty());
+    }
+
+    fn build_ann_index_bytes_legacy<'a, I>(dimensions: usize, vectors: I) -> io::Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = (DocId, &'a [f32])>,
+    {
+        let vectors: Vec<(DocId, &'a [f32])> = vectors.into_iter().collect();
+        let mut options = IndexOptions::default();
+        options.dimensions = dimensions;
+        options.metric = MetricKind::Cos;
+        options.quantization = ScalarKind::F16;
+        let index = usearch::Index::new(&options).map_err(usearch_err)?;
+        index.reserve(vectors.len()).map_err(usearch_err)?;
+        for (doc_id, vec) in vectors {
+            let bits = f32_to_f16_bits(vec);
+            let f16_slice = usearch::f16::from_i16s(&bits);
+            index.add(doc_id as u64, f16_slice).map_err(usearch_err)?;
+        }
+        let mut buffer = vec![0u8; index.serialized_length()];
+        index.save_to_buffer(&mut buffer).map_err(usearch_err)?;
+        Ok(buffer)
+    }
+
+    #[test]
+    #[ignore]
     fn bench_vector_ann_range_reads_fs() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -742,7 +860,11 @@ mod tests {
         if vector_norm == 0.0 {
             return None;
         }
-        let dot = query.iter().zip(vector.iter()).map(|(a, b)| a * b).sum::<f32>();
+        let dot = query
+            .iter()
+            .zip(vector.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
         Some(dot / (query_norm * vector_norm))
     }
 }

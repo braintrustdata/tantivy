@@ -804,8 +804,7 @@ impl IndexMerger {
             let vector_write = serializer
                 .segment_mut()
                 .open_write(SegmentComponent::Vectors)?;
-            let (vector_fields, ann_entries) =
-                self.write_vectors(vector_write, &doc_id_mapping)?;
+            let (vector_fields, ann_entries) = self.write_vectors(vector_write, &doc_id_mapping)?;
 
             debug!("write-vector-ann");
             let vector_ann_write = serializer
@@ -815,6 +814,7 @@ impl IndexMerger {
                 vector_ann_write,
                 &vector_fields,
                 ann_entries,
+                self.index_settings.vector_ann_build_params.as_ref(),
             )?;
         }
 
@@ -835,7 +835,10 @@ impl IndexMerger {
         &self,
         mut wrt: WritePtr,
         doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<(Vec<Field>, Vec<(Field, String, u32, Vec<(DocId, Vec<f32>)>)>)> {
+    ) -> crate::Result<(
+        Vec<Field>,
+        Vec<(Field, String, u32, Vec<(DocId, Vec<f32>)>)>,
+    )> {
         use std::collections::BTreeSet;
         use std::io::Write;
 
@@ -873,7 +876,9 @@ impl IndexMerger {
             }
         }
 
-        use crate::vector::format::{PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+        use crate::vector::format::{
+            PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
+        };
 
         // Write V2 header
         wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
@@ -955,12 +960,7 @@ impl IndexMerger {
                 }
 
                 if !ordered_doc_vectors.is_empty() && dimensions > 0 {
-                    ann_entries.push((
-                        *field,
-                        vector_id.clone(),
-                        dimensions,
-                        ordered_doc_vectors,
-                    ));
+                    ann_entries.push((*field, vector_id.clone(), dimensions, ordered_doc_vectors));
                 }
             }
         }

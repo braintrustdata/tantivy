@@ -10,6 +10,7 @@ use super::SegmentComponent;
 use crate::index::SegmentId;
 use crate::schema::Schema;
 use crate::store::Compressor;
+use crate::vector::VectorAnnBuildParams;
 use crate::{Inventory, Opstamp, TrackedObject};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -267,6 +268,12 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
+    /// Optional ANN build parameters for vector index serialization.
+    ///
+    /// If omitted, usearch defaults are used.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_ann_build_params: Option<VectorAnnBuildParams>,
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -281,6 +288,7 @@ impl Default for IndexSettings {
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
+            vector_ann_build_params: None,
         }
     }
 }
@@ -536,7 +544,8 @@ mod tests {
                 sort_by_field: None,
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
-                docstore_blocksize: 16_384
+                docstore_blocksize: 16_384,
+                vector_ann_build_params: None,
             }
         );
         {

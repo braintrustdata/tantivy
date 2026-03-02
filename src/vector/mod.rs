@@ -68,13 +68,16 @@
 //! }
 //! ```
 
-pub mod format;
 pub mod ann;
+pub mod format;
 mod reader;
 mod writer;
 
-pub use format::{VectorEncoding, Int8QuantParams, PresenceBitset, PresenceBitsetBuilder, VECTOR_MAGIC, VECTOR_VERSION};
-pub use ann::{VectorAnnReader, VectorAnnWriter};
+pub use ann::{VectorAnnBuildParams, VectorAnnReader, VectorAnnWriter};
+pub use format::{
+    Int8QuantParams, PresenceBitset, PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC,
+    VECTOR_VERSION,
+};
 pub use reader::VectorReader;
 pub use writer::VectorFieldsWriter;
 
@@ -109,8 +112,8 @@ mod tests {
 
     #[test]
     fn test_vector_binary_format_roundtrip() {
-        use crate::vector::format::{VECTOR_MAGIC, VECTOR_VERSION, VectorEncoding};
-        
+        use crate::vector::format::{VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+
         // Manually write v2 columnar binary data and read it back
         let mut buffer = Vec::new();
 
@@ -118,7 +121,7 @@ mod tests {
         buffer.extend_from_slice(&VECTOR_MAGIC.to_le_bytes());
         buffer.push(VECTOR_VERSION);
         buffer.push(VectorEncoding::F32 as u8);
-        
+
         // 1 field
         buffer.extend_from_slice(&1u32.to_le_bytes());
         // Field ID: 0
@@ -157,7 +160,10 @@ mod tests {
             reader.get(field, "main", 0).map(|c| c.into_owned()),
             Some(vec![0.1f32, 0.2, 0.3])
         );
-        assert_eq!(reader.get(field, "main", 1).map(|c| c.into_owned()), Some(vec![1.0f32, 2.0, 3.0]));
+        assert_eq!(
+            reader.get(field, "main", 1).map(|c| c.into_owned()),
+            Some(vec![1.0f32, 2.0, 3.0])
+        );
         assert!(reader.get(field, "main", 2).is_none()); // out of bounds
         assert!(reader.get(field, "nonexistent", 0).is_none()); // no such ID
     }
@@ -183,7 +189,8 @@ mod tests {
         let mut found_vector = false;
         for (field, value) in doc1.iter_fields_and_values() {
             if field == embedding_field {
-                if let ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vec_map)) = value.as_value()
+                if let ReferenceValue::Leaf(ReferenceValueLeaf::VectorMap(vec_map)) =
+                    value.as_value()
                 {
                     assert_eq!(vec_map.get("chunk_0"), Some(&vec![0.1f32, 0.2, 0.3]));
                     assert_eq!(vec_map.get("summary"), Some(&vec![10.0f32, 20.0]));
@@ -276,7 +283,10 @@ mod tests {
 
         let segment_reader = searcher.segment_reader(0);
         let vector_reader = segment_reader.vector_reader(embedding_field).unwrap();
-        assert!(vector_reader.is_some(), "Expected vector reader after merge");
+        assert!(
+            vector_reader.is_some(),
+            "Expected vector reader after merge"
+        );
         let vector_reader = vector_reader.unwrap();
 
         // Verify columnar access after merge
@@ -284,7 +294,11 @@ mod tests {
         let chunk0_vecs: Vec<_> = vector_reader
             .iter_vectors(embedding_field, "chunk_0")
             .collect();
-        assert_eq!(chunk0_vecs.len(), 2, "Expected 2 chunk_0 vectors after merge");
+        assert_eq!(
+            chunk0_vecs.len(),
+            2,
+            "Expected 2 chunk_0 vectors after merge"
+        );
 
         let summary_vecs: Vec<_> = vector_reader
             .iter_vectors(embedding_field, "summary")
@@ -302,7 +316,7 @@ mod tests {
     }
 
     /// Demonstrates using vector storage for K-means clustering.
-    /// 
+    ///
     /// This test shows the primary use case: extracting all vectors with a given ID
     /// across documents and feeding them to a clustering algorithm.
     #[test]
@@ -333,7 +347,7 @@ mod tests {
         for i in 0..100 {
             let cluster_idx = i % 3;
             let center = &cluster_centers[cluster_idx];
-            
+
             // Add noise to cluster center
             let vec: Vec<f32> = center
                 .iter()
@@ -366,7 +380,11 @@ mod tests {
         }
 
         assert_eq!(all_vectors.len(), 100, "Should have 100 vectors");
-        assert_eq!(all_vectors[0].len(), 8, "Each vector should be 8-dimensional");
+        assert_eq!(
+            all_vectors[0].len(),
+            8,
+            "Each vector should be 8-dimensional"
+        );
 
         // Step 2: Convert to ndarray for clustering
         let n_samples = all_vectors.len();
@@ -377,10 +395,7 @@ mod tests {
         // Step 3: Simple K-means clustering (k=3)
         // Use the known cluster centers as initial centroids for deterministic results
         let k = 3;
-        let initial_centroids = cluster_centers
-            .iter()
-            .map(|c| c.to_vec())
-            .collect();
+        let initial_centroids = cluster_centers.iter().map(|c| c.to_vec()).collect();
         let assignments = simple_kmeans(&data, k, 10, Some(initial_centroids));
 
         // Verify we got 3 clusters with reasonable distribution
@@ -574,11 +589,21 @@ mod tests {
 
         // Verify the vectors are from doc0 and doc2
         assert!(vectors.contains_key(&0), "Should have vector for doc 0");
-        assert!(vectors.contains_key(&1), "Should have vector for doc 2 (at index 1)");
+        assert!(
+            vectors.contains_key(&1),
+            "Should have vector for doc 2 (at index 1)"
+        );
 
         // Verify dimensions
-        assert_eq!(vectors.get(&0).unwrap().len(), 3, "Doc 0 should have 3 dimensions");
-        assert_eq!(vectors.get(&1).unwrap().len(), 3, "Doc 2 should have 3 dimensions");
+        assert_eq!(
+            vectors.get(&0).unwrap().len(),
+            3,
+            "Doc 0 should have 3 dimensions"
+        );
+        assert_eq!(
+            vectors.get(&1).unwrap().len(),
+            3,
+            "Doc 2 should have 3 dimensions"
+        );
     }
 }
-
