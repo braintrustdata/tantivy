@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
+use std::env;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use tantivy_fst::automaton::AlwaysMatch;
 use tantivy_fst::Automaton;
 
@@ -54,6 +55,12 @@ impl Dictionary<VoidSSTable> {
         dictionary_writer.finish().unwrap();
         Dictionary::from_bytes(OwnedBytes::new(buffer)).unwrap()
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DictionaryIndexLoadStrategy {
+    Eager,
+    Lazy,
 }
 
 impl<TSSTable: SSTable> Dictionary<TSSTable> {
@@ -181,29 +188,70 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
+        let strategy = if env::var_os("TANTIVY_SSTABLE_INDEX_LAZY").is_some() {
+            DictionaryIndexLoadStrategy::Lazy
+        } else {
+            DictionaryIndexLoadStrategy::Eager
+        };
+        Self::open_with_strategy(term_dictionary_file, strategy)
+    }
+
+    pub fn open_with_strategy(
+        term_dictionary_file: FileSlice,
+        strategy: DictionaryIndexLoadStrategy,
+    ) -> io::Result<Self> {
         let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
-        let sstable_index_bytes = index_slice.read_bytes()?;
 
         let sstable_index = match version {
-            2 => SSTableIndex::V2(
-                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?,
-            ),
+            2 => {
+                let sstable_index_bytes = index_slice.read_bytes()?;
+                SSTableIndex::V2(
+                    crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(
+                        |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                    )?,
+                )
+            }
             3 => {
-                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
+                if index_slice.len() < 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SSTable corruption",
+                    ));
+                }
+
+                let footer_offset = index_slice.len() - 8;
+                let mut footerv3_len_bytes =
+                    index_slice.read_bytes_slice(footer_offset..index_slice.len())?;
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
-                    SSTableIndex::V3(
-                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                        })?,
-                    )
+                    if strategy == DictionaryIndexLoadStrategy::Lazy {
+                        SSTableIndex::V3(
+                            SSTableIndexV3::load_from_file_slice(
+                                index_slice.slice_to(footer_offset),
+                                store_offset,
+                            )
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
+                            })?,
+                        )
+                    } else {
+                        let sstable_index_bytes = index_slice.read_bytes()?;
+                        let (sstable_index_bytes, mut footerv3_len_bytes) =
+                            sstable_index_bytes.rsplit(8);
+                        let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
+                        SSTableIndex::V3(
+                            SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(
+                                |_| {
+                                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
+                                },
+                            )?,
+                        )
+                    }
                 } else {
                     // if store_offset is zero, there is no index, so we build a pseudo-index
                     // assuming a single block of sstable covering everything.

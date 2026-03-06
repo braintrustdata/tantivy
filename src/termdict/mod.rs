@@ -84,6 +84,33 @@ impl TermDictionary {
         InnerTermDict::open(main_slice).map(TermDictionary)
     }
 
+    /// Opens a `TermDictionary` while forcing the lazy SSTable index path when available.
+    #[cfg(feature = "quickwit")]
+    pub fn open_lazy(file: FileSlice) -> io::Result<Self> {
+        let (main_slice, dict_type) = file.split_from_end(4);
+        let mut dict_type = dict_type.read_bytes()?;
+        let dict_type = u32::deserialize(&mut dict_type)?;
+
+        if dict_type != CURRENT_TYPE as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Unsuported dictionary type, expected {}, found {dict_type}",
+                    CURRENT_TYPE as u32,
+                ),
+            ));
+        }
+
+        InnerTermDict::open_with_strategy(main_slice, sstable::DictionaryIndexLoadStrategy::Lazy)
+            .map(TermDictionary)
+    }
+
+    /// Opens a `TermDictionary`. On non-SSTable dictionaries this is identical to `open`.
+    #[cfg(not(feature = "quickwit"))]
+    pub fn open_lazy(file: FileSlice) -> io::Result<Self> {
+        Self::open(file)
+    }
+
     /// Creates an empty term dictionary which contains no terms.
     pub fn empty() -> Self {
         TermDictionary(InnerTermDict::empty())
