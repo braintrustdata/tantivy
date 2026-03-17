@@ -109,6 +109,14 @@ pub trait ColumnValues<T: PartialOrd = u64>: Send + Sync + DowncastSync {
         }
     }
 
+    fn count_true_for_range(&self, _start: u32, _len: u32) -> Option<u64> {
+        None
+    }
+
+    fn count_true_for_sorted_indexes(&self, _indexes: &[u32]) -> Option<u64> {
+        None
+    }
+
     /// Fills an output buffer with the fast field values
     /// associated with the `DocId` going from
     /// `start` to `start + output.len()`.
@@ -204,6 +212,16 @@ impl<T: Copy + PartialOrd + Debug + 'static> ColumnValues<T> for Arc<dyn ColumnV
     #[inline(always)]
     fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<T>]) {
         self.as_ref().get_vals_opt(indexes, output)
+    }
+
+    #[inline(always)]
+    fn count_true_for_range(&self, start: u32, len: u32) -> Option<u64> {
+        self.as_ref().count_true_for_range(start, len)
+    }
+
+    #[inline(always)]
+    fn count_true_for_sorted_indexes(&self, indexes: &[u32]) -> Option<u64> {
+        self.as_ref().count_true_for_sorted_indexes(indexes)
     }
 
     #[inline(always)]

@@ -56,6 +56,22 @@ where
         self.monotonic_mapping.mapping(from_val)
     }
 
+    fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<Output>]) {
+        let mut mapped_input = vec![None; indexes.len()];
+        self.from_column.get_vals_opt(indexes, &mut mapped_input);
+        for (out, input) in output.iter_mut().zip(mapped_input.into_iter()) {
+            *out = input.map(|value| self.monotonic_mapping.mapping(value));
+        }
+    }
+
+    fn count_true_for_range(&self, start: u32, len: u32) -> Option<u64> {
+        self.from_column.count_true_for_range(start, len)
+    }
+
+    fn count_true_for_sorted_indexes(&self, indexes: &[u32]) -> Option<u64> {
+        self.from_column.count_true_for_sorted_indexes(indexes)
+    }
+
     fn min_value(&self) -> Output {
         let from_min_value = self.from_column.min_value();
         self.monotonic_mapping.mapping(from_min_value)

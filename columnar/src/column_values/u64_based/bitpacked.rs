@@ -63,6 +63,130 @@ impl ColumnValues for BitpackedReader {
     fn get_val(&self, doc: u32) -> u64 {
         self.stats.min_value + self.stats.gcd.get() * self.bit_unpacker.get(doc, &self.data)
     }
+
+    fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<u64>]) {
+        assert_eq!(indexes.len(), output.len());
+        if indexes.is_empty() {
+            return;
+        }
+
+        if self.bit_unpacker.bit_width() > 32 {
+            for (out, idx) in output.iter_mut().zip(indexes.iter().copied()) {
+                *out = Some(self.get_val(idx));
+            }
+            return;
+        }
+
+        let mut num_runs = 1usize;
+        let mut prev = indexes[0];
+        for &idx in &indexes[1..] {
+            if idx < prev {
+                for (out, idx) in output.iter_mut().zip(indexes.iter().copied()) {
+                    *out = Some(self.get_val(idx));
+                }
+                return;
+            }
+            if idx != prev + 1 {
+                num_runs += 1;
+            }
+            prev = idx;
+        }
+
+        if num_runs * 8 >= indexes.len() {
+            for (out, idx) in output.iter_mut().zip(indexes.iter().copied()) {
+                *out = Some(self.get_val(idx));
+            }
+            return;
+        }
+
+        let mut run_start_idx = 0usize;
+        let mut scratch = [0u32; 256];
+        while run_start_idx < indexes.len() {
+            let run_doc_start = indexes[run_start_idx];
+            let mut run_end_idx = run_start_idx + 1;
+            while run_end_idx < indexes.len() && indexes[run_end_idx] == indexes[run_end_idx - 1] + 1 {
+                run_end_idx += 1;
+            }
+
+            let mut decoded = 0usize;
+            while decoded < run_end_idx - run_start_idx {
+                let chunk_len = (run_end_idx - run_start_idx - decoded).min(scratch.len());
+                self.bit_unpacker.get_batch_u32s(
+                    run_doc_start + decoded as u32,
+                    &self.data,
+                    &mut scratch[..chunk_len],
+                );
+                for (out, compact) in output[run_start_idx + decoded..run_start_idx + decoded + chunk_len]
+                    .iter_mut()
+                    .zip(scratch[..chunk_len].iter().copied())
+                {
+                    *out = Some(self.stats.min_value + self.stats.gcd.get() * compact as u64);
+                }
+                decoded += chunk_len;
+            }
+
+            run_start_idx = run_end_idx;
+        }
+    }
+
+    fn count_true_for_sorted_indexes(&self, indexes: &[u32]) -> Option<u64> {
+        if indexes.is_empty() {
+            return Some(0);
+        }
+
+        if self.stats.max_value == 0 {
+            return Some(0);
+        }
+        if self.stats.min_value > 0 {
+            return Some(indexes.len() as u64);
+        }
+        if self.stats.gcd.get() != 1 || self.stats.max_value > 1 || self.bit_unpacker.bit_width() != 1 {
+            return None;
+        }
+
+        let mut count = 0u64;
+        let mut run_start_idx = 0usize;
+        let mut prev = indexes[0];
+        for (pos, &idx) in indexes.iter().enumerate().skip(1) {
+            if idx < prev {
+                return None;
+            }
+            if idx != prev + 1 {
+                count += self.bit_unpacker.count_ones(
+                    indexes[run_start_idx],
+                    (pos - run_start_idx) as u32,
+                    &self.data,
+                );
+                run_start_idx = pos;
+            }
+            prev = idx;
+        }
+        count += self.bit_unpacker.count_ones(
+            indexes[run_start_idx],
+            (indexes.len() - run_start_idx) as u32,
+            &self.data,
+        );
+        Some(count)
+    }
+
+    fn count_true_for_range(&self, start: u32, len: u32) -> Option<u64> {
+        if len == 0 {
+            return Some(0);
+        }
+
+        if self.stats.max_value == 0 {
+            return Some(0);
+        }
+        if self.stats.min_value > 0 {
+            return Some(len as u64);
+        }
+        if self.stats.gcd.get() != 1 || self.stats.max_value > 1 || self.bit_unpacker.bit_width() != 1 {
+            return None;
+        }
+
+        Some(self.bit_unpacker.count_ones(start, len, &self.data))
+    }
+
     #[inline]
     fn min_value(&self) -> u64 {
         self.stats.min_value

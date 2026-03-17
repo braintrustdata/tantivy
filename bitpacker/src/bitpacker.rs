@@ -128,7 +128,7 @@ impl BitUnpacker {
     // #Panics
     //
     // This methods panics if `num_bits` is > 32.
-    fn get_batch_u32s(&self, start_idx: u32, data: &[u8], output: &mut [u32]) {
+    pub fn get_batch_u32s(&self, start_idx: u32, data: &[u8], output: &mut [u32]) {
         assert!(
             self.bit_width() <= 32,
             "Bitwidth must be <= 32 to use this method."
@@ -190,6 +190,54 @@ impl BitUnpacker {
         // Exit ramp
         let highway_end = highway_start + num_blocks * BitPacker1x::BLOCK_LEN as u32;
         get_batch_ramp(highway_end, &mut output[output_cursor..]);
+    }
+
+    pub fn count_ones(&self, start_idx: u32, len: u32, data: &[u8]) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        assert_eq!(self.bit_width(), 1, "count_ones is only valid for 1-bit columns");
+
+        let start_bit = start_idx as usize;
+        let end_bit = start_bit + len as usize;
+        let start_byte = start_bit / 8;
+        let end_byte = (end_bit + 7) / 8;
+
+        let start_offset = (start_bit % 8) as u32;
+        let end_offset = (end_bit % 8) as u32;
+
+        if start_byte + 1 >= end_byte {
+            let byte = data[start_byte];
+            let lower_mask = u8::MAX.wrapping_shl(start_offset);
+            let upper_mask = if end_offset == 0 {
+                u8::MAX
+            } else {
+                (1u8 << end_offset) - 1
+            };
+            return (byte & lower_mask & upper_mask).count_ones() as u64;
+        }
+
+        let mut count = 0u64;
+
+        let first_mask = u8::MAX.wrapping_shl(start_offset);
+        count += (data[start_byte] & first_mask).count_ones() as u64;
+
+        let middle = &data[start_byte + 1..end_byte - 1];
+        let (chunks, remainder) = middle.as_chunks::<8>();
+        for chunk in chunks {
+            count += u64::from_le_bytes(*chunk).count_ones() as u64;
+        }
+        for &byte in remainder {
+            count += byte.count_ones() as u64;
+        }
+
+        let last_mask = if end_offset == 0 {
+            u8::MAX
+        } else {
+            (1u8 << end_offset) - 1
+        };
+        count += (data[end_byte - 1] & last_mask).count_ones() as u64;
+        count
     }
 
     pub fn get_ids_for_value_range(
