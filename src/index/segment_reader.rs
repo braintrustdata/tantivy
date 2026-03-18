@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::ops::BitOrAssign;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 use std::{fmt, io};
 
 use fnv::FnvHashMap;
@@ -51,6 +53,108 @@ pub struct SegmentReader {
     vector_file_opt: Option<FileSlice>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SegmentReaderOpenMetrics {
+    pub num_segments: u64,
+    pub total_segment_open_us: u64,
+    pub terms_open_us: u64,
+    pub terms_composite_open_us: u64,
+    pub store_open_us: u64,
+    pub postings_open_us: u64,
+    pub postings_composite_open_us: u64,
+    pub positions_open_us: u64,
+    pub positions_composite_open_us: u64,
+    pub fast_fields_open_us: u64,
+    pub fast_fields_readers_open_us: u64,
+    pub fieldnorm_open_us: u64,
+    pub fieldnorm_readers_open_us: u64,
+    pub delete_open_us: u64,
+    pub delete_read_bytes_us: u64,
+    pub vectors_open_us: u64,
+}
+
+#[derive(Default)]
+struct SegmentReaderOpenMetricsAtomic {
+    enabled: AtomicBool,
+    num_segments: AtomicU64,
+    total_segment_open_us: AtomicU64,
+    terms_open_us: AtomicU64,
+    terms_composite_open_us: AtomicU64,
+    store_open_us: AtomicU64,
+    postings_open_us: AtomicU64,
+    postings_composite_open_us: AtomicU64,
+    positions_open_us: AtomicU64,
+    positions_composite_open_us: AtomicU64,
+    fast_fields_open_us: AtomicU64,
+    fast_fields_readers_open_us: AtomicU64,
+    fieldnorm_open_us: AtomicU64,
+    fieldnorm_readers_open_us: AtomicU64,
+    delete_open_us: AtomicU64,
+    delete_read_bytes_us: AtomicU64,
+    vectors_open_us: AtomicU64,
+}
+
+static SEGMENT_READER_OPEN_METRICS: OnceLock<SegmentReaderOpenMetricsAtomic> = OnceLock::new();
+
+fn open_metrics() -> &'static SegmentReaderOpenMetricsAtomic {
+    SEGMENT_READER_OPEN_METRICS.get_or_init(SegmentReaderOpenMetricsAtomic::default)
+}
+
+fn metrics_enabled() -> bool {
+    open_metrics().enabled.load(Ordering::Relaxed)
+}
+
+fn record_open_metric(metric: &AtomicU64, start: Instant) {
+    if !metrics_enabled() {
+        return;
+    }
+    metric.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+pub fn reset_segment_reader_open_metrics() {
+    let metrics = open_metrics();
+    metrics.enabled.store(true, Ordering::Relaxed);
+    metrics.num_segments.store(0, Ordering::Relaxed);
+    metrics.total_segment_open_us.store(0, Ordering::Relaxed);
+    metrics.terms_open_us.store(0, Ordering::Relaxed);
+    metrics.terms_composite_open_us.store(0, Ordering::Relaxed);
+    metrics.store_open_us.store(0, Ordering::Relaxed);
+    metrics.postings_open_us.store(0, Ordering::Relaxed);
+    metrics.postings_composite_open_us.store(0, Ordering::Relaxed);
+    metrics.positions_open_us.store(0, Ordering::Relaxed);
+    metrics.positions_composite_open_us.store(0, Ordering::Relaxed);
+    metrics.fast_fields_open_us.store(0, Ordering::Relaxed);
+    metrics.fast_fields_readers_open_us.store(0, Ordering::Relaxed);
+    metrics.fieldnorm_open_us.store(0, Ordering::Relaxed);
+    metrics.fieldnorm_readers_open_us.store(0, Ordering::Relaxed);
+    metrics.delete_open_us.store(0, Ordering::Relaxed);
+    metrics.delete_read_bytes_us.store(0, Ordering::Relaxed);
+    metrics.vectors_open_us.store(0, Ordering::Relaxed);
+}
+
+pub fn take_segment_reader_open_metrics() -> SegmentReaderOpenMetrics {
+    let metrics = open_metrics();
+    metrics.enabled.store(false, Ordering::Relaxed);
+    SegmentReaderOpenMetrics {
+        num_segments: metrics.num_segments.load(Ordering::Relaxed),
+        total_segment_open_us: metrics.total_segment_open_us.load(Ordering::Relaxed),
+        terms_open_us: metrics.terms_open_us.load(Ordering::Relaxed),
+        terms_composite_open_us: metrics.terms_composite_open_us.load(Ordering::Relaxed),
+        store_open_us: metrics.store_open_us.load(Ordering::Relaxed),
+        postings_open_us: metrics.postings_open_us.load(Ordering::Relaxed),
+        postings_composite_open_us: metrics.postings_composite_open_us.load(Ordering::Relaxed),
+        positions_open_us: metrics.positions_open_us.load(Ordering::Relaxed),
+        positions_composite_open_us: metrics.positions_composite_open_us.load(Ordering::Relaxed),
+        fast_fields_open_us: metrics.fast_fields_open_us.load(Ordering::Relaxed),
+        fast_fields_readers_open_us: metrics.fast_fields_readers_open_us.load(Ordering::Relaxed),
+        fieldnorm_open_us: metrics.fieldnorm_open_us.load(Ordering::Relaxed),
+        fieldnorm_readers_open_us: metrics.fieldnorm_readers_open_us.load(Ordering::Relaxed),
+        delete_open_us: metrics.delete_open_us.load(Ordering::Relaxed),
+        delete_read_bytes_us: metrics.delete_read_bytes_us.load(Ordering::Relaxed),
+        vectors_open_us: metrics.vectors_open_us.load(Ordering::Relaxed),
+    }
 }
 
 impl SegmentReader {
@@ -170,45 +274,96 @@ impl SegmentReader {
         segment: &Segment,
         custom_bitset: Option<AliveBitSet>,
     ) -> crate::Result<SegmentReader> {
-        let termdict_file = segment.open_read(SegmentComponent::Terms)?;
-        let termdict_composite = CompositeFile::open(&termdict_file)?;
+        let metrics = open_metrics();
+        let segment_open_start = Instant::now();
 
+        let terms_open_start = Instant::now();
+        let termdict_file = segment.open_read(SegmentComponent::Terms)?;
+        record_open_metric(&metrics.terms_open_us, terms_open_start);
+
+        let terms_composite_open_start = Instant::now();
+        let termdict_composite = CompositeFile::open(&termdict_file)?;
+        record_open_metric(
+            &metrics.terms_composite_open_us,
+            terms_composite_open_start,
+        );
+
+        let store_open_start = Instant::now();
         let store_file = segment.open_read(SegmentComponent::Store)?;
+        record_open_metric(&metrics.store_open_us, store_open_start);
 
         crate::fail_point!("SegmentReader::open#middle");
 
+        let postings_open_start = Instant::now();
         let postings_file = segment.open_read(SegmentComponent::Postings)?;
+        record_open_metric(&metrics.postings_open_us, postings_open_start);
+
+        let postings_composite_open_start = Instant::now();
         let postings_composite = CompositeFile::open(&postings_file)?;
+        record_open_metric(
+            &metrics.postings_composite_open_us,
+            postings_composite_open_start,
+        );
 
         let positions_composite = {
+            let positions_open_start = Instant::now();
             if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
-                CompositeFile::open(&positions_file)?
+                record_open_metric(&metrics.positions_open_us, positions_open_start);
+                let positions_composite_open_start = Instant::now();
+                let positions_composite = CompositeFile::open(&positions_file)?;
+                record_open_metric(
+                    &metrics.positions_composite_open_us,
+                    positions_composite_open_start,
+                );
+                positions_composite
             } else {
+                record_open_metric(&metrics.positions_open_us, positions_open_start);
                 CompositeFile::empty()
             }
         };
 
         let schema = segment.schema();
 
+        let fast_fields_open_start = Instant::now();
         let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
+        record_open_metric(&metrics.fast_fields_open_us, fast_fields_open_start);
+        let fast_fields_readers_open_start = Instant::now();
         let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
+        record_open_metric(
+            &metrics.fast_fields_readers_open_us,
+            fast_fields_readers_open_start,
+        );
+
+        let fieldnorm_open_start = Instant::now();
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
+        record_open_metric(&metrics.fieldnorm_open_us, fieldnorm_open_start);
+        let fieldnorm_readers_open_start = Instant::now();
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        record_open_metric(
+            &metrics.fieldnorm_readers_open_us,
+            fieldnorm_readers_open_start,
+        );
 
         let original_bitset = if segment.meta().has_deletes() {
+            let delete_open_start = Instant::now();
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
+            record_open_metric(&metrics.delete_open_us, delete_open_start);
+            let delete_read_bytes_start = Instant::now();
             let alive_doc_data = alive_doc_file_slice.read_bytes()?;
+            record_open_metric(&metrics.delete_read_bytes_us, delete_read_bytes_start);
             Some(AliveBitSet::open(alive_doc_data))
         } else {
             None
         };
 
         // Try to load vector file if it exists
+        let vectors_open_start = Instant::now();
         let vector_file_opt = match segment.open_read(SegmentComponent::Vectors) {
             Ok(vector_file) => Some(vector_file),
             Err(OpenReadError::FileDoesNotExist(_)) => None,
             Err(e) => return Err(e.into()),
         };
+        record_open_metric(&metrics.vectors_open_us, vectors_open_start);
 
         let alive_bitset_opt = intersect_alive_bitset(original_bitset, custom_bitset);
 
@@ -218,7 +373,7 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        Ok(SegmentReader {
+        let reader = SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -233,7 +388,12 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
-        })
+        };
+        if metrics_enabled() {
+            metrics.num_segments.fetch_add(1, Ordering::Relaxed);
+        }
+        record_open_metric(&metrics.total_segment_open_us, segment_open_start);
+        Ok(reader)
     }
 
     /// Open a new segment for reading.
@@ -492,9 +652,7 @@ impl SegmentReader {
     pub fn vector_reader(&self, _field: Field) -> io::Result<Option<VectorReader>> {
         match self.vector_file_opt.as_ref() {
             None => Ok(None),
-            Some(file_slice) => {
-                Ok(Some(VectorReader::open(file_slice.read_bytes()?)?))
-            }
+            Some(file_slice) => Ok(Some(VectorReader::open(file_slice.read_bytes()?)?)),
         }
     }
 

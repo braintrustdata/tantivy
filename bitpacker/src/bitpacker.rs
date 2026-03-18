@@ -196,7 +196,11 @@ impl BitUnpacker {
         if len == 0 {
             return 0;
         }
-        assert_eq!(self.bit_width(), 1, "count_ones is only valid for 1-bit columns");
+        assert_eq!(
+            self.bit_width(),
+            1,
+            "count_ones is only valid for 1-bit columns"
+        );
 
         let start_bit = start_idx as usize;
         let end_bit = start_bit + len as usize;

@@ -129,6 +129,30 @@ impl ColumnarReader {
         })
     }
 
+    /// Prefetches the bytes needed to open a [`ColumnarReader`] without performing the
+    /// synchronous decode step.
+    pub async fn prefetch_open<F>(file_slice: F) -> io::Result<()>
+    where
+        FileSlice: From<F>,
+    {
+        Self::prefetch_open_inner(file_slice.into()).await
+    }
+
+    async fn prefetch_open_inner(file_slice: FileSlice) -> io::Result<()> {
+        let (file_slice_without_sstable_len, footer_slice) = file_slice
+            .split_from_end(mem::size_of::<u64>() + 4 + format_version::VERSION_FOOTER_NUM_BYTES);
+        let footer_bytes = footer_slice.read_bytes_async().await?;
+        let sstable_len = u64::deserialize(&mut &footer_bytes[0..8])?;
+        let _num_rows = u32::deserialize(&mut &footer_bytes[8..12])?;
+        let version_footer_bytes: [u8; format_version::VERSION_FOOTER_NUM_BYTES] =
+            footer_bytes[12..].try_into().unwrap();
+        let _version = format_version::parse_footer(version_footer_bytes)?;
+        let (_column_data, sstable) =
+            file_slice_without_sstable_len.split_from_end(sstable_len as usize);
+        Dictionary::<RangeSSTable>::prefetch_open(sstable).await?;
+        Ok(())
+    }
+
     pub fn num_rows(&self) -> RowId {
         self.num_rows
     }

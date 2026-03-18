@@ -1,5 +1,4 @@
 use std::io;
-
 use common::{BinarySerializable, FixedSize, HasLen};
 
 use super::{Decompressor, DOC_STORE_VERSION};

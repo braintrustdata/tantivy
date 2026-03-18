@@ -11,7 +11,8 @@ impl<'a, T: Copy> Iterable<T> for &'a [T] {
 }
 
 impl<T: Copy> Iterable<T> for Range<T>
-where Range<T>: Iterator<Item = T>
+where
+    Range<T>: Iterator<Item = T>,
 {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = T> + '_> {
         Box::new(self.clone())

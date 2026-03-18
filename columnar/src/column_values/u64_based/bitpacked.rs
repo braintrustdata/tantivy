@@ -104,7 +104,9 @@ impl ColumnValues for BitpackedReader {
         while run_start_idx < indexes.len() {
             let run_doc_start = indexes[run_start_idx];
             let mut run_end_idx = run_start_idx + 1;
-            while run_end_idx < indexes.len() && indexes[run_end_idx] == indexes[run_end_idx - 1] + 1 {
+            while run_end_idx < indexes.len()
+                && indexes[run_end_idx] == indexes[run_end_idx - 1] + 1
+            {
                 run_end_idx += 1;
             }
 
@@ -116,7 +118,8 @@ impl ColumnValues for BitpackedReader {
                     &self.data,
                     &mut scratch[..chunk_len],
                 );
-                for (out, compact) in output[run_start_idx + decoded..run_start_idx + decoded + chunk_len]
+                for (out, compact) in output
+                    [run_start_idx + decoded..run_start_idx + decoded + chunk_len]
                     .iter_mut()
                     .zip(scratch[..chunk_len].iter().copied())
                 {
@@ -140,7 +143,10 @@ impl ColumnValues for BitpackedReader {
         if self.stats.min_value > 0 {
             return Some(indexes.len() as u64);
         }
-        if self.stats.gcd.get() != 1 || self.stats.max_value > 1 || self.bit_unpacker.bit_width() != 1 {
+        if self.stats.gcd.get() != 1
+            || self.stats.max_value > 1
+            || self.bit_unpacker.bit_width() != 1
+        {
             return None;
         }
 
@@ -180,7 +186,10 @@ impl ColumnValues for BitpackedReader {
         if self.stats.min_value > 0 {
             return Some(len as u64);
         }
-        if self.stats.gcd.get() != 1 || self.stats.max_value > 1 || self.bit_unpacker.bit_width() != 1 {
+        if self.stats.gcd.get() != 1
+            || self.stats.max_value > 1
+            || self.bit_unpacker.bit_width() != 1
+        {
             return None;
         }
 

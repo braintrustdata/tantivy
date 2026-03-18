@@ -1406,23 +1406,27 @@ mod tests {
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         let segment_size = segment_reader.num_docs() as usize;
-        
+
         // Verify segment has 2 documents
         assert_eq!(segment_size, 2);
 
         // Create collector and get segment collector to check buffer capacity
         let collector = TopDocs::with_limit(100);
         let segment_collector = collector.for_segment(0, segment_reader)?;
-        
+
         // Buffer capacity should be 2 * capped_limit = 2 * 2 = 4
         // If it wasn't capped, it would be 2 * 100 = 200
         let buffer_capacity = segment_collector.buffer_capacity();
-        assert_eq!(buffer_capacity, 4, "Buffer should be capped to 2 * segment_size (4), but got {}", buffer_capacity);
+        assert_eq!(
+            buffer_capacity, 4,
+            "Buffer should be capped to 2 * segment_size (4), but got {}",
+            buffer_capacity
+        );
 
         // Also verify it works correctly when searching
         // Use AllQuery to match all documents in the segment
-        let top_docs: Vec<(Score, DocAddress)> = searcher
-            .search(&AllQuery, &TopDocs::with_limit(100))?;
+        let top_docs: Vec<(Score, DocAddress)> =
+            searcher.search(&AllQuery, &TopDocs::with_limit(100))?;
 
         // Should only return 2 documents (capped by segment size)
         assert_eq!(top_docs.len(), 2);
@@ -1446,24 +1450,28 @@ mod tests {
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         let segment_size = segment_reader.num_docs() as usize;
-        
+
         // Verify segment has 3 documents
         assert_eq!(segment_size, 3);
 
         // Create collector with offset and get segment collector to check buffer capacity
         let collector = TopDocs::with_limit(100).and_offset(1);
         let segment_collector = collector.for_segment(0, segment_reader)?;
-        
+
         // Requested limit is 100 + 1 = 101, but should be capped to segment_size (3)
         // Buffer capacity should be 2 * capped_limit = 2 * 3 = 6
         // If it wasn't capped, it would be 2 * 101 = 202
         let buffer_capacity = segment_collector.buffer_capacity();
-        assert_eq!(buffer_capacity, 6, "Buffer should be capped to 2 * segment_size (6), but got {}", buffer_capacity);
+        assert_eq!(
+            buffer_capacity, 6,
+            "Buffer should be capped to 2 * segment_size (6), but got {}",
+            buffer_capacity
+        );
 
         // Also verify it works correctly when searching
         // Use AllQuery to match all documents in the segment
-        let top_docs: Vec<(Score, DocAddress)> = searcher
-            .search(&AllQuery, &TopDocs::with_limit(100).and_offset(1))?;
+        let top_docs: Vec<(Score, DocAddress)> =
+            searcher.search(&AllQuery, &TopDocs::with_limit(100).and_offset(1))?;
 
         // Should only return 2 documents (3 total - 1 offset, capped by segment size)
         assert_eq!(top_docs.len(), 2);

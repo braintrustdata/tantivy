@@ -196,6 +196,15 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Self::open_with_strategy(term_dictionary_file, strategy)
     }
 
+    pub async fn prefetch_open(term_dictionary_file: FileSlice) -> io::Result<()> {
+        let strategy = if env::var_os("TANTIVY_SSTABLE_INDEX_LAZY").is_some() {
+            DictionaryIndexLoadStrategy::Lazy
+        } else {
+            DictionaryIndexLoadStrategy::Eager
+        };
+        Self::prefetch_open_with_strategy(term_dictionary_file, strategy).await
+    }
+
     pub fn open_with_strategy(
         term_dictionary_file: FileSlice,
         strategy: DictionaryIndexLoadStrategy,
@@ -272,6 +281,49 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             num_terms,
             phantom_data: PhantomData,
         })
+    }
+
+    pub async fn prefetch_open_with_strategy(
+        term_dictionary_file: FileSlice,
+        strategy: DictionaryIndexLoadStrategy,
+    ) -> io::Result<()> {
+        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
+        let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes_async().await?;
+        let index_offset = u64::deserialize(&mut footer_len_bytes)?;
+        let _num_terms = u64::deserialize(&mut footer_len_bytes)?;
+        let version = u32::deserialize(&mut footer_len_bytes)?;
+        let (_sstable_slice, index_slice) = main_slice.split(index_offset as usize);
+
+        match version {
+            2 => {
+                let _sstable_index_bytes = index_slice.read_bytes_async().await?;
+            }
+            3 => {
+                if index_slice.len() < 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SSTable corruption",
+                    ));
+                }
+
+                let footer_offset = index_slice.len() - 8;
+                let mut footerv3_len_bytes = index_slice
+                    .read_bytes_slice_async(footer_offset..index_slice.len())
+                    .await?;
+                let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
+                if store_offset != 0 && strategy != DictionaryIndexLoadStrategy::Lazy {
+                    let _sstable_index_bytes = index_slice.read_bytes_async().await?;
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Unsuported sstable version, expected one of [2, 3], found {version}"),
+                ))
+            }
+        }
+
+        Ok(())
     }
 
     /// Creates a term dictionary from the supplied bytes.

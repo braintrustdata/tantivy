@@ -144,6 +144,27 @@ impl CompositeFile {
         })
     }
 
+    /// Prefetches the footer bytes required to synchronously open a [`CompositeFile`].
+    pub async fn prefetch_open(data: &FileSlice) -> io::Result<()> {
+        let end = data.len();
+        if end < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Composite file is smaller than its footer length trailer.",
+            ));
+        }
+        let footer_len_data = data.slice_from(end - 4).read_bytes_async().await?;
+        let footer_len = u32::deserialize(&mut footer_len_data.as_slice())? as usize;
+        let footer_start = end
+            .checked_sub(4 + footer_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Composite footer is corrupt"))?;
+        let _footer_data = data
+            .slice(footer_start..footer_start + footer_len)
+            .read_bytes_async()
+            .await?;
+        Ok(())
+    }
+
     /// Returns a composite file that stores
     /// no fields.
     pub fn empty() -> CompositeFile {

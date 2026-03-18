@@ -862,7 +862,9 @@ impl IndexMerger {
             }
         }
 
-        use crate::vector::format::{PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+        use crate::vector::format::{
+            PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
+        };
 
         // Write V2 header
         wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
