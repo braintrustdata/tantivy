@@ -1,15 +1,14 @@
 use std::io;
-use std::io::Read;
 use std::iter::Sum;
 use std::num::NonZeroUsize;
 use std::ops::{AddAssign, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{BinarySerializable, FixedSize, HasLen, OwnedBytes};
+use common::{BinarySerializable, OwnedBytes};
 use lru::LruCache;
 
-use super::{footer::DocStoreFooter, DOC_STORE_VERSION};
+use super::footer::DocStoreFooter;
 use super::index::SkipIndex;
 use super::Decompressor;
 use crate::directory::FileSlice;
@@ -138,39 +137,6 @@ impl StoreReader {
             skip_index: Arc::new(skip_index),
             space_usage,
         })
-    }
-
-    pub async fn prefetch_open(store_file: FileSlice) -> io::Result<()> {
-        if store_file.len() < DocStoreFooter::SIZE_IN_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "File corrupted. The file is smaller than Footer::SIZE_IN_BYTES (len={}).",
-                    store_file.len()
-                ),
-            ));
-        }
-        let (data_and_offset, footer_slice) = store_file.split_from_end(DocStoreFooter::SIZE_IN_BYTES);
-        let mut footer_bytes = footer_slice.read_bytes_async().await?;
-        let doc_store_version = u32::deserialize(&mut footer_bytes)?;
-        if doc_store_version != DOC_STORE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Unexpected doc store version while prefetching footer: actual={}, expected={}",
-                    doc_store_version,
-                    DOC_STORE_VERSION
-                ),
-            ));
-        }
-        let offset = u64::deserialize(&mut footer_bytes)?;
-        let compressor_id = u8::deserialize(&mut footer_bytes)?;
-        let mut skip_buf = [0; 15];
-        footer_bytes.read_exact(&mut skip_buf)?;
-        let footer = DocStoreFooter::new(offset, Decompressor::from_id(compressor_id));
-        let (_data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
-        let _index_data = offset_index_file.read_bytes_async().await?;
-        Ok(())
     }
 
     pub(crate) fn block_checkpoints(&self) -> impl Iterator<Item = Checkpoint> + '_ {
