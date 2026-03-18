@@ -737,9 +737,7 @@ fn send_to_serialize_column_mappable_to_u64(
 fn coerce_numerical_symbol<T>(
     operation_iterator: impl Iterator<Item = ColumnOperation<NumericalValue>>,
 ) -> impl Iterator<Item = ColumnOperation<u64>>
-where
-    T: Coerce + MonotonicallyMappableToU64,
-{
+where T: Coerce + MonotonicallyMappableToU64 {
     operation_iterator.map(|symbol| match symbol {
         ColumnOperation::NewDoc(doc) => ColumnOperation::NewDoc(doc),
         ColumnOperation::Value(numerical_value) => {

@@ -61,18 +61,12 @@ impl VectorColumn {
     ) -> impl Iterator<Item = (DocId, Cow<'a, [f32]>)> + 'a {
         let bytes_per_vec = self.dimensions as usize * encoding.bytes_per_dim();
 
-        self.presence
-            .iter_ones()
-            .enumerate()
-            .map(move |(idx, doc_id)| {
-                let start = idx * bytes_per_vec;
-                let end = start + bytes_per_vec;
-                let bytes = &self.data[start..end];
-                (
-                    doc_id,
-                    decode_vector(bytes, encoding, self.quant_params.as_ref()),
-                )
-            })
+        self.presence.iter_ones().enumerate().map(move |(idx, doc_id)| {
+            let start = idx * bytes_per_vec;
+            let end = start + bytes_per_vec;
+            let bytes = &self.data[start..end];
+            (doc_id, decode_vector(bytes, encoding, self.quant_params.as_ref()))
+        })
     }
 
     /// Number of vectors in this column.
@@ -107,10 +101,7 @@ impl VectorReader {
         if magic != VECTOR_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid vector file magic: expected {:x}, got {:x}",
-                    VECTOR_MAGIC, magic
-                ),
+                format!("Invalid vector file magic: expected {:x}, got {:x}", VECTOR_MAGIC, magic),
             ));
         }
 

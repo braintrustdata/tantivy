@@ -79,8 +79,7 @@ pub(crate) struct TopCollector<T> {
 }
 
 impl<T> TopCollector<T>
-where
-    T: PartialOrd + Clone,
+where T: PartialOrd + Clone
 {
     /// Creates a top collector, with a number of documents equal to "limit".
     ///
@@ -339,26 +338,21 @@ mod tests {
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         let segment_size = segment_reader.num_docs() as usize;
-
+        
         // Verify segment has 2 documents
         assert_eq!(segment_size, 2);
 
         // Create a TopCollector requesting more than segment size
         let collector: TopCollector<crate::Score> = TopCollector::with_limit(100);
-
+        
         // Get the segment collector - it should be capped to segment_size
-        let segment_collector: TopSegmentCollector<crate::Score> =
-            collector.for_segment(0, segment_reader);
-
+        let segment_collector: TopSegmentCollector<crate::Score> = collector.for_segment(0, segment_reader);
+        
         // The internal TopNComputer should have been created with capped size (2)
         // Buffer capacity should be 2 * capped_limit = 2 * 2 = 4
         // If it wasn't capped, it would be 2 * 100 = 200
         let buffer_capacity = segment_collector.buffer_capacity();
-        assert_eq!(
-            buffer_capacity, 4,
-            "Buffer should be capped to 2 * segment_size (4), but got {}",
-            buffer_capacity
-        );
+        assert_eq!(buffer_capacity, 4, "Buffer should be capped to 2 * segment_size (4), but got {}", buffer_capacity);
         Ok(())
     }
 }

@@ -162,8 +162,7 @@ where
 }
 
 impl<'a, TSSTable> Streamer<'a, TSSTable, AlwaysMatch>
-where
-    TSSTable: SSTable,
+where TSSTable: SSTable
 {
     pub fn empty() -> Self {
         Streamer {

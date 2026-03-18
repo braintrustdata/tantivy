@@ -181,8 +181,7 @@ impl LazyFstMap {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "FST corruption"));
         }
 
-        let mut root_addr_bytes =
-            fst_slice.read_bytes_slice(fst_slice.len() - 8..fst_slice.len())?;
+        let mut root_addr_bytes = fst_slice.read_bytes_slice(fst_slice.len() - 8..fst_slice.len())?;
         let root_addr = u64::deserialize(&mut root_addr_bytes)? as usize;
         if root_addr != 0 && root_addr + 17 != fst_slice.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "FST corruption"));
@@ -230,11 +229,7 @@ impl LazyFstMap {
                     next_transition,
                     out,
                 });
-                return self.first_key_in_subtree(
-                    self.read_node(transition.addr)?,
-                    out + transition.out,
-                    stack,
-                );
+                return self.first_key_in_subtree(self.read_node(transition.addr)?, out + transition.out, stack);
             }
 
             return self.resume_from_backtrack(stack);
@@ -290,11 +285,7 @@ impl LazyFstMap {
                 next_transition,
                 out: state.out,
             });
-            return self.first_key_in_subtree(
-                self.read_node(transition.addr)?,
-                state.out + transition.out,
-                stack,
-            );
+            return self.first_key_in_subtree(self.read_node(transition.addr)?, state.out + transition.out, stack);
         }
 
         Ok(None)
@@ -373,10 +364,7 @@ impl LazyFstTailPrefetch {
         if range.start < self.start || range.end > self.start + self.bytes.len() {
             return None;
         }
-        Some(
-            self.bytes
-                .slice(range.start - self.start..range.end - self.start),
-        )
+        Some(self.bytes.slice(range.start - self.start..range.end - self.start))
     }
 }
 
@@ -431,11 +419,7 @@ impl LazyFstWindowCache {
     }
 
     fn touch(&mut self, window_start: usize) {
-        if let Some(position) = self
-            .order
-            .iter()
-            .position(|&existing| existing == window_start)
-        {
+        if let Some(position) = self.order.iter().position(|&existing| existing == window_start) {
             self.order.remove(position);
         }
         self.order.push_back(window_start);
@@ -571,8 +555,12 @@ impl LazyNode {
             } => {
                 assert!(index < ntrans);
                 let local_last = self.bytes.len() - 1;
-                let input_offset =
-                    local_last - ntrans_len - 1 - self.transition_index_len() - index - 1;
+                let input_offset = local_last
+                    - ntrans_len
+                    - 1
+                    - self.transition_index_len()
+                    - index
+                    - 1;
                 let transition_offset = local_last
                     - ntrans_len
                     - 1
@@ -787,10 +775,11 @@ fn decode_common_input(index: u8) -> Option<u8> {
 }
 
 const COMMON_INPUTS_INV: [u8; 63] = [
-    b't', b'e', b'/', b'o', b'a', b's', b'r', b'i', b'p', b'c', b'n', b'w', b'.', b'h', b'l', b'm',
-    b'-', b'd', b'u', b'0', b'1', b'2', b'g', b'=', b':', b'b', b'f', b'3', b'y', b'5', b'&', b'_',
-    b'4', b'v', b'9', b'6', b'7', b'8', b'k', b'%', b'?', b'x', b'C', b'D', b'A', b'S', b'F', b'I',
-    b'B', b'E', b'j', b'P', b'T', b'z', b'R', b'N', b'M', b'+', b'L', b'O', b'q', b'H', b'G',
+    b't', b'e', b'/', b'o', b'a', b's', b'r', b'i', b'p', b'c', b'n', b'w', b'.', b'h', b'l',
+    b'm', b'-', b'd', b'u', b'0', b'1', b'2', b'g', b'=', b':', b'b', b'f', b'3', b'y', b'5',
+    b'&', b'_', b'4', b'v', b'9', b'6', b'7', b'8', b'k', b'%', b'?', b'x', b'C', b'D', b'A',
+    b'S', b'F', b'I', b'B', b'E', b'j', b'P', b'T', b'z', b'R', b'N', b'M', b'+', b'L', b'O',
+    b'q', b'H', b'G',
 ];
 
 #[derive(Debug, Clone)]
@@ -1285,7 +1274,10 @@ impl BlockAddrStore {
         let addr_bytes = self
             .read_addr_bytes(block_addr_block_data.offset as usize, required_len)
             .unwrap();
-        let (inner_offset, block_addr) = block_addr_block_data.bisect_for_ord(&addr_bytes, ord);
+        let (inner_offset, block_addr) = block_addr_block_data.bisect_for_ord(
+            &addr_bytes,
+            ord,
+        );
         (
             store_block_id * STORE_BLOCK_LEN as u64 + inner_offset,
             block_addr,

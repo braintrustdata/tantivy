@@ -172,6 +172,7 @@ impl SegmentReader {
     ) -> crate::Result<SegmentReader> {
         let termdict_file = segment.open_read(SegmentComponent::Terms)?;
         let termdict_composite = CompositeFile::open(&termdict_file)?;
+
         let store_file = segment.open_read(SegmentComponent::Store)?;
 
         crate::fail_point!("SegmentReader::open#middle");
@@ -181,8 +182,7 @@ impl SegmentReader {
 
         let positions_composite = {
             if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
-                let positions_composite = CompositeFile::open(&positions_file)?;
-                positions_composite
+                CompositeFile::open(&positions_file)?
             } else {
                 CompositeFile::empty()
             }
@@ -192,7 +192,6 @@ impl SegmentReader {
 
         let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
         let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
-
         let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
         let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
 
@@ -219,7 +218,7 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        let reader = SegmentReader {
+        Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -234,8 +233,7 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
-        };
-        Ok(reader)
+        })
     }
 
     /// Open a new segment for reading.
@@ -494,7 +492,9 @@ impl SegmentReader {
     pub fn vector_reader(&self, _field: Field) -> io::Result<Option<VectorReader>> {
         match self.vector_file_opt.as_ref() {
             None => Ok(None),
-            Some(file_slice) => Ok(Some(VectorReader::open(file_slice.read_bytes()?)?)),
+            Some(file_slice) => {
+                Ok(Some(VectorReader::open(file_slice.read_bytes()?)?))
+            }
         }
     }
 
