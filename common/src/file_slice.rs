@@ -31,6 +31,16 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
             "Async read is not supported.",
         ))
     }
+
+    #[doc(hidden)]
+    async fn prefetch_sync_read_range(
+        &self,
+        byte_range: Range<usize>,
+        _logical_len: usize,
+    ) -> io::Result<()> {
+        let _ = self.read_bytes_async(byte_range).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -228,6 +238,27 @@ impl FileSlice {
         self.data.read_bytes_async(self.range.clone()).await
     }
 
+    #[doc(hidden)]
+    pub async fn prefetch_sync_read_range(&self, byte_range: Range<usize>) -> io::Result<()> {
+        assert!(
+            byte_range.end <= self.len(),
+            "end of requested range exceeds the fileslice length ({} > {})",
+            byte_range.end,
+            self.len()
+        );
+        self.data
+            .prefetch_sync_read_range(
+                self.range.start + byte_range.start..self.range.start + byte_range.end,
+                self.data.len(),
+            )
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn prefetch_sync_read_all(&self) -> io::Result<()> {
+        self.prefetch_sync_read_range(0..self.len()).await
+    }
+
     /// Reads a specific slice of data.
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
@@ -312,6 +343,14 @@ impl FileHandle for FileSlice {
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice_async(byte_range).await
+    }
+
+    async fn prefetch_sync_read_range(
+        &self,
+        byte_range: Range<usize>,
+        _logical_len: usize,
+    ) -> io::Result<()> {
+        self.prefetch_sync_read_range(byte_range).await
     }
 }
 

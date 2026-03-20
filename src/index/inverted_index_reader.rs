@@ -1,6 +1,7 @@
 use std::io;
+use std::ops::Range;
 
-use common::BinarySerializable;
+use common::{BinarySerializable, HasLen};
 use fnv::FnvHashSet;
 
 use crate::directory::FileSlice;
@@ -225,6 +226,25 @@ impl InvertedIndexReader {
 
 #[cfg(feature = "quickwit")]
 impl InvertedIndexReader {
+    fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+        if ranges.is_empty() {
+            return ranges;
+        }
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut merged_ranges = Vec::with_capacity(ranges.len());
+        let mut current_range = ranges[0].clone();
+        for range in ranges.into_iter().skip(1) {
+            if range.start <= current_range.end {
+                current_range.end = current_range.end.max(range.end);
+            } else {
+                merged_ranges.push(current_range);
+                current_range = range;
+            }
+        }
+        merged_ranges.push(current_range);
+        merged_ranges
+    }
+
     pub(crate) async fn get_term_info_async(&self, term: &Term) -> io::Result<Option<TermInfo>> {
         self.termdict.get_async(term.serialized_value_bytes()).await
     }
@@ -286,6 +306,49 @@ impl InvertedIndexReader {
         } else {
             Ok(false)
         }
+    }
+
+    #[doc(hidden)]
+    pub async fn prefetch_exact_terms_sync_read_pages(
+        &self,
+        terms: &[(Term, bool)],
+    ) -> io::Result<()> {
+        let mut postings_ranges = Vec::with_capacity(terms.len());
+        let mut positions_ranges = Vec::with_capacity(terms.len());
+
+        for (term, needs_positions) in terms {
+            let key = term.serialized_value_bytes();
+            let term_dict_slice = self.termdict.file_slice_for_range(
+                (
+                    std::ops::Bound::Included(key),
+                    std::ops::Bound::Included(key),
+                ),
+                Some(1),
+            );
+            if term_dict_slice.len() > 0 {
+                term_dict_slice.prefetch_sync_read_all().await?;
+            }
+
+            if let Some(term_info) = self.get_term_info(term)? {
+                postings_ranges.push(term_info.postings_range);
+                if *needs_positions {
+                    positions_ranges.push(term_info.positions_range);
+                }
+            }
+        }
+
+        for postings_range in Self::merge_ranges(postings_ranges) {
+            self.postings_file_slice
+                .prefetch_sync_read_range(postings_range)
+                .await?;
+        }
+        for positions_range in Self::merge_ranges(positions_ranges) {
+            self.positions_file_slice
+                .prefetch_sync_read_range(positions_range)
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Warmup a block postings given a range of `Term`s.

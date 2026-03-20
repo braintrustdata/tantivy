@@ -52,6 +52,11 @@ impl FastFieldRangeWeight {
             column_type_opt: Some(T::column_type()),
         }
     }
+
+    #[doc(hidden)]
+    pub fn field_name(&self) -> &str {
+        &self.field
+    }
 }
 
 impl Query for FastFieldRangeWeight {
