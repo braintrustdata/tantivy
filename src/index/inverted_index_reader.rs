@@ -351,6 +351,73 @@ impl InvertedIndexReader {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub async fn prefetch_exact_terms_sync_read_pages_from_files(
+        termdict_file: FileSlice,
+        postings_file: FileSlice,
+        positions_file_opt: Option<FileSlice>,
+        terms: &[(Term, bool)],
+    ) -> io::Result<()> {
+        let termdict = TermDictionary::open_async(termdict_file).await?;
+        let (_, postings_body) = postings_file.split(8);
+        let mut postings_ranges = Vec::with_capacity(terms.len());
+        let mut positions_ranges = Vec::with_capacity(terms.len());
+
+        for (term, needs_positions) in terms {
+            let key = term.serialized_value_bytes();
+            let term_dict_slice = termdict.file_slice_for_range(
+                (
+                    std::ops::Bound::Included(key),
+                    std::ops::Bound::Included(key),
+                ),
+                Some(1),
+            );
+            if term_dict_slice.len() > 0 {
+                term_dict_slice.prefetch_sync_read_all().await?;
+            }
+
+            if let Some(term_info) = termdict.get_async(key).await? {
+                postings_ranges.push(term_info.postings_range);
+                if *needs_positions && positions_file_opt.is_some() {
+                    positions_ranges.push(term_info.positions_range);
+                }
+            }
+        }
+
+        for postings_range in Self::merge_ranges(postings_ranges) {
+            postings_body
+                .prefetch_sync_read_range(postings_range)
+                .await?;
+        }
+        if let Some(positions_file) = positions_file_opt {
+            for positions_range in Self::merge_ranges(positions_ranges) {
+                positions_file
+                    .prefetch_sync_read_range(positions_range)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn prefetch_full_text_sync_read_pages_from_files(
+        termdict_file: FileSlice,
+        postings_file: FileSlice,
+        positions_file_opt: Option<FileSlice>,
+        with_positions: bool,
+    ) -> io::Result<()> {
+        TermDictionary::prefetch_open(termdict_file.clone()).await?;
+        termdict_file.prefetch_sync_read_all().await?;
+        postings_file.prefetch_sync_read_all().await?;
+        if with_positions {
+            if let Some(positions_file) = positions_file_opt {
+                positions_file.prefetch_sync_read_all().await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Warmup a block postings given a range of `Term`s.
     /// This method is for an advanced usage only.
     ///

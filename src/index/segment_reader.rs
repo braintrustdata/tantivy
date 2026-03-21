@@ -53,6 +53,13 @@ pub struct SegmentReader {
     schema: Schema,
 }
 
+#[derive(Clone)]
+pub struct InvertedIndexFileSlices {
+    pub termdict_file: FileSlice,
+    pub postings_file: FileSlice,
+    pub positions_file_opt: Option<FileSlice>,
+}
+
 impl SegmentReader {
     /// Returns the highest document id ever attributed in
     /// this segment + 1.
@@ -327,6 +334,40 @@ impl SegmentReader {
             .insert(field, Arc::clone(&inv_idx_reader));
 
         Ok(inv_idx_reader)
+    }
+
+    pub fn inverted_index_file_slices(
+        &self,
+        field: Field,
+    ) -> crate::Result<Option<InvertedIndexFileSlices>> {
+        let field_entry = self.schema.get_field_entry(field);
+        let field_type = field_entry.field_type();
+        let record_option_opt = field_type.get_index_record_option();
+
+        if record_option_opt.is_none() {
+            warn!("Field {:?} does not seem indexed.", field_entry.name());
+        }
+
+        let postings_file_opt = self.postings_composite.open_read(field);
+        if postings_file_opt.is_none() || record_option_opt.is_none() {
+            return Ok(None);
+        }
+
+        let termdict_file = self.termdict_composite.open_read(field).ok_or_else(|| {
+            DataCorruption::comment_only(format!(
+                "Failed to open field {:?}'s term dictionary in the composite file. Has the \
+                 schema been modified?",
+                field_entry.name()
+            ))
+        })?;
+
+        let positions_file_opt = self.positions_composite.open_read(field);
+
+        Ok(Some(InvertedIndexFileSlices {
+            termdict_file,
+            postings_file: postings_file_opt.unwrap(),
+            positions_file_opt,
+        }))
     }
 
     pub fn inverted_index_uncached_lazy(

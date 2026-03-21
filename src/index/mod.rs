@@ -19,4 +19,4 @@ pub use self::inverted_index_reader::InvertedIndexReader;
 pub use self::segment::Segment;
 pub use self::segment_component::SegmentComponent;
 pub use self::segment_id::SegmentId;
-pub use self::segment_reader::{FieldMetadata, SegmentReader};
+pub use self::segment_reader::{FieldMetadata, InvertedIndexFileSlices, SegmentReader};

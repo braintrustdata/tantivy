@@ -84,6 +84,30 @@ impl TermDictionary {
         InnerTermDict::open(main_slice).map(TermDictionary)
     }
 
+    #[cfg(feature = "quickwit")]
+    pub async fn open_async(file: FileSlice) -> io::Result<Self> {
+        let (main_slice, dict_type) = file.split_from_end(4);
+        let mut dict_type = dict_type.read_bytes_async().await?;
+        let dict_type = u32::deserialize(&mut dict_type)?;
+
+        if dict_type != CURRENT_TYPE as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Unsuported dictionary type, expected {}, found {dict_type}",
+                    CURRENT_TYPE as u32,
+                ),
+            ));
+        }
+
+        InnerTermDict::open_async(main_slice).await.map(TermDictionary)
+    }
+
+    #[cfg(not(feature = "quickwit"))]
+    pub async fn open_async(file: FileSlice) -> io::Result<Self> {
+        Self::open(file)
+    }
+
     /// Opens a `TermDictionary` while forcing the lazy SSTable index path when available.
     #[cfg(feature = "quickwit")]
     pub fn open_lazy(file: FileSlice) -> io::Result<Self> {
@@ -180,6 +204,12 @@ impl TermDictionary {
     #[doc(hidden)]
     pub async fn warm_up_dictionary(&self) -> io::Result<()> {
         self.0.warm_up_dictionary().await
+    }
+
+    #[cfg(feature = "quickwit")]
+    #[doc(hidden)]
+    pub async fn prefetch_open(file: FileSlice) -> io::Result<()> {
+        InnerTermDict::prefetch_open(file).await
     }
 
     #[cfg(feature = "quickwit")]
