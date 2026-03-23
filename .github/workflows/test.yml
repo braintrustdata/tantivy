@@ -20,22 +20,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Install nightly
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
       with:
             toolchain: nightly
             profile: minimal
             components: rustfmt
     - name: Install stable
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
       with:
             toolchain: stable
             profile: minimal
             components: clippy
 
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Check Formatting
       run: cargo +nightly fmt --all -- --check
@@ -47,7 +47,7 @@ jobs:
     - name: Check Bench Compilation
       run: cargo +nightly bench --no-run --profile=dev --all-features
 
-    - uses: actions-rs/clippy-check@v1
+    - uses: actions-rs/clippy-check@b5b5f21f4797c02da247df37026fcd0a5024aa4d # v1.0.7
       with:
         toolchain: stable
         token: ${{ secrets.GITHUB_TOKEN }}
@@ -67,17 +67,17 @@ jobs:
     name: test-${{ matrix.features.label}}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
     - name: Install stable
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
       with:
             toolchain: stable
             profile: minimal
             override: true
 
     - uses: taiki-e/install-action@nextest
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
     - name: Run tests
       run: cargo +stable nextest run --features ${{ matrix.features.flags }} --verbose --workspace
