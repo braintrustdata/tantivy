@@ -90,22 +90,43 @@ fn merge(
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
 ) -> crate::Result<Option<SegmentEntry>> {
-    let num_docs = segment_entries
+    let input_num_segments = segment_entries.len();
+    let input_num_docs = segment_entries
         .iter()
         .map(|segment| segment.meta().num_docs() as u64)
         .sum::<u64>();
-    if num_docs == 0 {
+    if input_num_docs == 0 {
         return Ok(None);
     }
+    let input_max_doc = segment_entries
+        .iter()
+        .map(|segment| segment.meta().max_doc() as u64)
+        .sum::<u64>();
+    let input_deleted_docs = segment_entries
+        .iter()
+        .map(|segment| segment.meta().num_deleted_docs() as u64)
+        .sum::<u64>();
+    let merge_span = tracing::info_span!(
+        "merge",
+        num_input_segments = input_num_segments,
+        input_num_docs = input_num_docs,
+        input_max_doc = input_max_doc,
+        input_deleted_docs = input_deleted_docs,
+        target_opstamp = target_opstamp
+    );
+    let _enter = merge_span.enter();
 
     // first we need to apply deletes to our segment.
     let merged_segment = index.new_segment();
 
     // First we apply all of the delete to the merged segment, up to the target opstamp.
-    for segment_entry in &mut segment_entries {
-        let segment = index.segment(segment_entry.meta().clone());
-        advance_deletes(segment, segment_entry, target_opstamp)?;
-    }
+    tracing::info_span!("apply_deletes").in_scope(|| -> crate::Result<()> {
+        for segment_entry in &mut segment_entries {
+            let segment = index.segment(segment_entry.meta().clone());
+            advance_deletes(segment, segment_entry, target_opstamp)?;
+        }
+        Ok(())
+    })?;
 
     let delete_cursor = segment_entries[0].delete_cursor().clone();
 
@@ -115,13 +136,15 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger =
-        IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
+    let merger: IndexMerger = tracing::info_span!("open_index_merger")
+        .in_scope(|| IndexMerger::open(index.schema(), index.settings().clone(), &segments[..]))?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone(), true)?;
+    let segment_serializer = tracing::info_span!("open_segment_serializer")
+        .in_scope(|| SegmentSerializer::for_segment(merged_segment.clone(), true))?;
 
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = tracing::info_span!("write_merged_segment")
+        .in_scope(|| merger.write(segment_serializer))?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -511,7 +534,11 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
-        let span = tracing::span!(tracing::Level::INFO, "merge_thread");
+        let span = tracing::info_span!(
+            "merge_thread",
+            num_input_segments = segment_entries.len(),
+            target_opstamp = merge_operation.target_opstamp()
+        );
 
         self.merge_thread_pool.spawn(move || {
             let _enter = span.enter();
