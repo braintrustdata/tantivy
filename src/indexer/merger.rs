@@ -10,7 +10,7 @@ use measure_time::debug_time;
 
 use common::TerminatingWrite;
 
-use crate::directory::{Directory, WritePtr};
+use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
@@ -81,6 +81,36 @@ fn estimate_total_num_tokens(readers: &[SegmentReader], field: Field) -> crate::
         total_num_tokens += estimate_total_num_tokens_in_single_segment(reader, field)?;
     }
     Ok(total_num_tokens)
+}
+
+#[derive(Default)]
+struct MergeInputSpaceUsage {
+    total_bytes: u64,
+    termdict_bytes: u64,
+    postings_bytes: u64,
+    positions_bytes: u64,
+    fast_fields_bytes: u64,
+    fieldnorms_bytes: u64,
+    store_bytes: u64,
+    deletes_bytes: u64,
+}
+
+impl MergeInputSpaceUsage {
+    fn from_readers(readers: &[SegmentReader]) -> crate::Result<Self> {
+        let mut usage = Self::default();
+        for reader in readers {
+            let segment_usage = reader.space_usage()?;
+            usage.total_bytes += segment_usage.total().get_bytes();
+            usage.termdict_bytes += segment_usage.termdict().total().get_bytes();
+            usage.postings_bytes += segment_usage.postings().total().get_bytes();
+            usage.positions_bytes += segment_usage.positions().total().get_bytes();
+            usage.fast_fields_bytes += segment_usage.fast_fields().total().get_bytes();
+            usage.fieldnorms_bytes += segment_usage.fieldnorms().total().get_bytes();
+            usage.store_bytes += segment_usage.store().total().get_bytes();
+            usage.deletes_bytes += segment_usage.deletes().get_bytes();
+        }
+        Ok(usage)
+    }
 }
 
 pub struct IndexMerger {
@@ -281,7 +311,15 @@ impl IndexMerger {
         doc_id_mapping: SegmentDocIdMapping,
     ) -> crate::Result<()> {
         debug_time!("write-fast-fields");
+        let fast_fields_span = tracing::info_span!(
+            "write_fast_fields",
+            num_readers = self.readers.len(),
+            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
+            num_fast_fields = tracing::field::Empty
+        );
+        let _enter = fast_fields_span.enter();
         let required_columns = extract_fast_field_required_columns(&self.schema);
+        tracing::Span::current().record("num_fast_fields", required_columns.len());
         let columnars: Vec<&ColumnarReader> = self
             .readers
             .iter()
@@ -511,6 +549,14 @@ impl IndexMerger {
         // Note that the total number of tokens is not exact.
         // It is only used as a parameter in the BM25 formula.
         let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
+        let postings_for_field_span = tracing::info_span!(
+            "write_postings_for_field",
+            field = %self.schema.get_field_name(indexed_field),
+            num_readers = self.readers.len(),
+            total_num_tokens_estimate = total_num_tokens,
+            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial()
+        );
+        let _enter = postings_for_field_span.enter();
 
         // Create the total list of doc ids
         // by stacking the doc ids from the different segment.
@@ -676,6 +722,17 @@ impl IndexMerger {
         fieldnorm_readers: FieldNormReaders,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
+        let num_indexed_fields = self
+            .schema
+            .fields()
+            .filter(|(_, field_entry)| field_entry.is_indexed())
+            .count();
+        let postings_span = tracing::info_span!(
+            "write_postings",
+            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
+            num_indexed_fields = num_indexed_fields
+        );
+        let _enter = postings_span.enter();
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
@@ -698,6 +755,15 @@ impl IndexMerger {
     ) -> crate::Result<()> {
         debug_time!("write-storable-fields");
         debug!("write-storable-field");
+        let store_span = tracing::info_span!(
+            "write_storable_fields",
+            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
+            stacked_segments = tracing::field::Empty,
+            copied_segments = tracing::field::Empty
+        );
+        let _enter = store_span.enter();
+        let mut stacked_segments = 0usize;
+        let mut copied_segments = 0usize;
 
         if !doc_id_mapping.is_trivial() {
             debug!("non-trivial-doc-id-mapping");
@@ -727,6 +793,7 @@ impl IndexMerger {
                     .into());
                 }
             }
+            copied_segments = self.readers.len();
         } else {
             debug!("trivial-doc-id-mapping");
             for reader in &self.readers {
@@ -752,11 +819,15 @@ impl IndexMerger {
                         let doc_bytes = doc_bytes_res?;
                         store_writer.store_bytes(&doc_bytes)?;
                     }
+                    copied_segments += 1;
                 } else {
                     store_writer.stack(store_reader)?;
+                    stacked_segments += 1;
                 }
             }
         }
+        tracing::Span::current().record("stacked_segments", stacked_segments);
+        tracing::Span::current().record("copied_segments", copied_segments);
         Ok(())
     }
 
@@ -766,6 +837,8 @@ impl IndexMerger {
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+        let input_space_usage = MergeInputSpaceUsage::from_readers(&self.readers)?;
+        let has_vector_fields = self.has_vector_fields();
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             // If the documents are already sorted and stackable, we ignore the mapping and execute
@@ -778,15 +851,41 @@ impl IndexMerger {
         } else {
             self.get_doc_id_from_concatenated_data()?
         };
+        let write_span = tracing::info_span!(
+            "index_merger_write",
+            num_readers = self.readers.len(),
+            max_doc = self.max_doc,
+            has_vector_fields = has_vector_fields,
+            sort_by_field = ?self
+                .index_settings
+                .sort_by_field
+                .as_ref()
+                .map(|sort| (&sort.field, sort.order.clone())),
+            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
+            input_total_bytes = input_space_usage.total_bytes,
+            input_termdict_bytes = input_space_usage.termdict_bytes,
+            input_postings_bytes = input_space_usage.postings_bytes,
+            input_positions_bytes = input_space_usage.positions_bytes,
+            input_fast_fields_bytes = input_space_usage.fast_fields_bytes,
+            input_fieldnorms_bytes = input_space_usage.fieldnorms_bytes,
+            input_store_bytes = input_space_usage.store_bytes,
+            input_deletes_bytes = input_space_usage.deletes_bytes
+        );
+        let _enter = write_span.enter();
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
-            self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping)?;
+            tracing::info_span!("write_fieldnorms")
+                .in_scope(|| self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping))?;
         }
         debug!("write-postings");
-        let fieldnorm_data = serializer
-            .segment()
-            .open_read(SegmentComponent::FieldNorms)?;
-        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        let fieldnorm_readers = tracing::info_span!("open_fieldnorm_readers").in_scope(
+            || -> crate::Result<FieldNormReaders> {
+                let fieldnorm_data = serializer
+                    .segment()
+                    .open_read(SegmentComponent::FieldNorms)?;
+                FieldNormReaders::open(fieldnorm_data)
+            },
+        )?;
         self.write_postings(
             serializer.get_postings_serializer(),
             fieldnorm_readers,
@@ -799,16 +898,19 @@ impl IndexMerger {
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping.clone())?;
 
         // Write vectors if there are any vector fields
-        if self.has_vector_fields() {
+        if has_vector_fields {
             debug!("write-vectors");
-            let vector_write = serializer
-                .segment_mut()
-                .open_write(SegmentComponent::Vectors)?;
-            self.write_vectors(vector_write, &doc_id_mapping)?;
+            let vector_write = tracing::info_span!("open_vector_writer").in_scope(|| {
+                serializer
+                    .segment_mut()
+                    .open_write(SegmentComponent::Vectors)
+            })?;
+            tracing::info_span!("write_vectors")
+                .in_scope(|| self.write_vectors(vector_write, &doc_id_mapping))?;
         }
 
         debug!("close-serializer");
-        serializer.close()?;
+        tracing::info_span!("close_serializer").in_scope(|| serializer.close())?;
         Ok(self.max_doc)
     }
 
@@ -862,7 +964,9 @@ impl IndexMerger {
             }
         }
 
-        use crate::vector::format::{PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION};
+        use crate::vector::format::{
+            PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
+        };
 
         // Write V2 header
         wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
