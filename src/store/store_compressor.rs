@@ -176,23 +176,38 @@ impl BlockCompressorImpl {
     fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
         let doc_shift = self.first_doc_in_block;
         let start_shift = self.writer.written_bytes() as usize;
+        let block_data = store_reader.block_data()?;
+        let num_checkpoints = store_reader.block_checkpoints().count();
 
         // just bulk write all of the block of the given reader.
-        self.writer
-            .write_all(store_reader.block_data()?.as_slice())?;
+        tracing::info_span!(
+            "write_stacked_store_data",
+            store_data_bytes = block_data.len(),
+            num_checkpoints = num_checkpoints
+        )
+        .in_scope(|| self.writer.write_all(block_data.as_slice()))?;
         let end_shift = self.writer.written_bytes() as usize;
         tracing::Span::current().record("write_start_offset", start_shift as u64);
         tracing::Span::current().record("write_end_offset", end_shift as u64);
 
         // concatenate the index of the `store_reader`, after translating
         // its start doc id and its start file offset.
-        for mut checkpoint in store_reader.block_checkpoints() {
-            checkpoint.doc_range.start += doc_shift;
-            checkpoint.doc_range.end += doc_shift;
-            checkpoint.byte_range.start += start_shift;
-            checkpoint.byte_range.end += start_shift;
-            self.register_checkpoint(checkpoint);
-        }
+        tracing::info_span!(
+            "rewrite_stacked_store_checkpoints",
+            num_checkpoints = num_checkpoints,
+            doc_shift = doc_shift,
+            byte_shift = start_shift
+        )
+        .in_scope(|| {
+            for mut checkpoint in store_reader.block_checkpoints() {
+                checkpoint.doc_range.start += doc_shift;
+                checkpoint.doc_range.end += doc_shift;
+                checkpoint.byte_range.start += start_shift;
+                checkpoint.byte_range.end += start_shift;
+                self.register_checkpoint(checkpoint);
+            }
+            Ok::<(), io::Error>(())
+        })?;
         Ok(())
     }
 
