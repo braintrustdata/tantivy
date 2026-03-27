@@ -26,6 +26,31 @@ pub struct StoreWriter {
     block_compressor: BlockCompressor,
 }
 
+struct StoreReaderStats {
+    total_store_bytes: u64,
+    data_bytes: u64,
+    offsets_bytes: u64,
+    num_docs: u64,
+    num_blocks: usize,
+}
+
+fn store_reader_stats(store_reader: &StoreReader) -> StoreReaderStats {
+    let space_usage = store_reader.space_usage();
+    let mut num_docs = 0u64;
+    let mut num_blocks = 0usize;
+    for checkpoint in store_reader.block_checkpoints() {
+        num_docs = u64::from(checkpoint.doc_range.end);
+        num_blocks += 1;
+    }
+    StoreReaderStats {
+        total_store_bytes: space_usage.total().get_bytes(),
+        data_bytes: space_usage.data_usage().get_bytes(),
+        offsets_bytes: space_usage.offsets_usage().get_bytes(),
+        num_docs,
+        num_blocks,
+    }
+}
+
 impl StoreWriter {
     /// Create a store writer.
     ///
@@ -74,6 +99,16 @@ impl StoreWriter {
         if self.current_block.is_empty() {
             return Ok(());
         }
+
+        let flush_span = tracing::info_span!(
+            "flush_stored_fields_block",
+            compressor = ?self.compressor,
+            block_size = self.block_size,
+            uncompressed_block_bytes = self.current_block.len(),
+            num_docs_in_block = self.num_docs_in_current_block,
+            num_offsets_in_block = self.doc_pos.len()
+        );
+        let _enter = flush_span.enter();
 
         let size_of_u32 = std::mem::size_of::<u32>();
         self.current_block
@@ -124,10 +159,25 @@ impl StoreWriter {
     /// in the store and adding them one by one, as the store's data will
     /// not be decompressed and then recompressed.
     pub fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
-        // We flush the current block first before stacking
-        self.send_current_block_to_compressor()?;
-        self.block_compressor.stack_reader(store_reader)?;
-        Ok(())
+        let stats = store_reader_stats(&store_reader);
+        tracing::info_span!(
+            "stack_store_reader",
+            compressor = ?self.compressor,
+            block_size = self.block_size,
+            current_block_bytes = self.current_block.len(),
+            current_block_docs = self.num_docs_in_current_block,
+            store_bytes = stats.total_store_bytes,
+            store_data_bytes = stats.data_bytes,
+            store_offsets_bytes = stats.offsets_bytes,
+            num_docs = stats.num_docs,
+            num_blocks = stats.num_blocks
+        )
+        .in_scope(|| {
+            // We flush the current block first before stacking
+            self.send_current_block_to_compressor()?;
+            self.block_compressor.stack_reader(store_reader)?;
+            Ok(())
+        })
     }
 
     /// Finalized the store writer.
@@ -135,8 +185,19 @@ impl StoreWriter {
     /// Compress the last unfinished block if any,
     /// and serializes the skip list index on disc.
     pub fn close(mut self) -> io::Result<()> {
-        self.send_current_block_to_compressor()?;
-        self.block_compressor.close()?;
-        Ok(())
+        tracing::info_span!(
+            "store_writer_close",
+            compressor = ?self.compressor,
+            block_size = self.block_size,
+            current_block_bytes = self.current_block.len(),
+            current_block_docs = self.num_docs_in_current_block
+        )
+        .in_scope(|| {
+            tracing::info_span!("flush_pending_store_block")
+                .in_scope(|| self.send_current_block_to_compressor())?;
+            tracing::info_span!("close_block_compressor")
+                .in_scope(|| self.block_compressor.close())?;
+            Ok(())
+        })
     }
 }

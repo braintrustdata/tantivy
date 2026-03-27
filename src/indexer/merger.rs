@@ -126,6 +126,111 @@ struct DeltaComputer {
     buffer: Vec<u32>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StoredFieldsRunKind {
+    Copy,
+    Stack,
+}
+
+struct StoredFieldsRun {
+    kind: StoredFieldsRunKind,
+    span: tracing::span::EnteredSpan,
+    segments: usize,
+    store_bytes: u64,
+    num_docs: u64,
+    copied_segments_non_trivial_doc_id_mapping: usize,
+    copied_segments_with_deletes: usize,
+    copied_segments_small_blocks: usize,
+    copied_segments_compressor_mismatch: usize,
+}
+
+impl StoredFieldsRun {
+    fn start(kind: StoredFieldsRunKind) -> Self {
+        let span = match kind {
+            StoredFieldsRunKind::Copy => tracing::info_span!(
+                "copy_stored_fields",
+                segments = tracing::field::Empty,
+                store_bytes = tracing::field::Empty,
+                num_docs = tracing::field::Empty,
+                copied_segments_non_trivial_doc_id_mapping = tracing::field::Empty,
+                copied_segments_with_deletes = tracing::field::Empty,
+                copied_segments_small_blocks = tracing::field::Empty,
+                copied_segments_compressor_mismatch = tracing::field::Empty
+            )
+            .entered(),
+            StoredFieldsRunKind::Stack => tracing::info_span!(
+                "stack_stored_fields",
+                segments = tracing::field::Empty,
+                store_bytes = tracing::field::Empty,
+                num_docs = tracing::field::Empty
+            )
+            .entered(),
+        };
+        Self {
+            kind,
+            span,
+            segments: 0,
+            store_bytes: 0,
+            num_docs: 0,
+            copied_segments_non_trivial_doc_id_mapping: 0,
+            copied_segments_with_deletes: 0,
+            copied_segments_small_blocks: 0,
+            copied_segments_compressor_mismatch: 0,
+        }
+    }
+
+    fn record_copy_segment(
+        &mut self,
+        store_bytes: u64,
+        num_docs: u64,
+        copied_segments_non_trivial_doc_id_mapping: usize,
+        copied_segments_with_deletes: usize,
+        copied_segments_small_blocks: usize,
+        copied_segments_compressor_mismatch: usize,
+    ) {
+        debug_assert_eq!(self.kind, StoredFieldsRunKind::Copy);
+        self.segments += 1;
+        self.store_bytes += store_bytes;
+        self.num_docs += num_docs;
+        self.copied_segments_non_trivial_doc_id_mapping +=
+            copied_segments_non_trivial_doc_id_mapping;
+        self.copied_segments_with_deletes += copied_segments_with_deletes;
+        self.copied_segments_small_blocks += copied_segments_small_blocks;
+        self.copied_segments_compressor_mismatch += copied_segments_compressor_mismatch;
+    }
+
+    fn record_stack_segment(&mut self, store_bytes: u64, num_docs: u64) {
+        debug_assert_eq!(self.kind, StoredFieldsRunKind::Stack);
+        self.segments += 1;
+        self.store_bytes += store_bytes;
+        self.num_docs += num_docs;
+    }
+
+    fn finish(self) {
+        self.span.record("segments", self.segments);
+        self.span.record("store_bytes", self.store_bytes);
+        self.span.record("num_docs", self.num_docs);
+        if self.kind == StoredFieldsRunKind::Copy {
+            self.span.record(
+                "copied_segments_non_trivial_doc_id_mapping",
+                self.copied_segments_non_trivial_doc_id_mapping,
+            );
+            self.span.record(
+                "copied_segments_with_deletes",
+                self.copied_segments_with_deletes,
+            );
+            self.span.record(
+                "copied_segments_small_blocks",
+                self.copied_segments_small_blocks,
+            );
+            self.span.record(
+                "copied_segments_compressor_mismatch",
+                self.copied_segments_compressor_mismatch,
+            );
+        }
+    }
+}
+
 impl DeltaComputer {
     fn new() -> DeltaComputer {
         DeltaComputer {
@@ -759,11 +864,27 @@ impl IndexMerger {
             "write_storable_fields",
             doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
             stacked_segments = tracing::field::Empty,
-            copied_segments = tracing::field::Empty
+            copied_segments = tracing::field::Empty,
+            stacked_store_bytes = tracing::field::Empty,
+            copied_store_bytes = tracing::field::Empty,
+            stacked_num_docs = tracing::field::Empty,
+            copied_num_docs = tracing::field::Empty,
+            copied_segments_non_trivial_doc_id_mapping = tracing::field::Empty,
+            copied_segments_with_deletes = tracing::field::Empty,
+            copied_segments_small_blocks = tracing::field::Empty,
+            copied_segments_compressor_mismatch = tracing::field::Empty
         );
         let _enter = store_span.enter();
         let mut stacked_segments = 0usize;
         let mut copied_segments = 0usize;
+        let mut stacked_store_bytes = 0u64;
+        let mut copied_store_bytes = 0u64;
+        let mut stacked_num_docs = 0u64;
+        let mut copied_num_docs = 0u64;
+        let mut copied_segments_non_trivial_doc_id_mapping = 0usize;
+        let mut copied_segments_with_deletes = 0usize;
+        let mut copied_segments_small_blocks = 0usize;
+        let mut copied_segments_compressor_mismatch = 0usize;
 
         if !doc_id_mapping.is_trivial() {
             debug!("non-trivial-doc-id-mapping");
@@ -779,7 +900,29 @@ impl IndexMerger {
                 .enumerate()
                 .map(|(i, store)| store.iter_raw(self.readers[i].alive_bitset()))
                 .collect();
+            copied_segments_non_trivial_doc_id_mapping = self.readers.len();
+            copied_segments = self.readers.len();
+            copied_num_docs = self
+                .readers
+                .iter()
+                .map(|reader| u64::from(reader.num_docs()))
+                .sum();
+            copied_store_bytes = store_readers
+                .iter()
+                .map(|store_reader| store_reader.space_usage().total().get_bytes())
+                .sum();
 
+            let mut copy_run = StoredFieldsRun::start(StoredFieldsRunKind::Copy);
+            for (store_reader, reader) in store_readers.iter().zip(self.readers.iter()) {
+                copy_run.record_copy_segment(
+                    store_reader.space_usage().total().get_bytes(),
+                    u64::from(reader.num_docs()),
+                    1,
+                    0,
+                    0,
+                    0,
+                );
+            }
             for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
                 let doc_bytes_it = &mut document_iterators[old_doc_addr.segment_ord as usize];
                 if let Some(doc_bytes_res) = doc_bytes_it.next() {
@@ -793,12 +936,19 @@ impl IndexMerger {
                     .into());
                 }
             }
-            copied_segments = self.readers.len();
+            copy_run.finish();
         } else {
             debug!("trivial-doc-id-mapping");
+            let mut active_run: Option<StoredFieldsRun> = None;
             for reader in &self.readers {
                 let store_reader = reader.get_store_reader(1)?;
-                if reader.has_deletes()
+                let store_bytes = store_reader.space_usage().total().get_bytes();
+                let num_docs = u64::from(reader.num_docs());
+                let has_deletes = reader.has_deletes();
+                let has_too_few_blocks = store_reader.block_checkpoints().take(7).count() < 6;
+                let has_compressor_mismatch =
+                    store_reader.decompressor() != store_writer.compressor().into();
+                if has_deletes
                     // If there is not enough data in the store, we avoid stacking in order to
                     // avoid creating many small blocks in the doc store. Once we have 5 full blocks,
                     // we start stacking. In the worst case 2/7 of the blocks would be very small.
@@ -812,22 +962,80 @@ impl IndexMerger {
                     // https://github.com/quickwit-oss/tantivy/issues/1053
                     //
                     // take 7 in order to not walk over all checkpoints.
-                    || store_reader.block_checkpoints().take(7).count() < 6
-                    || store_reader.decompressor() != store_writer.compressor().into()
+                    || has_too_few_blocks
+                    || has_compressor_mismatch
                 {
+                    let start_new_run = active_run
+                        .as_ref()
+                        .map(|run| run.kind != StoredFieldsRunKind::Copy)
+                        .unwrap_or(true);
+                    if start_new_run {
+                        if let Some(run) = active_run.take() {
+                            run.finish();
+                        }
+                        active_run = Some(StoredFieldsRun::start(StoredFieldsRunKind::Copy));
+                    }
+                    copied_segments += 1;
+                    copied_store_bytes += store_bytes;
+                    copied_num_docs += num_docs;
+                    copied_segments_with_deletes += usize::from(has_deletes);
+                    copied_segments_small_blocks += usize::from(has_too_few_blocks);
+                    copied_segments_compressor_mismatch += usize::from(has_compressor_mismatch);
+                    active_run.as_mut().unwrap().record_copy_segment(
+                        store_bytes,
+                        num_docs,
+                        0,
+                        usize::from(has_deletes),
+                        usize::from(has_too_few_blocks),
+                        usize::from(has_compressor_mismatch),
+                    );
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
                         let doc_bytes = doc_bytes_res?;
                         store_writer.store_bytes(&doc_bytes)?;
                     }
-                    copied_segments += 1;
                 } else {
-                    store_writer.stack(store_reader)?;
+                    let start_new_run = active_run
+                        .as_ref()
+                        .map(|run| run.kind != StoredFieldsRunKind::Stack)
+                        .unwrap_or(true);
+                    if start_new_run {
+                        if let Some(run) = active_run.take() {
+                            run.finish();
+                        }
+                        active_run = Some(StoredFieldsRun::start(StoredFieldsRunKind::Stack));
+                    }
                     stacked_segments += 1;
+                    stacked_store_bytes += store_bytes;
+                    stacked_num_docs += num_docs;
+                    active_run
+                        .as_mut()
+                        .unwrap()
+                        .record_stack_segment(store_bytes, num_docs);
+                    store_writer.stack(store_reader)?;
                 }
+            }
+            if let Some(run) = active_run.take() {
+                run.finish();
             }
         }
         tracing::Span::current().record("stacked_segments", stacked_segments);
         tracing::Span::current().record("copied_segments", copied_segments);
+        tracing::Span::current().record("stacked_store_bytes", stacked_store_bytes);
+        tracing::Span::current().record("copied_store_bytes", copied_store_bytes);
+        tracing::Span::current().record("stacked_num_docs", stacked_num_docs);
+        tracing::Span::current().record("copied_num_docs", copied_num_docs);
+        tracing::Span::current().record(
+            "copied_segments_non_trivial_doc_id_mapping",
+            copied_segments_non_trivial_doc_id_mapping,
+        );
+        tracing::Span::current()
+            .record("copied_segments_with_deletes", copied_segments_with_deletes);
+        tracing::Span::current()
+            .record("copied_segments_small_blocks", copied_segments_small_blocks);
+        tracing::Span::current().record(
+            "copied_segments_compressor_mismatch",
+            copied_segments_compressor_mismatch,
+        );
         Ok(())
     }
 
