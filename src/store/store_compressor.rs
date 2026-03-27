@@ -183,7 +183,11 @@ impl BlockCompressorImpl {
         tracing::info_span!(
             "write_stacked_store_data",
             store_data_bytes = block_data.len(),
-            num_checkpoints = num_checkpoints
+            num_checkpoints = num_checkpoints,
+            local_write_calls = tracing::field::Empty,
+            local_write_bytes = tracing::field::Empty,
+            avg_local_write_bytes = tracing::field::Empty,
+            max_local_write_bytes = tracing::field::Empty
         )
         .in_scope(|| self.writer.write_all(block_data.as_slice()))?;
         let end_shift = self.writer.written_bytes() as usize;
