@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Instant;
 use std::{io, thread};
 
 use common::{BinarySerializable, CountingWriter, TerminatingWrite};
@@ -13,34 +12,6 @@ use crate::store::{Compressor, Decompressor, StoreReader};
 use crate::DocId;
 
 pub struct BlockCompressor(BlockCompressorVariants);
-
-#[derive(Clone, Copy)]
-struct StackReaderStats {
-    total_store_bytes: u64,
-    data_bytes: u64,
-    offsets_bytes: u64,
-    num_docs: u64,
-    num_blocks: usize,
-}
-
-impl StackReaderStats {
-    fn from_store_reader(store_reader: &StoreReader) -> Self {
-        let space_usage = store_reader.space_usage();
-        let mut num_docs = 0u64;
-        let mut num_blocks = 0usize;
-        for checkpoint in store_reader.block_checkpoints() {
-            num_docs = u64::from(checkpoint.doc_range.end);
-            num_blocks += 1;
-        }
-        Self {
-            total_store_bytes: space_usage.total().get_bytes(),
-            data_bytes: space_usage.data_usage().get_bytes(),
-            offsets_bytes: space_usage.offsets_usage().get_bytes(),
-            num_docs,
-            num_blocks,
-        }
-    }
-}
 
 // The struct wrapping an enum is just here to keep the
 // impls private.
@@ -72,15 +43,7 @@ impl BlockCompressor {
     ) -> io::Result<()> {
         match &mut self.0 {
             BlockCompressorVariants::SameThread(block_compressor) => {
-                tracing::info_span!(
-                    "compress_store_block",
-                    uncompressed_block_bytes = bytes.len(),
-                    num_docs_in_block = num_docs_in_block,
-                    compressed_block_bytes = tracing::field::Empty,
-                    write_start_offset = tracing::field::Empty,
-                    write_end_offset = tracing::field::Empty
-                )
-                .in_scope(|| block_compressor.compress_block_and_write(bytes, num_docs_in_block))?;
+                block_compressor.compress_block_and_write(bytes, num_docs_in_block)?;
             }
             BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
                 different_thread_block_compressor
@@ -91,23 +54,12 @@ impl BlockCompressor {
     }
 
     pub fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
-        let stats = StackReaderStats::from_store_reader(&store_reader);
         match &mut self.0 {
             BlockCompressorVariants::SameThread(block_compressor) => {
-                tracing::info_span!(
-                    "stack_store_reader_blocks",
-                    store_bytes = stats.total_store_bytes,
-                    store_data_bytes = stats.data_bytes,
-                    store_offsets_bytes = stats.offsets_bytes,
-                    num_docs = stats.num_docs,
-                    num_blocks = stats.num_blocks,
-                    write_start_offset = tracing::field::Empty,
-                    write_end_offset = tracing::field::Empty
-                )
-                .in_scope(|| block_compressor.stack(store_reader))?;
+                block_compressor.stack(store_reader)?;
             }
             BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
-                different_thread_block_compressor.stack_reader(store_reader, stats)?;
+                different_thread_block_compressor.stack_reader(store_reader)?;
             }
         }
         Ok(())
@@ -153,9 +105,6 @@ impl BlockCompressorImpl {
         let start_offset = self.writer.written_bytes() as usize;
         self.writer.write_all(&self.intermediary_buffer)?;
         let end_offset = self.writer.written_bytes() as usize;
-        tracing::Span::current().record("compressed_block_bytes", self.intermediary_buffer.len());
-        tracing::Span::current().record("write_start_offset", start_offset as u64);
-        tracing::Span::current().record("write_end_offset", end_offset as u64);
 
         self.register_checkpoint(Checkpoint {
             doc_range: self.first_doc_in_block..self.first_doc_in_block + num_docs_in_block,
@@ -177,41 +126,19 @@ impl BlockCompressorImpl {
         let doc_shift = self.first_doc_in_block;
         let start_shift = self.writer.written_bytes() as usize;
         let block_data = store_reader.block_data()?;
-        let num_checkpoints = store_reader.block_checkpoints().count();
 
         // just bulk write all of the block of the given reader.
-        tracing::info_span!(
-            "write_stacked_store_data",
-            store_data_bytes = block_data.len(),
-            num_checkpoints = num_checkpoints,
-            local_write_calls = tracing::field::Empty,
-            local_write_bytes = tracing::field::Empty,
-            avg_local_write_bytes = tracing::field::Empty,
-            max_local_write_bytes = tracing::field::Empty
-        )
-        .in_scope(|| self.writer.write_all(block_data.as_slice()))?;
-        let end_shift = self.writer.written_bytes() as usize;
-        tracing::Span::current().record("write_start_offset", start_shift as u64);
-        tracing::Span::current().record("write_end_offset", end_shift as u64);
+        self.writer.write_all(block_data.as_slice())?;
 
         // concatenate the index of the `store_reader`, after translating
         // its start doc id and its start file offset.
-        tracing::info_span!(
-            "rewrite_stacked_store_checkpoints",
-            num_checkpoints = num_checkpoints,
-            doc_shift = doc_shift,
-            byte_shift = start_shift
-        )
-        .in_scope(|| {
-            for mut checkpoint in store_reader.block_checkpoints() {
-                checkpoint.doc_range.start += doc_shift;
-                checkpoint.doc_range.end += doc_shift;
-                checkpoint.byte_range.start += start_shift;
-                checkpoint.byte_range.end += start_shift;
-                self.register_checkpoint(checkpoint);
-            }
-            Ok::<(), io::Error>(())
-        })?;
+        for mut checkpoint in store_reader.block_checkpoints() {
+            checkpoint.doc_range.start += doc_shift;
+            checkpoint.doc_range.end += doc_shift;
+            checkpoint.byte_range.start += start_shift;
+            checkpoint.byte_range.end += start_shift;
+            self.register_checkpoint(checkpoint);
+        }
         Ok(())
     }
 
@@ -230,14 +157,9 @@ enum BlockCompressorMessage {
     CompressBlockAndWrite {
         block_data: Vec<u8>,
         num_docs_in_block: u32,
-        enqueued_at: Instant,
-        parent_span: tracing::Span,
     },
     Stack {
         store_reader: StoreReader,
-        stats: StackReaderStats,
-        enqueued_at: Instant,
-        parent_span: tracing::Span,
     },
 }
 
@@ -252,53 +174,20 @@ impl DedicatedThreadBlockCompressorImpl {
             SyncSender<BlockCompressorMessage>,
             Receiver<BlockCompressorMessage>,
         ) = sync_channel(3);
-        let parent_span = tracing::Span::current();
         let join_handle = thread::Builder::new()
             .name("docstore-compressor-thread".to_string())
             .spawn(move || {
-                let _parent_span_guard = parent_span.enter();
                 while let Ok(packet) = rx.recv() {
                     match packet {
                         BlockCompressorMessage::CompressBlockAndWrite {
                             block_data,
                             num_docs_in_block,
-                            enqueued_at,
-                            parent_span,
                         } => {
-                            let _parent_span_guard = parent_span.enter();
-                            tracing::info_span!(
-                                "compress_store_block",
-                                uncompressed_block_bytes = block_data.len(),
-                                num_docs_in_block = num_docs_in_block,
-                                queue_age_ms = enqueued_at.elapsed().as_secs_f64() * 1_000.0,
-                                compressed_block_bytes = tracing::field::Empty,
-                                write_start_offset = tracing::field::Empty,
-                                write_end_offset = tracing::field::Empty
-                            )
-                            .in_scope(|| {
-                                block_compressor
-                                    .compress_block_and_write(&block_data[..], num_docs_in_block)
-                            })?;
+                            block_compressor
+                                .compress_block_and_write(&block_data[..], num_docs_in_block)?;
                         }
-                        BlockCompressorMessage::Stack {
-                            store_reader,
-                            stats,
-                            enqueued_at,
-                            parent_span,
-                        } => {
-                            let _parent_span_guard = parent_span.enter();
-                            tracing::info_span!(
-                                "stack_store_reader_blocks",
-                                store_bytes = stats.total_store_bytes,
-                                store_data_bytes = stats.data_bytes,
-                                store_offsets_bytes = stats.offsets_bytes,
-                                num_docs = stats.num_docs,
-                                num_blocks = stats.num_blocks,
-                                queue_age_ms = enqueued_at.elapsed().as_secs_f64() * 1_000.0,
-                                write_start_offset = tracing::field::Empty,
-                                write_end_offset = tracing::field::Empty
-                            )
-                            .in_scope(|| block_compressor.stack(store_reader))?;
+                        BlockCompressorMessage::Stack { store_reader } => {
+                            block_compressor.stack(store_reader)?;
                         }
                     }
                 }
@@ -312,42 +201,14 @@ impl DedicatedThreadBlockCompressorImpl {
     }
 
     fn compress_block_and_write(&mut self, bytes: &[u8], num_docs_in_block: u32) -> io::Result<()> {
-        tracing::info_span!(
-            "enqueue_compress_store_block",
-            uncompressed_block_bytes = bytes.len(),
-            num_docs_in_block = num_docs_in_block
-        )
-        .in_scope(|| {
-            self.send(BlockCompressorMessage::CompressBlockAndWrite {
-                block_data: bytes.to_vec(),
-                num_docs_in_block,
-                enqueued_at: Instant::now(),
-                parent_span: tracing::Span::current(),
-            })
+        self.send(BlockCompressorMessage::CompressBlockAndWrite {
+            block_data: bytes.to_vec(),
+            num_docs_in_block,
         })
     }
 
-    fn stack_reader(
-        &mut self,
-        store_reader: StoreReader,
-        stats: StackReaderStats,
-    ) -> io::Result<()> {
-        tracing::info_span!(
-            "enqueue_stack_store_reader_blocks",
-            store_bytes = stats.total_store_bytes,
-            store_data_bytes = stats.data_bytes,
-            store_offsets_bytes = stats.offsets_bytes,
-            num_docs = stats.num_docs,
-            num_blocks = stats.num_blocks
-        )
-        .in_scope(|| {
-            self.send(BlockCompressorMessage::Stack {
-                store_reader,
-                stats,
-                enqueued_at: Instant::now(),
-                parent_span: tracing::Span::current(),
-            })
-        })
+    fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
+        self.send(BlockCompressorMessage::Stack { store_reader })
     }
 
     fn send(&mut self, msg: BlockCompressorMessage) -> io::Result<()> {
