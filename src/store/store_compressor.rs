@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::JoinHandle;
+use std::time::Instant;
 use std::{io, thread};
 
 use common::{BinarySerializable, CountingWriter, TerminatingWrite};
@@ -210,11 +211,13 @@ enum BlockCompressorMessage {
     CompressBlockAndWrite {
         block_data: Vec<u8>,
         num_docs_in_block: u32,
+        enqueued_at: Instant,
         parent_span: tracing::Span,
     },
     Stack {
         store_reader: StoreReader,
         stats: StackReaderStats,
+        enqueued_at: Instant,
         parent_span: tracing::Span,
     },
 }
@@ -240,6 +243,7 @@ impl DedicatedThreadBlockCompressorImpl {
                         BlockCompressorMessage::CompressBlockAndWrite {
                             block_data,
                             num_docs_in_block,
+                            enqueued_at,
                             parent_span,
                         } => {
                             let _parent_span_guard = parent_span.enter();
@@ -247,6 +251,7 @@ impl DedicatedThreadBlockCompressorImpl {
                                 "compress_store_block",
                                 uncompressed_block_bytes = block_data.len(),
                                 num_docs_in_block = num_docs_in_block,
+                                queue_age_ms = enqueued_at.elapsed().as_secs_f64() * 1_000.0,
                                 compressed_block_bytes = tracing::field::Empty,
                                 write_start_offset = tracing::field::Empty,
                                 write_end_offset = tracing::field::Empty
@@ -259,6 +264,7 @@ impl DedicatedThreadBlockCompressorImpl {
                         BlockCompressorMessage::Stack {
                             store_reader,
                             stats,
+                            enqueued_at,
                             parent_span,
                         } => {
                             let _parent_span_guard = parent_span.enter();
@@ -269,6 +275,7 @@ impl DedicatedThreadBlockCompressorImpl {
                                 store_offsets_bytes = stats.offsets_bytes,
                                 num_docs = stats.num_docs,
                                 num_blocks = stats.num_blocks,
+                                queue_age_ms = enqueued_at.elapsed().as_secs_f64() * 1_000.0,
                                 write_start_offset = tracing::field::Empty,
                                 write_end_offset = tracing::field::Empty
                             )
@@ -286,10 +293,18 @@ impl DedicatedThreadBlockCompressorImpl {
     }
 
     fn compress_block_and_write(&mut self, bytes: &[u8], num_docs_in_block: u32) -> io::Result<()> {
-        self.send(BlockCompressorMessage::CompressBlockAndWrite {
-            block_data: bytes.to_vec(),
-            num_docs_in_block,
-            parent_span: tracing::Span::current(),
+        tracing::info_span!(
+            "enqueue_compress_store_block",
+            uncompressed_block_bytes = bytes.len(),
+            num_docs_in_block = num_docs_in_block
+        )
+        .in_scope(|| {
+            self.send(BlockCompressorMessage::CompressBlockAndWrite {
+                block_data: bytes.to_vec(),
+                num_docs_in_block,
+                enqueued_at: Instant::now(),
+                parent_span: tracing::Span::current(),
+            })
         })
     }
 
@@ -298,10 +313,21 @@ impl DedicatedThreadBlockCompressorImpl {
         store_reader: StoreReader,
         stats: StackReaderStats,
     ) -> io::Result<()> {
-        self.send(BlockCompressorMessage::Stack {
-            store_reader,
-            stats,
-            parent_span: tracing::Span::current(),
+        tracing::info_span!(
+            "enqueue_stack_store_reader_blocks",
+            store_bytes = stats.total_store_bytes,
+            store_data_bytes = stats.data_bytes,
+            store_offsets_bytes = stats.offsets_bytes,
+            num_docs = stats.num_docs,
+            num_blocks = stats.num_blocks
+        )
+        .in_scope(|| {
+            self.send(BlockCompressorMessage::Stack {
+                store_reader,
+                stats,
+                enqueued_at: Instant::now(),
+                parent_span: tracing::Span::current(),
+            })
         })
     }
 
