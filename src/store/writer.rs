@@ -124,6 +124,7 @@ impl StoreWriter {
     /// in the store and adding them one by one, as the store's data will
     /// not be decompressed and then recompressed.
     pub fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
+        // We flush the current block first before stacking
         self.send_current_block_to_compressor()?;
         self.block_compressor.stack_reader(store_reader)?;
         Ok(())
