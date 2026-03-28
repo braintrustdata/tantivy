@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use columnar::{
     ColumnType, ColumnValues, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder,
@@ -32,6 +33,13 @@ use crate::{
 ///
 /// We do not allow segments with more than
 pub const MAX_DOC_LIMIT: u32 = 1 << 31;
+
+#[derive(Debug)]
+struct FieldPostingTiming {
+    field_name: String,
+    total_num_tokens_estimate: u64,
+    elapsed_ms: f64,
+}
 
 fn estimate_total_num_tokens_in_single_segment(
     reader: &SegmentReader,
@@ -508,7 +516,7 @@ impl IndexMerger {
         serializer: &mut InvertedIndexSerializer,
         fieldnorm_reader: Option<FieldNormReader>,
         doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<u64> {
         debug_time!("write-postings-for-field");
         let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
         let mut delta_computer = DeltaComputer::new();
@@ -713,7 +721,7 @@ impl IndexMerger {
             field_serializer.close_term()?;
         }
         field_serializer.close()?;
-        Ok(())
+        Ok(total_num_tokens)
     }
 
     fn write_postings(
@@ -730,19 +738,105 @@ impl IndexMerger {
         let postings_span = tracing::info_span!(
             "write_postings",
             doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
-            num_indexed_fields = num_indexed_fields
+            num_indexed_fields = num_indexed_fields,
+            num_fields_profiled = tracing::field::Empty,
+            sequential_field_time_ms = tracing::field::Empty,
+            ideal_parallel_field_time_ms = tracing::field::Empty,
+            field_parallelism_upper_bound = tracing::field::Empty,
+            num_fields_over_100ms = tracing::field::Empty,
+            num_fields_over_1000ms = tracing::field::Empty,
+            top_field_1_name = tracing::field::Empty,
+            top_field_1_ms = tracing::field::Empty,
+            top_field_1_total_num_tokens_estimate = tracing::field::Empty,
+            top_field_2_name = tracing::field::Empty,
+            top_field_2_ms = tracing::field::Empty,
+            top_field_2_total_num_tokens_estimate = tracing::field::Empty,
+            top_field_3_name = tracing::field::Empty,
+            top_field_3_ms = tracing::field::Empty,
+            top_field_3_total_num_tokens_estimate = tracing::field::Empty
         );
         let _enter = postings_span.enter();
+        let mut field_timings = Vec::new();
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
-                self.write_postings_for_field(
+                let field_name = self.schema.get_field_name(field).to_string();
+                let field_start = Instant::now();
+                let total_num_tokens_estimate = self.write_postings_for_field(
                     field,
                     field_entry.field_type(),
                     serializer,
                     fieldnorm_reader,
                     doc_id_mapping,
                 )?;
+                field_timings.push(FieldPostingTiming {
+                    field_name,
+                    total_num_tokens_estimate,
+                    elapsed_ms: field_start.elapsed().as_secs_f64() * 1_000.0,
+                });
+            }
+        }
+        let span = tracing::Span::current();
+        let sequential_field_time_ms = field_timings
+            .iter()
+            .map(|timing| timing.elapsed_ms)
+            .sum::<f64>();
+        let ideal_parallel_field_time_ms = field_timings
+            .iter()
+            .map(|timing| timing.elapsed_ms)
+            .fold(0.0f64, f64::max);
+        let field_parallelism_upper_bound = if ideal_parallel_field_time_ms > 0.0 {
+            sequential_field_time_ms / ideal_parallel_field_time_ms
+        } else {
+            1.0
+        };
+        span.record("num_fields_profiled", field_timings.len());
+        span.record("sequential_field_time_ms", sequential_field_time_ms);
+        span.record("ideal_parallel_field_time_ms", ideal_parallel_field_time_ms);
+        span.record("field_parallelism_upper_bound", field_parallelism_upper_bound);
+        span.record(
+            "num_fields_over_100ms",
+            field_timings
+                .iter()
+                .filter(|timing| timing.elapsed_ms >= 100.0)
+                .count(),
+        );
+        span.record(
+            "num_fields_over_1000ms",
+            field_timings
+                .iter()
+                .filter(|timing| timing.elapsed_ms >= 1_000.0)
+                .count(),
+        );
+        field_timings.sort_by(|left, right| right.elapsed_ms.total_cmp(&left.elapsed_ms));
+        for (idx, timing) in field_timings.iter().take(3).enumerate() {
+            let rank = idx + 1;
+            match rank {
+                1 => {
+                    span.record("top_field_1_name", tracing::field::display(&timing.field_name));
+                    span.record("top_field_1_ms", timing.elapsed_ms);
+                    span.record(
+                        "top_field_1_total_num_tokens_estimate",
+                        timing.total_num_tokens_estimate,
+                    );
+                }
+                2 => {
+                    span.record("top_field_2_name", tracing::field::display(&timing.field_name));
+                    span.record("top_field_2_ms", timing.elapsed_ms);
+                    span.record(
+                        "top_field_2_total_num_tokens_estimate",
+                        timing.total_num_tokens_estimate,
+                    );
+                }
+                3 => {
+                    span.record("top_field_3_name", tracing::field::display(&timing.field_name));
+                    span.record("top_field_3_ms", timing.elapsed_ms);
+                    span.record(
+                        "top_field_3_total_num_tokens_estimate",
+                        timing.total_num_tokens_estimate,
+                    );
+                }
+                _ => unreachable!(),
             }
         }
         Ok(())
