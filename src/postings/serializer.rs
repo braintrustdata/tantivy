@@ -1,7 +1,10 @@
 use std::cmp::Ordering;
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Seek, Write};
+use std::path::PathBuf;
 
 use common::{BinarySerializable, CountingWriter, VInt};
+use uuid::Uuid;
 
 use super::TermInfo;
 use crate::directory::{CompositeWrite, WritePtr};
@@ -53,6 +56,86 @@ pub struct InvertedIndexSerializer {
     schema: Schema,
 }
 
+pub(crate) struct TempFieldWrite {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl TempFieldWrite {
+    pub(crate) fn create(component_name: &str) -> io::Result<Self> {
+        for _ in 0..4 {
+            let path = std::env::temp_dir().join(format!(
+                "tantivy-postings-{component_name}-{}.tmp",
+                Uuid::new_v4().simple()
+            ));
+            match OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("failed to allocate temp postings file for {component_name}"),
+        ))
+    }
+
+    fn file_mut(&mut self) -> io::Result<&mut File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "temp postings file closed"))
+    }
+
+    pub(crate) fn copy_into<W: Write>(&mut self, output: &mut W) -> io::Result<u64> {
+        let file = self.file_mut()?;
+        file.flush()?;
+        file.rewind()?;
+        io::copy(file, output)
+    }
+}
+
+impl Write for TempFieldWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file_mut()?.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file_mut()?.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.file_mut()?.write_all(buf)
+    }
+}
+
+impl Drop for TempFieldWrite {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub(crate) struct SerializedFieldData {
+    pub(crate) terms_data: TempFieldWrite,
+    pub(crate) postings_data: TempFieldWrite,
+    pub(crate) positions_data: TempFieldWrite,
+    pub(crate) terms_bytes: u64,
+    pub(crate) postings_bytes: u64,
+    pub(crate) positions_bytes: u64,
+}
+
 impl InvertedIndexSerializer {
     /// Open a new `InvertedIndexSerializer` for the given segment
     pub fn open(segment: &mut Segment) -> crate::Result<InvertedIndexSerializer> {
@@ -75,7 +158,7 @@ impl InvertedIndexSerializer {
         field: Field,
         total_num_tokens: u64,
         fieldnorm_reader: Option<FieldNormReader>,
-    ) -> io::Result<FieldSerializer> {
+    ) -> io::Result<FieldSerializer<'_, WritePtr>> {
         let field_entry: &FieldEntry = self.schema.get_field_entry(field);
         let term_dictionary_write = self.terms_write.for_field(field);
         let postings_write = self.postings_write.for_field(field);
@@ -91,6 +174,26 @@ impl InvertedIndexSerializer {
         )
     }
 
+    pub(crate) fn write_serialized_field(
+        &mut self,
+        field: Field,
+        mut serialized_field: SerializedFieldData,
+    ) -> io::Result<()> {
+        let copied_terms_bytes = serialized_field
+            .terms_data
+            .copy_into(self.terms_write.for_field(field))?;
+        debug_assert_eq!(copied_terms_bytes, serialized_field.terms_bytes);
+        let copied_postings_bytes = serialized_field
+            .postings_data
+            .copy_into(self.postings_write.for_field(field))?;
+        debug_assert_eq!(copied_postings_bytes, serialized_field.postings_bytes);
+        let copied_positions_bytes = serialized_field
+            .positions_data
+            .copy_into(self.positions_write.for_field(field))?;
+        debug_assert_eq!(copied_positions_bytes, serialized_field.positions_bytes);
+        Ok(())
+    }
+
     /// Closes the serializer.
     pub fn close(self) -> io::Result<()> {
         self.terms_write.close()?;
@@ -102,23 +205,23 @@ impl InvertedIndexSerializer {
 
 /// The field serializer is in charge of
 /// the serialization of a specific field.
-pub struct FieldSerializer<'a> {
-    term_dictionary_builder: TermDictionaryBuilder<&'a mut CountingWriter<WritePtr>>,
-    postings_serializer: PostingsSerializer<&'a mut CountingWriter<WritePtr>>,
-    positions_serializer_opt: Option<PositionSerializer<&'a mut CountingWriter<WritePtr>>>,
+pub struct FieldSerializer<'a, W: Write = WritePtr> {
+    term_dictionary_builder: TermDictionaryBuilder<&'a mut CountingWriter<W>>,
+    postings_serializer: PostingsSerializer<&'a mut CountingWriter<W>>,
+    positions_serializer_opt: Option<PositionSerializer<&'a mut CountingWriter<W>>>,
     current_term_info: TermInfo,
     term_open: bool,
 }
 
-impl<'a> FieldSerializer<'a> {
-    fn create(
+impl<'a, W: Write> FieldSerializer<'a, W> {
+    pub(crate) fn create(
         field_type: &FieldType,
         total_num_tokens: u64,
-        term_dictionary_write: &'a mut CountingWriter<WritePtr>,
-        postings_write: &'a mut CountingWriter<WritePtr>,
-        positions_write: &'a mut CountingWriter<WritePtr>,
+        term_dictionary_write: &'a mut CountingWriter<W>,
+        postings_write: &'a mut CountingWriter<W>,
+        positions_write: &'a mut CountingWriter<W>,
         fieldnorm_reader: Option<FieldNormReader>,
-    ) -> io::Result<FieldSerializer<'a>> {
+    ) -> io::Result<FieldSerializer<'a, W>> {
         total_num_tokens.serialize(postings_write)?;
         let index_record_option = field_type
             .index_record_option()
