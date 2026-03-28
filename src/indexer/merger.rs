@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use columnar::{
     ColumnType, ColumnValues, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder,
@@ -36,13 +35,6 @@ use crate::{
 /// We do not allow segments with more than
 pub const MAX_DOC_LIMIT: u32 = 1 << 31;
 
-#[derive(Debug)]
-struct FieldPostingTiming {
-    field_name: String,
-    total_num_tokens_estimate: u64,
-    elapsed_ms: f64,
-}
-
 struct FieldPostingJob {
     field: Field,
     field_name: String,
@@ -51,9 +43,6 @@ struct FieldPostingJob {
 
 struct SerializedFieldPosting {
     field: Field,
-    field_name: String,
-    total_num_tokens_estimate: u64,
-    elapsed_ms: f64,
     output_total_bytes: u64,
     serialized_field: SerializedFieldData,
 }
@@ -607,9 +596,6 @@ impl IndexMerger {
         span.record("output_total_bytes", output_total_bytes);
         Ok(SerializedFieldPosting {
             field: indexed_field,
-            field_name: field_name.to_string(),
-            total_num_tokens_estimate: total_num_tokens,
-            elapsed_ms: 0.0,
             output_total_bytes,
             serialized_field: SerializedFieldData {
                 terms_bytes,
@@ -819,21 +805,6 @@ impl IndexMerger {
             doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
             num_indexed_fields = num_indexed_fields,
             postings_parallelism = self.postings_parallelism(),
-            num_fields_profiled = tracing::field::Empty,
-            sequential_field_time_ms = tracing::field::Empty,
-            ideal_parallel_field_time_ms = tracing::field::Empty,
-            field_parallelism_upper_bound = tracing::field::Empty,
-            num_fields_over_100ms = tracing::field::Empty,
-            num_fields_over_1000ms = tracing::field::Empty,
-            top_field_1_name = tracing::field::Empty,
-            top_field_1_ms = tracing::field::Empty,
-            top_field_1_total_num_tokens_estimate = tracing::field::Empty,
-            top_field_2_name = tracing::field::Empty,
-            top_field_2_ms = tracing::field::Empty,
-            top_field_2_total_num_tokens_estimate = tracing::field::Empty,
-            top_field_3_name = tracing::field::Empty,
-            top_field_3_ms = tracing::field::Empty,
-            top_field_3_total_num_tokens_estimate = tracing::field::Empty,
             total_serialized_postings_output_bytes = tracing::field::Empty
         );
         let _enter = postings_span.enter();
@@ -856,27 +827,16 @@ impl IndexMerger {
         };
         let field_results = postings_field_executor.map(
             |field_job| {
-                let field_start = Instant::now();
-                let mut field_result = self.write_postings_for_field(
+                self.write_postings_for_field(
                     field_job.field,
                     &field_job.field_name,
                     field_job.fieldnorm_reader,
                     doc_id_mapping,
                     &merged_doc_id_map,
-                )?;
-                field_result.elapsed_ms = field_start.elapsed().as_secs_f64() * 1_000.0;
-                Ok(field_result)
+                )
             },
             field_jobs.into_iter(),
         )?;
-        let mut field_timings = field_results
-            .iter()
-            .map(|field_result| FieldPostingTiming {
-                field_name: field_result.field_name.clone(),
-                total_num_tokens_estimate: field_result.total_num_tokens_estimate,
-                elapsed_ms: field_result.elapsed_ms,
-            })
-            .collect::<Vec<_>>();
         let total_serialized_postings_output_bytes = field_results
             .iter()
             .map(|field_result| field_result.output_total_bytes)
@@ -884,85 +844,10 @@ impl IndexMerger {
         for field_result in field_results {
             serializer.write_serialized_field(field_result.field, field_result.serialized_field)?;
         }
-        let span = tracing::Span::current();
-        let sequential_field_time_ms = field_timings
-            .iter()
-            .map(|timing| timing.elapsed_ms)
-            .sum::<f64>();
-        let ideal_parallel_field_time_ms = field_timings
-            .iter()
-            .map(|timing| timing.elapsed_ms)
-            .fold(0.0f64, f64::max);
-        let field_parallelism_upper_bound = if ideal_parallel_field_time_ms > 0.0 {
-            sequential_field_time_ms / ideal_parallel_field_time_ms
-        } else {
-            1.0
-        };
-        span.record("num_fields_profiled", field_timings.len());
-        span.record("sequential_field_time_ms", sequential_field_time_ms);
-        span.record("ideal_parallel_field_time_ms", ideal_parallel_field_time_ms);
-        span.record(
+        tracing::Span::current().record(
             "total_serialized_postings_output_bytes",
             total_serialized_postings_output_bytes,
         );
-        span.record(
-            "field_parallelism_upper_bound",
-            field_parallelism_upper_bound,
-        );
-        span.record(
-            "num_fields_over_100ms",
-            field_timings
-                .iter()
-                .filter(|timing| timing.elapsed_ms >= 100.0)
-                .count(),
-        );
-        span.record(
-            "num_fields_over_1000ms",
-            field_timings
-                .iter()
-                .filter(|timing| timing.elapsed_ms >= 1_000.0)
-                .count(),
-        );
-        field_timings.sort_by(|left, right| right.elapsed_ms.total_cmp(&left.elapsed_ms));
-        for (idx, timing) in field_timings.iter().take(3).enumerate() {
-            let rank = idx + 1;
-            match rank {
-                1 => {
-                    span.record(
-                        "top_field_1_name",
-                        tracing::field::display(&timing.field_name),
-                    );
-                    span.record("top_field_1_ms", timing.elapsed_ms);
-                    span.record(
-                        "top_field_1_total_num_tokens_estimate",
-                        timing.total_num_tokens_estimate,
-                    );
-                }
-                2 => {
-                    span.record(
-                        "top_field_2_name",
-                        tracing::field::display(&timing.field_name),
-                    );
-                    span.record("top_field_2_ms", timing.elapsed_ms);
-                    span.record(
-                        "top_field_2_total_num_tokens_estimate",
-                        timing.total_num_tokens_estimate,
-                    );
-                }
-                3 => {
-                    span.record(
-                        "top_field_3_name",
-                        tracing::field::display(&timing.field_name),
-                    );
-                    span.record("top_field_3_ms", timing.elapsed_ms);
-                    span.record(
-                        "top_field_3_total_num_tokens_estimate",
-                        timing.total_num_tokens_estimate,
-                    );
-                }
-                _ => unreachable!(),
-            }
-        }
         Ok(())
     }
 
