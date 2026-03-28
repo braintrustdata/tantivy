@@ -561,6 +561,8 @@ impl IndexMerger {
         doc_id_mapping: &SegmentDocIdMapping,
         merged_doc_id_map: &[Vec<Option<DocId>>],
     ) -> crate::Result<SerializedFieldPosting> {
+        // Note that the total number of tokens is not exact.
+        // It is only used as a parameter in the BM25 formula.
         let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
         let postings_for_field_span = tracing::info_span!(
             "write_postings_for_field",
@@ -634,6 +636,18 @@ impl IndexMerger {
 
         let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
 
+        // Create the total list of doc ids
+        // by stacking the doc ids from the different segment.
+        //
+        // In the new segments, the doc id from the different
+        // segment are stacked so that :
+        // - Segment 0's doc ids become doc id [0, seg.max_doc]
+        // - Segment 1's doc ids become  [seg0.max_doc, seg0.max_doc + seg.max_doc]
+        // - Segment 2's doc ids become  [seg0.max_doc + seg1.max_doc, seg0.max_doc + seg1.max_doc +
+        //   seg2.max_doc]
+        //
+        // This stacking applies only when the index is not sorted, in that case the
+        // doc_ids are kmerged by their sort property
         let field_readers: Vec<Arc<InvertedIndexReader>> = self
             .readers
             .iter()
@@ -650,6 +664,7 @@ impl IndexMerger {
         let mut merged_terms = TermMerger::new(field_term_streams);
         let field_entry = self.schema.get_field_entry(indexed_field);
 
+        // ... set segment postings option the new field.
         let segment_postings_option = field_entry.field_type().get_index_record_option().expect(
             "Encountered a field that is not supposed to be
                          indexed. Have you modified the schema?",
@@ -681,6 +696,10 @@ impl IndexMerger {
                 }
             }
 
+            // At this point, `segment_postings` contains the posting list
+            // of all of the segments containing the given term (and that are non-empty)
+            //
+            // These segments are non-empty and advance has already been called.
             if total_doc_freq == 0u32 {
                 // All docs that used to contain the term have been deleted. The `term` will be
                 // entirely removed.
@@ -734,6 +753,8 @@ impl IndexMerger {
                 while doc != TERMINATED {
                     // deleted doc are skipped as they do not have a `remapped_doc_id`.
                     if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
+                        // we make sure to only write the term if
+                        // there is at least one document.
                         let term_freq = if has_term_freq {
                             segment_postings.positions(&mut positions_buffer);
                             segment_postings.term_freq()
@@ -745,14 +766,14 @@ impl IndexMerger {
                             0u32
                         };
 
+                        // if doc_id_mapping exists, the doc_ids are reordered, they are
+                        // not just stacked. The field serializer expects monotonically increasing
+                        // doc_ids, so we collect and sort them first, before writing.
+                        //
+                        // I think this is not strictly necessary, it would be possible to
+                        // avoid the loading into a vec via some form of kmerge, but then the merge
+                        // logic would deviate much more from the stacking case (unsorted index)
                         if !doc_id_mapping.is_trivial() {
-                            // if doc_id_mapping exists, the doc_ids are reordered, they are
-                            // not just stacked. The field serializer expects monotonically increasing
-                            // doc_ids, so we collect and sort them first, before writing.
-                            //
-                            // I think this is not strictly necessary, it would be possible to
-                            // avoid the loading into a vec via some form of kmerge, but then the merge
-                            // logic would deviate much more from the stacking case (unsorted index)
                             doc_id_and_positions.push((
                                 remapped_doc_id,
                                 term_freq,
@@ -776,6 +797,7 @@ impl IndexMerger {
                 }
                 doc_id_and_positions.clear();
             }
+            // closing the term.
             field_serializer.close_term()?;
         }
         Ok(())
