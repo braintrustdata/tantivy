@@ -266,11 +266,23 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
+    /// The maximum number of threads used to serialize postings within a single merge.
+    #[serde(default = "default_merge_postings_parallelism")]
+    #[serde(skip_serializing_if = "is_default_merge_postings_parallelism")]
+    pub merge_postings_parallelism: usize,
 }
 
 /// Must be a function to be compatible with serde defaults
 fn default_docstore_blocksize() -> usize {
     16_384
+}
+
+fn default_merge_postings_parallelism() -> usize {
+    4
+}
+
+fn is_default_merge_postings_parallelism(val: &usize) -> bool {
+    *val == default_merge_postings_parallelism()
 }
 
 impl Default for IndexSettings {
@@ -280,6 +292,7 @@ impl Default for IndexSettings {
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
+            merge_postings_parallelism: default_merge_postings_parallelism(),
         }
     }
 }
@@ -535,7 +548,8 @@ mod tests {
                 sort_by_field: None,
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
-                docstore_blocksize: 16_384
+                docstore_blocksize: 16_384,
+                merge_postings_parallelism: IndexSettings::default().merge_postings_parallelism,
             }
         );
         {

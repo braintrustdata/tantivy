@@ -4,12 +4,11 @@ use columnar::{
     ColumnType, ColumnValues, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder,
     StackMergeOrder,
 };
-use common::ReadOnlyBitSet;
+use common::{CountingWriter, ReadOnlyBitSet, TerminatingWrite};
 use itertools::Itertools;
 use measure_time::debug_time;
 
-use common::TerminatingWrite;
-
+use crate::core::Executor;
 use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
@@ -18,7 +17,10 @@ use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, 
 use crate::index::{Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
-use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
+use crate::postings::{
+    FieldSerializer, InvertedIndexSerializer, Postings, SegmentPostings, SerializedFieldData,
+    TempFieldWrite,
+};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
@@ -32,6 +34,18 @@ use crate::{
 ///
 /// We do not allow segments with more than
 pub const MAX_DOC_LIMIT: u32 = 1 << 31;
+
+struct FieldPostingJob {
+    field: Field,
+    field_name: String,
+    fieldnorm_reader: Option<FieldNormReader>,
+}
+
+struct SerializedFieldPosting {
+    field: Field,
+    output_total_bytes: u64,
+    serialized_field: SerializedFieldData,
+}
 
 fn estimate_total_num_tokens_in_single_segment(
     reader: &SegmentReader,
@@ -185,6 +199,13 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
 }
 
 impl IndexMerger {
+    fn postings_parallelism(&self) -> usize {
+        self.index_settings
+            .merge_postings_parallelism
+            .max(1)
+            .min(num_cpus::get().max(1))
+    }
+
     pub fn open(
         schema: Schema,
         index_settings: IndexSettings,
@@ -501,13 +522,99 @@ impl IndexMerger {
         ))
     }
 
+    fn build_merged_doc_id_map(
+        &self,
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> Vec<Vec<Option<DocId>>> {
+        let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = self
+            .readers
+            .iter()
+            .map(|reader| {
+                let mut segment_local_map = vec![];
+                segment_local_map.resize(reader.max_doc() as usize, None);
+                segment_local_map
+            })
+            .collect();
+        for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
+            let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
+            segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
+        }
+        merged_doc_id_map
+    }
+
     fn write_postings_for_field(
         &self,
         indexed_field: Field,
-        _field_type: &FieldType,
-        serializer: &mut InvertedIndexSerializer,
+        field_name: &str,
         fieldnorm_reader: Option<FieldNormReader>,
         doc_id_mapping: &SegmentDocIdMapping,
+        merged_doc_id_map: &[Vec<Option<DocId>>],
+    ) -> crate::Result<SerializedFieldPosting> {
+        // Note that the total number of tokens is not exact.
+        // It is only used as a parameter in the BM25 formula.
+        let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
+        let postings_for_field_span = tracing::info_span!(
+            "write_postings_for_field",
+            field = %field_name,
+            num_readers = self.readers.len(),
+            total_num_tokens_estimate = total_num_tokens,
+            output_terms_bytes = tracing::field::Empty,
+            output_postings_bytes = tracing::field::Empty,
+            output_positions_bytes = tracing::field::Empty,
+            output_total_bytes = tracing::field::Empty,
+            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial()
+        );
+        let _enter = postings_for_field_span.enter();
+        let field_entry = self.schema.get_field_entry(indexed_field);
+        let mut terms_write = CountingWriter::wrap(TempFieldWrite::create("terms")?);
+        let mut postings_write = CountingWriter::wrap(TempFieldWrite::create("postings")?);
+        let mut positions_write = CountingWriter::wrap(TempFieldWrite::create("positions")?);
+        let mut field_serializer = FieldSerializer::create(
+            field_entry.field_type(),
+            total_num_tokens,
+            &mut terms_write,
+            &mut postings_write,
+            &mut positions_write,
+            fieldnorm_reader,
+        )?;
+        self.serialize_postings_into_field(
+            indexed_field,
+            field_entry.field_type(),
+            &mut field_serializer,
+            doc_id_mapping,
+            merged_doc_id_map,
+        )?;
+        field_serializer.close()?;
+        let terms_bytes = terms_write.written_bytes();
+        let postings_bytes = postings_write.written_bytes();
+        let positions_bytes = positions_write.written_bytes();
+        let output_total_bytes = terms_bytes + postings_bytes + positions_bytes;
+        let span = tracing::Span::current();
+        span.record("output_terms_bytes", terms_bytes);
+        span.record("output_postings_bytes", postings_bytes);
+        span.record("output_positions_bytes", positions_bytes);
+        span.record("output_total_bytes", output_total_bytes);
+        Ok(SerializedFieldPosting {
+            field: indexed_field,
+            output_total_bytes,
+            serialized_field: SerializedFieldData {
+                terms_bytes,
+                postings_bytes,
+                positions_bytes,
+                terms_data: terms_write.finish(),
+                postings_data: postings_write.finish(),
+                positions_data: positions_write.finish(),
+            },
+        })
+    }
+
+    fn serialize_postings_into_field<W: std::io::Write>(
+        &self,
+        indexed_field: Field,
+        _field_type: &FieldType,
+        field_serializer: &mut FieldSerializer<'_, W>,
+        doc_id_mapping: &SegmentDocIdMapping,
+        merged_doc_id_map: &[Vec<Option<DocId>>],
     ) -> crate::Result<()> {
         debug_time!("write-postings-for-field");
         let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
@@ -515,6 +622,18 @@ impl IndexMerger {
 
         let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
 
+        // Create the total list of doc ids
+        // by stacking the doc ids from the different segment.
+        //
+        // In the new segments, the doc id from the different
+        // segment are stacked so that :
+        // - Segment 0's doc ids become doc id [0, seg.max_doc]
+        // - Segment 1's doc ids become  [seg0.max_doc, seg0.max_doc + seg.max_doc]
+        // - Segment 2's doc ids become  [seg0.max_doc + seg1.max_doc, seg0.max_doc + seg1.max_doc +
+        //   seg2.max_doc]
+        //
+        // This stacking applies only when the index is not sorted, in that case the
+        // doc_ids are kmerged by their sort property
         let field_readers: Vec<Arc<InvertedIndexReader>> = self
             .readers
             .iter()
@@ -529,50 +648,6 @@ impl IndexMerger {
         }
 
         let mut merged_terms = TermMerger::new(field_term_streams);
-
-        // map from segment doc ids to the resulting merged segment doc id.
-
-        let mut merged_doc_id_map: Vec<Vec<Option<DocId>>> = self
-            .readers
-            .iter()
-            .map(|reader| {
-                let mut segment_local_map = vec![];
-                segment_local_map.resize(reader.max_doc() as usize, None);
-                segment_local_map
-            })
-            .collect();
-        for (new_doc_id, old_doc_addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
-            let segment_map = &mut merged_doc_id_map[old_doc_addr.segment_ord as usize];
-            segment_map[old_doc_addr.doc_id as usize] = Some(new_doc_id as DocId);
-        }
-
-        // Note that the total number of tokens is not exact.
-        // It is only used as a parameter in the BM25 formula.
-        let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
-        let postings_for_field_span = tracing::info_span!(
-            "write_postings_for_field",
-            field = %self.schema.get_field_name(indexed_field),
-            num_readers = self.readers.len(),
-            total_num_tokens_estimate = total_num_tokens,
-            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial()
-        );
-        let _enter = postings_for_field_span.enter();
-
-        // Create the total list of doc ids
-        // by stacking the doc ids from the different segment.
-        //
-        // In the new segments, the doc id from the different
-        // segment are stacked so that :
-        // - Segment 0's doc ids become doc id [0, seg.max_doc]
-        // - Segment 1's doc ids become  [seg0.max_doc, seg0.max_doc + seg.max_doc]
-        // - Segment 2's doc ids become  [seg0.max_doc + seg1.max_doc, seg0.max_doc + seg1.max_doc +
-        //   seg2.max_doc]
-        //
-        // This stacking applies only when the index is not sorted, in that case the
-        // doc_ids are kmerged by their sort property
-        let mut field_serializer =
-            serializer.new_field(indexed_field, total_num_tokens, fieldnorm_reader)?;
-
         let field_entry = self.schema.get_field_entry(indexed_field);
 
         // ... set segment postings option the new field.
@@ -590,7 +665,6 @@ impl IndexMerger {
 
             let mut total_doc_freq = 0;
 
-            // Let's compute the list of non-empty posting lists
             for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
                 let segment_reader = &self.readers[segment_ord];
                 let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
@@ -712,7 +786,6 @@ impl IndexMerger {
             // closing the term.
             field_serializer.close_term()?;
         }
-        field_serializer.close()?;
         Ok(())
     }
 
@@ -730,21 +803,51 @@ impl IndexMerger {
         let postings_span = tracing::info_span!(
             "write_postings",
             doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
-            num_indexed_fields = num_indexed_fields
+            num_indexed_fields = num_indexed_fields,
+            postings_parallelism = self.postings_parallelism(),
+            total_serialized_postings_output_bytes = tracing::field::Empty
         );
         let _enter = postings_span.enter();
+        let mut field_jobs = Vec::new();
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
-                self.write_postings_for_field(
+                field_jobs.push(FieldPostingJob {
                     field,
-                    field_entry.field_type(),
-                    serializer,
+                    field_name: self.schema.get_field_name(field).to_string(),
                     fieldnorm_reader,
-                    doc_id_mapping,
-                )?;
+                });
             }
         }
+        let merged_doc_id_map = self.build_merged_doc_id_map(doc_id_mapping);
+        let postings_field_executor = if self.postings_parallelism() <= 1 {
+            Executor::single_thread()
+        } else {
+            Executor::multi_thread(self.postings_parallelism(), "postings_field_")?
+        };
+        let field_results = postings_field_executor.map(
+            |field_job| {
+                self.write_postings_for_field(
+                    field_job.field,
+                    &field_job.field_name,
+                    field_job.fieldnorm_reader,
+                    doc_id_mapping,
+                    &merged_doc_id_map,
+                )
+            },
+            field_jobs.into_iter(),
+        )?;
+        let total_serialized_postings_output_bytes = field_results
+            .iter()
+            .map(|field_result| field_result.output_total_bytes)
+            .sum::<u64>();
+        for field_result in field_results {
+            serializer.write_serialized_field(field_result.field, field_result.serialized_field)?;
+        }
+        tracing::Span::current().record(
+            "total_serialized_postings_output_bytes",
+            total_serialized_postings_output_bytes,
+        );
         Ok(())
     }
 

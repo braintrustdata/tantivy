@@ -25,6 +25,7 @@ pub(crate) use self::per_field_postings_writer::PerFieldPostingsWriter;
 pub use self::postings::Postings;
 pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, PostingsWriter};
 pub use self::segment_postings::SegmentPostings;
+pub(crate) use self::serializer::{SerializedFieldData, TempFieldWrite};
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
 pub use self::term_info::TermInfo;
