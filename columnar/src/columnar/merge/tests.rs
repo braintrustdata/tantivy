@@ -90,9 +90,7 @@ fn test_group_columns_required_column_with_no_existing_columns() {
         .get(&("required_col".to_string(), ColumnTypeCategory::Str))
         .unwrap()
         .columns;
-    assert_eq!(columns.len(), 2);
-    assert!(columns[0].is_none());
-    assert!(columns[1].is_none());
+    assert!(columns.is_empty());
 }
 
 #[test]
@@ -123,20 +121,20 @@ fn test_missing_column() {
     assert_eq!(column_map.len(), 2);
     assert!(column_map.contains_key(&("numbers".to_string(), ColumnTypeCategory::Numerical)));
     {
-        let columns = &column_map
+        let grouped_columns = column_map
             .get(&("numbers".to_string(), ColumnTypeCategory::Numerical))
-            .unwrap()
-            .columns;
-        assert!(columns[0].is_some());
-        assert!(columns[1].is_none());
+            .unwrap();
+        assert_eq!(grouped_columns.num_columnars, 2);
+        assert_eq!(grouped_columns.columns.len(), 1);
+        assert_eq!(grouped_columns.columns[0].0, 0);
     }
     {
-        let columns = &column_map
+        let grouped_columns = column_map
             .get(&("numbers2".to_string(), ColumnTypeCategory::Numerical))
-            .unwrap()
-            .columns;
-        assert!(columns[0].is_none());
-        assert!(columns[1].is_some());
+            .unwrap();
+        assert_eq!(grouped_columns.num_columnars, 2);
+        assert_eq!(grouped_columns.columns.len(), 1);
+        assert_eq!(grouped_columns.columns[0].0, 1);
     }
 }
 
