@@ -263,33 +263,30 @@ impl GroupedColumns {
 
 struct GroupedColumnsHandle {
     required_column_type: Option<ColumnType>,
-    columns: Vec<Option<DynamicColumnHandle>>,
+    num_columnars: usize,
+    columns: Vec<(u32, DynamicColumnHandle)>,
 }
 
 impl GroupedColumnsHandle {
     fn new(num_columnars: usize) -> Self {
         GroupedColumnsHandle {
             required_column_type: None,
-            columns: vec![None; num_columnars],
+            num_columnars,
+            columns: Vec::new(),
         }
     }
     fn open(self, merge_row_order: &MergeRowOrder) -> io::Result<GroupedColumns> {
-        let mut columns: Vec<Option<DynamicColumn>> = Vec::new();
-        for (columnar_id, column) in self.columns.iter().enumerate() {
-            if let Some(column) = column {
-                let column = column.open()?;
-                // We skip columns that end up with 0 documents.
-                // That way, we make sure they don't end up influencing the merge type or
-                // creating empty columns.
-
-                if is_empty_after_merge(merge_row_order, &column, columnar_id) {
-                    columns.push(None);
-                } else {
-                    columns.push(Some(column));
-                }
-            } else {
-                columns.push(None);
+        let mut columns: Vec<Option<DynamicColumn>> = vec![None; self.num_columnars];
+        for (columnar_id, column) in self.columns {
+            let column = column.open()?;
+            let columnar_id = columnar_id as usize;
+            // We skip columns that end up with 0 documents.
+            // That way, we make sure they don't end up influencing the merge type or
+            // creating empty columns.
+            if is_empty_after_merge(merge_row_order, &column, columnar_id) {
+                continue;
             }
+            columns[columnar_id] = Some(column);
         }
         Ok(GroupedColumns {
             required_column_type: self.required_column_type,
@@ -299,7 +296,9 @@ impl GroupedColumnsHandle {
 
     /// Set the dynamic column for a given columnar.
     fn set_column(&mut self, columnar_id: usize, column: DynamicColumnHandle) {
-        self.columns[columnar_id] = Some(column);
+        let columnar_id = u32::try_from(columnar_id)
+            .expect("columnar_id exceeds u32::MAX while grouping columns for merge");
+        self.columns.push((columnar_id, column));
     }
 
     /// Force the existence of a column, as well as its type.
