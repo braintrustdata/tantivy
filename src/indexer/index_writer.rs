@@ -39,6 +39,21 @@ pub const MAX_NUM_THREAD: usize = 8;
 // reaches `PIPELINE_MAX_SIZE_IN_DOCS`
 const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
 
+#[derive(Clone)]
+/// Handle for waiting on background merge work without consuming the index writer.
+pub struct MergeWaiter {
+    segment_updater: SegmentUpdater,
+}
+
+impl MergeWaiter {
+    /// Blocks until the writer has no merge operations in flight.
+    pub fn wait(self) -> crate::Result<()> {
+        self.segment_updater
+            .wait_merging_thread()
+            .map_err(|_| error_in_index_worker_thread("Failed to join merging thread."))
+    }
+}
+
 fn error_in_index_worker_thread(context: &str) -> TantivyError {
     TantivyError::ErrorInThread(format!(
         "{context}. A worker thread encountered an error (io::Error most likely) or panicked."
@@ -660,6 +675,13 @@ impl<D: Document> IndexWriter<D> {
 
     pub(crate) fn segment_updater(&self) -> &SegmentUpdater {
         &self.segment_updater
+    }
+
+    /// Returns a handle that can wait for background merges without consuming the writer.
+    pub fn merge_waiter(&self) -> MergeWaiter {
+        MergeWaiter {
+            segment_updater: self.segment_updater.clone(),
+        }
     }
 
     /// Delete all documents containing a given term.
