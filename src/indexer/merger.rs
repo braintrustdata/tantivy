@@ -8,6 +8,7 @@ use common::{CountingWriter, ReadOnlyBitSet, TerminatingWrite};
 use itertools::Itertools;
 use measure_time::debug_time;
 
+use super::segment_serializer::SegmentSerializerParts;
 use crate::core::Executor;
 use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
@@ -18,8 +19,7 @@ use crate::index::{Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
 use crate::postings::{
-    FieldSerializer, InvertedIndexSerializer, Postings, SegmentPostings, SerializedFieldData,
-    TempFieldWrite,
+    FieldSerializer, Postings, SegmentPostings, SerializedFieldData, TempFieldWrite,
 };
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
@@ -45,6 +45,24 @@ struct SerializedFieldPosting {
     field: Field,
     output_total_bytes: u64,
     serialized_field: SerializedFieldData,
+}
+
+enum MergeWriteTask {
+    Postings(FieldPostingJob),
+    StorableFields {
+        store_writer: StoreWriter,
+        doc_id_mapping: SegmentDocIdMapping,
+    },
+    FastFields {
+        fast_field_write: WritePtr,
+        doc_id_mapping: SegmentDocIdMapping,
+    },
+}
+
+enum MergeWriteTaskOutput {
+    Postings(SerializedFieldPosting),
+    StorableFields,
+    FastFields,
 }
 
 fn estimate_total_num_tokens_in_single_segment(
@@ -789,68 +807,6 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_postings(
-        &self,
-        serializer: &mut InvertedIndexSerializer,
-        fieldnorm_readers: FieldNormReaders,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        let num_indexed_fields = self
-            .schema
-            .fields()
-            .filter(|(_, field_entry)| field_entry.is_indexed())
-            .count();
-        let postings_span = tracing::info_span!(
-            "write_postings",
-            doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
-            num_indexed_fields = num_indexed_fields,
-            postings_parallelism = self.postings_parallelism(),
-            total_serialized_postings_output_bytes = tracing::field::Empty
-        );
-        let _enter = postings_span.enter();
-        let mut field_jobs = Vec::new();
-        for (field, field_entry) in self.schema.fields() {
-            let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
-            if field_entry.is_indexed() {
-                field_jobs.push(FieldPostingJob {
-                    field,
-                    field_name: self.schema.get_field_name(field).to_string(),
-                    fieldnorm_reader,
-                });
-            }
-        }
-        let merged_doc_id_map = self.build_merged_doc_id_map(doc_id_mapping);
-        let postings_field_executor = if self.postings_parallelism() <= 1 {
-            Executor::single_thread()
-        } else {
-            Executor::multi_thread(self.postings_parallelism(), "postings_field_")?
-        };
-        let field_results = postings_field_executor.map(
-            |field_job| {
-                self.write_postings_for_field(
-                    field_job.field,
-                    &field_job.field_name,
-                    field_job.fieldnorm_reader,
-                    doc_id_mapping,
-                    &merged_doc_id_map,
-                )
-            },
-            field_jobs.into_iter(),
-        )?;
-        let total_serialized_postings_output_bytes = field_results
-            .iter()
-            .map(|field_result| field_result.output_total_bytes)
-            .sum::<u64>();
-        for field_result in field_results {
-            serializer.write_serialized_field(field_result.field, field_result.serialized_field)?;
-        }
-        tracing::Span::current().record(
-            "total_serialized_postings_output_bytes",
-            total_serialized_postings_output_bytes,
-        );
-        Ok(())
-    }
-
     fn write_storable_fields(
         &self,
         store_writer: &mut StoreWriter,
@@ -989,31 +945,110 @@ impl IndexMerger {
                 FieldNormReaders::open(fieldnorm_data)
             },
         )?;
-        self.write_postings(
-            serializer.get_postings_serializer(),
-            fieldnorm_readers,
-            &doc_id_mapping,
+        let SegmentSerializerParts {
+            mut segment,
+            store_writer,
+            fast_field_write,
+            fieldnorms_serializer,
+            mut postings_serializer,
+        } = serializer.into_parts();
+        debug_assert!(fieldnorms_serializer.is_none());
+        let mut write_tasks = Vec::new();
+        for (field, field_entry) in self.schema.fields() {
+            let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
+            if field_entry.is_indexed() {
+                write_tasks.push(MergeWriteTask::Postings(FieldPostingJob {
+                    field,
+                    field_name: self.schema.get_field_name(field).to_string(),
+                    fieldnorm_reader,
+                }));
+            }
+        }
+        let merged_doc_id_map = self.build_merged_doc_id_map(&doc_id_mapping);
+        write_tasks.push(MergeWriteTask::StorableFields {
+            store_writer,
+            doc_id_mapping: doc_id_mapping.clone(),
+        });
+        write_tasks.push(MergeWriteTask::FastFields {
+            fast_field_write,
+            doc_id_mapping: doc_id_mapping.clone(),
+        });
+        let merge_write_executor = if self.postings_parallelism() <= 1 {
+            Executor::single_thread()
+        } else {
+            Executor::multi_thread(self.postings_parallelism(), "merge_write_")?
+        };
+        let write_results = merge_write_executor.map(
+            |task| match task {
+                MergeWriteTask::Postings(field_job) => self
+                    .write_postings_for_field(
+                        field_job.field,
+                        &field_job.field_name,
+                        field_job.fieldnorm_reader,
+                        &doc_id_mapping,
+                        &merged_doc_id_map,
+                    )
+                    .map(MergeWriteTaskOutput::Postings),
+                MergeWriteTask::StorableFields {
+                    mut store_writer,
+                    doc_id_mapping,
+                } => {
+                    debug!("write-storagefields");
+                    self.write_storable_fields(&mut store_writer, &doc_id_mapping)?;
+                    tracing::info_span!("close_store_writer").in_scope(|| store_writer.close())?;
+                    Ok(MergeWriteTaskOutput::StorableFields)
+                }
+                MergeWriteTask::FastFields {
+                    mut fast_field_write,
+                    doc_id_mapping,
+                } => {
+                    debug!("write-fastfields");
+                    self.write_fast_fields(&mut fast_field_write, doc_id_mapping)?;
+                    tracing::info_span!("close_fast_fields_writer")
+                        .in_scope(|| fast_field_write.terminate())?;
+                    Ok(MergeWriteTaskOutput::FastFields)
+                }
+            },
+            write_tasks.into_iter(),
         )?;
-
-        debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
-        debug!("write-fastfields");
-        self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping.clone())?;
+        let total_serialized_postings_output_bytes = write_results
+            .iter()
+            .filter_map(|result| match result {
+                MergeWriteTaskOutput::Postings(field_result) => {
+                    Some(field_result.output_total_bytes)
+                }
+                MergeWriteTaskOutput::StorableFields | MergeWriteTaskOutput::FastFields => None,
+            })
+            .sum::<u64>();
+        for write_result in write_results {
+            if let MergeWriteTaskOutput::Postings(field_result) = write_result {
+                postings_serializer
+                    .write_serialized_field(field_result.field, field_result.serialized_field)?;
+            }
+        }
+        tracing::info_span!("close_postings_serializer")
+            .in_scope(|| postings_serializer.close())?;
+        tracing::Span::current().record(
+            "total_serialized_postings_output_bytes",
+            total_serialized_postings_output_bytes,
+        );
 
         // Write vectors if there are any vector fields
         if has_vector_fields {
             debug!("write-vectors");
-            let vector_write = tracing::info_span!("open_vector_writer").in_scope(|| {
-                serializer
-                    .segment_mut()
-                    .open_write(SegmentComponent::Vectors)
-            })?;
+            let vector_write = tracing::info_span!("open_vector_writer")
+                .in_scope(|| segment.open_write(SegmentComponent::Vectors))?;
             tracing::info_span!("write_vectors")
                 .in_scope(|| self.write_vectors(vector_write, &doc_id_mapping))?;
         }
 
         debug!("close-serializer");
-        tracing::info_span!("close_serializer").in_scope(|| serializer.close())?;
+        tracing::info_span!("close_serializer").in_scope(|| -> crate::Result<()> {
+            if let Some(fieldnorms_serializer) = fieldnorms_serializer {
+                fieldnorms_serializer.close()?;
+            }
+            Ok(())
+        })?;
         Ok(self.max_doc)
     }
 
