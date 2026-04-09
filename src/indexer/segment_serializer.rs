@@ -16,6 +16,14 @@ pub struct SegmentSerializer {
     postings_serializer: InvertedIndexSerializer,
 }
 
+pub struct SegmentSerializerParts {
+    pub(crate) segment: Segment,
+    pub(crate) store_writer: StoreWriter,
+    pub(crate) fast_field_write: WritePtr,
+    pub(crate) fieldnorms_serializer: Option<FieldNormsSerializer>,
+    pub(crate) postings_serializer: InvertedIndexSerializer,
+}
+
 impl SegmentSerializer {
     /// Creates a new `SegmentSerializer`.
     pub fn for_segment(
@@ -96,6 +104,16 @@ impl SegmentSerializer {
     /// Accessor to the `StoreWriter`.
     pub fn get_store_writer(&mut self) -> &mut StoreWriter {
         &mut self.store_writer
+    }
+
+    pub fn into_parts(self) -> SegmentSerializerParts {
+        SegmentSerializerParts {
+            segment: self.segment,
+            store_writer: self.store_writer,
+            fast_field_write: self.fast_field_write,
+            fieldnorms_serializer: self.fieldnorms_serializer,
+            postings_serializer: self.postings_serializer,
+        }
     }
 
     /// Finalize the segment serialization.
