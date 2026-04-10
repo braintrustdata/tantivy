@@ -87,6 +87,7 @@ fn garbage_collect_files(
 /// This function happens in the calling thread and is computationally expensive.
 fn merge(
     index: &Index,
+    merge_thread_pool: &ThreadPool,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
 ) -> crate::Result<Option<SegmentEntry>> {
@@ -144,7 +145,7 @@ fn merge(
         .in_scope(|| SegmentSerializer::for_segment(merged_segment.clone(), true))?;
 
     let num_docs = tracing::info_span!("write_merged_segment")
-        .in_scope(|| merger.write(segment_serializer))?;
+        .in_scope(|| merger.write(segment_serializer, Some(merge_thread_pool)))?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -250,7 +251,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         filter_doc_ids,
     )?;
     let segment_serializer = SegmentSerializer::for_segment(merged_segment, true)?;
-    let num_docs = merger.write(segment_serializer)?;
+    let num_docs = merger.write(segment_serializer, None)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
 
@@ -548,6 +549,7 @@ impl SegmentUpdater {
             // candidate for another merge.
             match merge(
                 &segment_updater.index,
+                &segment_updater.merge_thread_pool,
                 segment_entries,
                 merge_operation.target_opstamp(),
             ) {
@@ -701,6 +703,12 @@ impl SegmentUpdater {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rayon::prelude::*;
+    use rayon::ThreadPoolBuilder;
+
     use super::merge_indices;
     use crate::collector::TopDocs;
     use crate::directory::RamDirectory;
@@ -711,6 +719,39 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::*;
     use crate::{Directory, DocAddress, Index, Segment};
+
+    #[test]
+    fn test_nested_merge_thread_pool_parallelism_does_not_deadlock() {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(4)
+                .thread_name(|i| format!("merge-thread-test-{i}"))
+                .build()
+                .unwrap(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        for outer_job in 0..8usize {
+            let pool_for_spawn = pool.clone();
+            let pool_for_install = pool.clone();
+            let tx = tx.clone();
+            pool_for_spawn.spawn(move || {
+                let result = pool_for_install.install(|| {
+                    (0..8usize)
+                        .into_par_iter()
+                        .map(|inner_job| {
+                            std::thread::sleep(Duration::from_millis(1));
+                            outer_job * 100 + inner_job
+                        })
+                        .sum::<usize>()
+                });
+                tx.send(result).unwrap();
+            });
+        }
+        drop(tx);
+
+        let results: Vec<_> = rx.iter().collect();
+        assert_eq!(results.len(), 8);
+    }
 
     #[test]
     fn test_delete_during_merge() -> crate::Result<()> {
