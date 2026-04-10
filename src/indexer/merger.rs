@@ -7,9 +7,10 @@ use columnar::{
 use common::{CountingWriter, ReadOnlyBitSet, TerminatingWrite};
 use itertools::Itertools;
 use measure_time::debug_time;
+use rayon::prelude::*;
+use rayon::ThreadPool;
 
 use super::segment_serializer::SegmentSerializerParts;
-use crate::core::Executor;
 use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
@@ -890,12 +891,54 @@ impl IndexMerger {
         Ok(())
     }
 
+    fn run_merge_write_task(
+        &self,
+        task: MergeWriteTask,
+        doc_id_mapping: &SegmentDocIdMapping,
+        merged_doc_id_map: &[Vec<Option<DocId>>],
+    ) -> crate::Result<MergeWriteTaskOutput> {
+        match task {
+            MergeWriteTask::Postings(field_job) => self
+                .write_postings_for_field(
+                    field_job.field,
+                    &field_job.field_name,
+                    field_job.fieldnorm_reader,
+                    doc_id_mapping,
+                    merged_doc_id_map,
+                )
+                .map(MergeWriteTaskOutput::Postings),
+            MergeWriteTask::StorableFields {
+                mut store_writer,
+                doc_id_mapping,
+            } => {
+                debug!("write-storagefields");
+                self.write_storable_fields(&mut store_writer, &doc_id_mapping)?;
+                tracing::info_span!("close_store_writer").in_scope(|| store_writer.close())?;
+                Ok(MergeWriteTaskOutput::StorableFields)
+            }
+            MergeWriteTask::FastFields {
+                mut fast_field_write,
+                doc_id_mapping,
+            } => {
+                debug!("write-fastfields");
+                self.write_fast_fields(&mut fast_field_write, doc_id_mapping)?;
+                tracing::info_span!("close_fast_fields_writer")
+                    .in_scope(|| fast_field_write.terminate())?;
+                Ok(MergeWriteTaskOutput::FastFields)
+            }
+        }
+    }
+
     /// Writes the merged segment by pushing information
     /// to the `SegmentSerializer`.
     ///
     /// # Returns
     /// The number of documents in the resulting segment.
-    pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+    pub fn write(
+        &self,
+        mut serializer: SegmentSerializer,
+        merge_thread_pool: Option<&ThreadPool>,
+    ) -> crate::Result<u32> {
         let input_space_usage = MergeInputSpaceUsage::from_readers(&self.readers)?;
         let has_vector_fields = self.has_vector_fields();
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
@@ -973,44 +1016,26 @@ impl IndexMerger {
             fast_field_write,
             doc_id_mapping: doc_id_mapping.clone(),
         });
-        let merge_write_executor = if self.postings_parallelism() <= 1 {
-            Executor::single_thread()
+        let write_results = if self.postings_parallelism() <= 1 || write_tasks.len() <= 1 {
+            write_tasks
+                .into_iter()
+                .map(|task| self.run_merge_write_task(task, &doc_id_mapping, &merged_doc_id_map))
+                .collect::<crate::Result<Vec<_>>>()?
+        } else if let Some(merge_thread_pool) = merge_thread_pool {
+            merge_thread_pool.install(|| {
+                write_tasks
+                    .into_par_iter()
+                    .map(|task| {
+                        self.run_merge_write_task(task, &doc_id_mapping, &merged_doc_id_map)
+                    })
+                    .collect::<crate::Result<Vec<_>>>()
+            })?
         } else {
-            Executor::multi_thread(self.postings_parallelism(), "merge_write_")?
+            write_tasks
+                .into_iter()
+                .map(|task| self.run_merge_write_task(task, &doc_id_mapping, &merged_doc_id_map))
+                .collect::<crate::Result<Vec<_>>>()?
         };
-        let write_results = merge_write_executor.map(
-            |task| match task {
-                MergeWriteTask::Postings(field_job) => self
-                    .write_postings_for_field(
-                        field_job.field,
-                        &field_job.field_name,
-                        field_job.fieldnorm_reader,
-                        &doc_id_mapping,
-                        &merged_doc_id_map,
-                    )
-                    .map(MergeWriteTaskOutput::Postings),
-                MergeWriteTask::StorableFields {
-                    mut store_writer,
-                    doc_id_mapping,
-                } => {
-                    debug!("write-storagefields");
-                    self.write_storable_fields(&mut store_writer, &doc_id_mapping)?;
-                    tracing::info_span!("close_store_writer").in_scope(|| store_writer.close())?;
-                    Ok(MergeWriteTaskOutput::StorableFields)
-                }
-                MergeWriteTask::FastFields {
-                    mut fast_field_write,
-                    doc_id_mapping,
-                } => {
-                    debug!("write-fastfields");
-                    self.write_fast_fields(&mut fast_field_write, doc_id_mapping)?;
-                    tracing::info_span!("close_fast_fields_writer")
-                        .in_scope(|| fast_field_write.terminate())?;
-                    Ok(MergeWriteTaskOutput::FastFields)
-                }
-            },
-            write_tasks.into_iter(),
-        )?;
         let total_serialized_postings_output_bytes = write_results
             .iter()
             .filter_map(|result| match result {
