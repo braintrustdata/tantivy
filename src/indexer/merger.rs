@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use columnar::{
     ColumnType, ColumnValues, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder,
@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use rayon::ThreadPool;
 
 use super::segment_serializer::SegmentSerializerParts;
-use crate::directory::WritePtr;
+use crate::directory::{Directory, WritePtr};
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
@@ -218,6 +218,12 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
 }
 
 impl IndexMerger {
+    fn scratch_temp_root(&self) -> Option<PathBuf> {
+        self.segments
+            .first()
+            .and_then(|segment| segment.index().directory().scratch_temp_root())
+    }
+
     fn postings_parallelism(&self) -> usize {
         self.index_settings
             .merge_postings_parallelism
@@ -572,6 +578,7 @@ impl IndexMerger {
         // Note that the total number of tokens is not exact.
         // It is only used as a parameter in the BM25 formula.
         let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
+        let scratch_temp_root = self.scratch_temp_root();
         let postings_for_field_span = tracing::info_span!(
             "write_postings_for_field",
             field = %field_name,
@@ -585,9 +592,18 @@ impl IndexMerger {
         );
         let _enter = postings_for_field_span.enter();
         let field_entry = self.schema.get_field_entry(indexed_field);
-        let mut terms_write = CountingWriter::wrap(TempFieldWrite::create("terms")?);
-        let mut postings_write = CountingWriter::wrap(TempFieldWrite::create("postings")?);
-        let mut positions_write = CountingWriter::wrap(TempFieldWrite::create("positions")?);
+        let mut terms_write = CountingWriter::wrap(TempFieldWrite::create(
+            "terms",
+            scratch_temp_root.as_deref(),
+        )?);
+        let mut postings_write = CountingWriter::wrap(TempFieldWrite::create(
+            "postings",
+            scratch_temp_root.as_deref(),
+        )?);
+        let mut positions_write = CountingWriter::wrap(TempFieldWrite::create(
+            "positions",
+            scratch_temp_root.as_deref(),
+        )?);
         let mut field_serializer = FieldSerializer::create(
             field_entry.field_type(),
             total_num_tokens,

@@ -187,6 +187,12 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// effectively stored durably.
     fn sync_directory(&self) -> io::Result<()>;
 
+    /// Returns an optional scratch root for temporary files created during large write
+    /// operations such as merges.
+    fn scratch_temp_root(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Acquire a lock in the directory given in the [`Lock`].
     ///
     /// The method is blocking or not depending on the [`Lock`] object.
@@ -234,7 +240,8 @@ pub trait DirectoryClone {
 }
 
 impl<T> DirectoryClone for T
-where T: 'static + Directory + Clone
+where
+    T: 'static + Directory + Clone,
 {
     fn box_clone(&self) -> Box<dyn Directory> {
         Box::new(self.clone())
