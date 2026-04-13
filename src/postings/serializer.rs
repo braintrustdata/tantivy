@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::{BinarySerializable, CountingWriter, VInt};
 use uuid::Uuid;
@@ -62,9 +62,15 @@ pub(crate) struct TempFieldWrite {
 }
 
 impl TempFieldWrite {
-    pub(crate) fn create(component_name: &str) -> io::Result<Self> {
+    pub(crate) fn create(
+        component_name: &str,
+        scratch_temp_root: Option<&Path>,
+    ) -> io::Result<Self> {
+        let scratch_temp_root = scratch_temp_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
         for _ in 0..4 {
-            let path = std::env::temp_dir().join(format!(
+            let path = scratch_temp_root.join(format!(
                 "tantivy-postings-{component_name}-{}.tmp",
                 Uuid::new_v4().simple()
             ));

@@ -323,6 +323,10 @@ impl Directory for ManagedDirectory {
         self.directory.sync_directory()?;
         Ok(())
     }
+
+    fn scratch_temp_root(&self) -> Option<PathBuf> {
+        self.directory.scratch_temp_root()
+    }
 }
 
 impl Clone for ManagedDirectory {
