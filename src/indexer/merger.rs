@@ -1038,10 +1038,12 @@ impl IndexMerger {
                 .map(|task| self.run_merge_write_task(task, &doc_id_mapping, &merged_doc_id_map))
                 .collect::<crate::Result<Vec<_>>>()?
         } else if let Some(merge_thread_pool) = merge_thread_pool {
+            let parent_span = tracing::Span::current();
             merge_thread_pool.install(|| {
                 write_tasks
                     .into_par_iter()
                     .map(|task| {
+                        let _parent_span_guard = parent_span.enter();
                         self.run_merge_write_task(task, &doc_id_mapping, &merged_doc_id_map)
                     })
                     .collect::<crate::Result<Vec<_>>>()
