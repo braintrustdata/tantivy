@@ -7,7 +7,7 @@ use common::BitSet;
 use smallvec::smallvec;
 
 use super::operation::{AddOperation, UserOperation};
-use super::segment_updater::SegmentUpdater;
+use super::segment_updater::{SegmentUpdater, DEFAULT_NUM_MERGE_THREADS};
 use super::{AddBatch, AddBatchReceiver, AddBatchSender, PreparedCommit};
 use crate::directory::{DirectoryLock, GarbageCollectionResult, TerminatingWrite};
 use crate::error::TantivyError;
@@ -284,6 +284,22 @@ impl<D: Document> IndexWriter<D> {
         memory_budget_in_bytes_per_thread: usize,
         directory_lock: DirectoryLock,
     ) -> crate::Result<Self> {
+        Self::new_with_merge_threads(
+            index,
+            num_threads,
+            DEFAULT_NUM_MERGE_THREADS,
+            memory_budget_in_bytes_per_thread,
+            directory_lock,
+        )
+    }
+
+    pub(crate) fn new_with_merge_threads(
+        index: &Index,
+        num_threads: usize,
+        num_merge_threads: usize,
+        memory_budget_in_bytes_per_thread: usize,
+        directory_lock: DirectoryLock,
+    ) -> crate::Result<Self> {
         if memory_budget_in_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             let err_msg = format!(
                 "The memory arena in bytes per thread needs to be at least \
@@ -306,8 +322,12 @@ impl<D: Document> IndexWriter<D> {
 
         let stamper = Stamper::new(current_opstamp);
 
-        let segment_updater =
-            SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
+        let segment_updater = SegmentUpdater::create_with_merge_threads(
+            index.clone(),
+            stamper.clone(),
+            &delete_queue.cursor(),
+            num_merge_threads,
+        )?;
 
         let mut index_writer = Self {
             _directory_lock: Some(directory_lock),
