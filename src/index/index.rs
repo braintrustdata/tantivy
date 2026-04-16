@@ -17,6 +17,7 @@ use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN};
 use crate::indexer::segment_updater::save_metas;
+use crate::indexer::segment_updater::DEFAULT_NUM_MERGE_THREADS;
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
@@ -565,6 +566,20 @@ impl Index {
         num_threads: usize,
         overall_memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {
+        self.writer_with_num_threads_and_merge_threads(
+            num_threads,
+            DEFAULT_NUM_MERGE_THREADS,
+            overall_memory_budget_in_bytes,
+        )
+    }
+
+    /// Open a new index writer and configure the merge thread pool size.
+    pub fn writer_with_num_threads_and_merge_threads<D: Document>(
+        &self,
+        num_threads: usize,
+        num_merge_threads: usize,
+        overall_memory_budget_in_bytes: usize,
+    ) -> crate::Result<IndexWriter<D>> {
         let directory_lock = self
             .directory
             .acquire_lock(&INDEX_WRITER_LOCK)
@@ -580,9 +595,10 @@ impl Index {
                 )
             })?;
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
-        IndexWriter::new(
+        IndexWriter::new_with_merge_threads(
             self,
             num_threads,
+            num_merge_threads,
             memory_arena_in_bytes_per_thread,
             directory_lock,
         )
