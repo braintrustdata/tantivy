@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use serde::Deserialize;
 
 use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
@@ -83,6 +84,56 @@ fn garbage_collect_files(
         .garbage_collect(move || segment_updater.list_files())
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct BrainstoreCommitPayload {
+    #[serde(default)]
+    brainstore_operation: Option<String>,
+    #[serde(default)]
+    brainstore_segment_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MergeTracingContext {
+    brainstore_operation: String,
+    brainstore_segment_id: String,
+    payload: String,
+}
+
+impl MergeTracingContext {
+    fn from_index_meta(index_meta: &IndexMeta) -> Self {
+        let payload = index_meta.payload.clone().unwrap_or_default();
+        let mut tracing_context = MergeTracingContext {
+            payload: payload.clone(),
+            ..MergeTracingContext::default()
+        };
+        if let Ok(commit_payload) = serde_json::from_str::<BrainstoreCommitPayload>(&payload) {
+            tracing_context.brainstore_operation =
+                commit_payload.brainstore_operation.unwrap_or_default();
+            tracing_context.brainstore_segment_id =
+                commit_payload.brainstore_segment_id.unwrap_or_default();
+        }
+        tracing_context
+    }
+}
+
+fn segment_ids_for_logging(segment_ids: &[SegmentId]) -> Vec<String> {
+    segment_ids.iter().map(SegmentId::uuid_string).collect()
+}
+
+fn segment_entries_for_logging(segment_entries: &[SegmentEntry]) -> Vec<String> {
+    segment_entries
+        .iter()
+        .map(|segment_entry| segment_entry.segment_id().uuid_string())
+        .collect()
+}
+
+fn merge_candidate_sizes(merge_candidates: &[MergeCandidate]) -> Vec<usize> {
+    merge_candidates
+        .iter()
+        .map(|merge_candidate| merge_candidate.0.len())
+        .collect()
+}
+
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
 /// This function happens in the calling thread and is computationally expensive.
 fn merge(
@@ -90,8 +141,10 @@ fn merge(
     merge_thread_pool: &ThreadPool,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
+    tracing_context: &MergeTracingContext,
 ) -> crate::Result<Option<SegmentEntry>> {
     let input_num_segments = segment_entries.len();
+    let input_segment_ids = segment_entries_for_logging(&segment_entries);
     let input_num_docs = segment_entries
         .iter()
         .map(|segment| segment.meta().num_docs() as u64)
@@ -109,6 +162,10 @@ fn merge(
         .sum::<u64>();
     let merge_span = tracing::info_span!(
         "merge",
+        brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+        brainstore_operation = tracing_context.brainstore_operation.as_str(),
+        commit_payload = tracing_context.payload.as_str(),
+        input_segment_ids = tracing::field::debug(&input_segment_ids),
         num_input_segments = input_num_segments,
         input_num_docs = input_num_docs,
         input_max_doc = input_max_doc,
@@ -150,6 +207,15 @@ fn merge(
     let merged_segment_id = merged_segment.id();
 
     let segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
+    tracing::info!(
+        brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+        brainstore_operation = tracing_context.brainstore_operation.as_str(),
+        commit_payload = tracing_context.payload.as_str(),
+        input_segment_ids = tracing::field::debug(&input_segment_ids),
+        output_segment_id = merged_segment_id.uuid_string(),
+        output_num_docs = num_docs,
+        "Finished merge candidate",
+    );
     Ok(Some(SegmentEntry::new(segment_meta, delete_cursor, None)))
 }
 
@@ -525,27 +591,48 @@ impl SegmentUpdater {
         );
 
         let segment_updater = self.clone();
+        let tracing_context = MergeTracingContext::from_index_meta(self.load_meta().as_ref());
+        let merge_segment_ids = segment_ids_for_logging(merge_operation.segment_ids());
         let segment_entries: Vec<SegmentEntry> = match self
             .segment_manager
             .start_merge(merge_operation.segment_ids())
         {
             Ok(segment_entries) => segment_entries,
             Err(err) => {
-                warn!(
-                    "Starting the merge failed for the following reason. This is not fatal. {}",
-                    err
+                tracing::warn!(
+                    brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+                    brainstore_operation = tracing_context.brainstore_operation.as_str(),
+                    commit_payload = tracing_context.payload.as_str(),
+                    merge_segment_ids = tracing::field::debug(&merge_segment_ids),
+                    error = tracing::field::display(&err),
+                    "Starting merge candidate failed",
                 );
                 return err.into();
             }
         };
 
-        debug!("Starting merge  - {:?}", merge_operation.segment_ids());
+        let segment_entry_ids = segment_entries_for_logging(&segment_entries);
+        tracing::info!(
+            brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+            brainstore_operation = tracing_context.brainstore_operation.as_str(),
+            commit_payload = tracing_context.payload.as_str(),
+            merge_segment_ids = tracing::field::debug(&merge_segment_ids),
+            segment_entry_ids = tracing::field::debug(&segment_entry_ids),
+            num_input_segments = segment_entries.len(),
+            target_opstamp = merge_operation.target_opstamp(),
+            "Starting merge candidate",
+        );
 
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
         let span = tracing::info_span!(
             "merge_thread",
+            brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+            brainstore_operation = tracing_context.brainstore_operation.as_str(),
+            commit_payload = tracing_context.payload.as_str(),
+            merge_segment_ids = tracing::field::debug(&merge_segment_ids),
+            segment_entry_ids = tracing::field::debug(&segment_entry_ids),
             num_input_segments = segment_entries.len(),
             target_opstamp = merge_operation.target_opstamp()
         );
@@ -561,16 +648,21 @@ impl SegmentUpdater {
                 &segment_updater.merge_thread_pool,
                 segment_entries,
                 merge_operation.target_opstamp(),
+                &tracing_context,
             ) {
                 Ok(after_merge_segment_entry) => {
                     let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
                     let _send_result = merging_future_send.send(res);
                 }
                 Err(merge_error) => {
-                    warn!(
-                        "Merge of {:?} was cancelled: {:?}",
-                        merge_operation.segment_ids().to_vec(),
-                        merge_error
+                    tracing::warn!(
+                        brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+                        brainstore_operation = tracing_context.brainstore_operation.as_str(),
+                        commit_payload = tracing_context.payload.as_str(),
+                        merge_segment_ids = tracing::field::debug(&merge_segment_ids),
+                        segment_entry_ids = tracing::field::debug(&segment_entry_ids),
+                        error = tracing::field::debug(&merge_error),
+                        "Merge candidate was cancelled",
                     );
                     if cfg!(test) {
                         panic!("{merge_error:?}");
@@ -595,10 +687,14 @@ impl SegmentUpdater {
         // Committed segments cannot be merged with uncommitted_segments.
         // We therefore consider merges using these two sets of segments independently.
         let merge_policy = self.get_merge_policy();
+        let tracing_context = MergeTracingContext::from_index_meta(self.load_meta().as_ref());
 
         let current_opstamp = self.stamper.stamp();
-        let mut merge_candidates: Vec<MergeOperation> = merge_policy
-            .compute_merge_candidates(&uncommitted_segments)
+        let uncommitted_merge_candidates =
+            merge_policy.compute_merge_candidates(&uncommitted_segments);
+        let uncommitted_merge_candidate_sizes =
+            merge_candidate_sizes(&uncommitted_merge_candidates);
+        let mut merge_candidates: Vec<MergeOperation> = uncommitted_merge_candidates
             .into_iter()
             .map(|merge_candidate| {
                 MergeOperation::new(&self.merge_operations, current_opstamp, merge_candidate.0)
@@ -606,12 +702,28 @@ impl SegmentUpdater {
             .collect();
 
         let commit_opstamp = self.load_meta().opstamp;
-        let committed_merge_candidates = merge_policy
-            .compute_merge_candidates(&committed_segments)
-            .into_iter()
-            .map(|merge_candidate: MergeCandidate| {
-                MergeOperation::new(&self.merge_operations, commit_opstamp, merge_candidate.0)
-            });
+        let committed_merge_candidates = merge_policy.compute_merge_candidates(&committed_segments);
+        let committed_merge_candidate_sizes = merge_candidate_sizes(&committed_merge_candidates);
+        tracing::info!(
+            brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+            brainstore_operation = tracing_context.brainstore_operation.as_str(),
+            commit_payload = tracing_context.payload.as_str(),
+            committed_num_segments = committed_segments.len(),
+            uncommitted_num_segments = uncommitted_segments.len(),
+            committed_num_merge_candidates = committed_merge_candidates.len(),
+            committed_merge_candidate_sizes =
+                tracing::field::debug(&committed_merge_candidate_sizes),
+            uncommitted_num_merge_candidates = merge_candidates.len(),
+            uncommitted_merge_candidate_sizes =
+                tracing::field::debug(&uncommitted_merge_candidate_sizes),
+            "considered merge candidates",
+        );
+        let committed_merge_candidates =
+            committed_merge_candidates
+                .into_iter()
+                .map(|merge_candidate: MergeCandidate| {
+                    MergeOperation::new(&self.merge_operations, commit_opstamp, merge_candidate.0)
+                });
         merge_candidates.extend(committed_merge_candidates);
 
         for merge_operation in merge_candidates {
@@ -628,9 +740,12 @@ impl SegmentUpdater {
         mut after_merge_segment_entry: Option<SegmentEntry>,
     ) -> crate::Result<Option<SegmentMeta>> {
         let segment_updater = self.clone();
+        let tracing_context = MergeTracingContext::from_index_meta(self.load_meta().as_ref());
+        let merge_segment_ids = segment_ids_for_logging(merge_operation.segment_ids());
         let after_merge_segment_meta = after_merge_segment_entry
             .as_ref()
             .map(|after_merge_segment_entry| after_merge_segment_entry.meta().clone());
+        let after_merge_segment_meta_for_log = after_merge_segment_meta.clone();
         self.schedule_task(move || {
             debug!(
                 "End merge {:?}",
@@ -673,6 +788,28 @@ impl SegmentUpdater {
                 let segments_status = segment_updater
                     .segment_manager
                     .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
+                let output_segment_id = after_merge_segment_meta_for_log
+                    .as_ref()
+                    .map(|segment_meta| segment_meta.id().uuid_string())
+                    .unwrap_or_default();
+                let output_num_docs = after_merge_segment_meta_for_log
+                    .as_ref()
+                    .map(|segment_meta| segment_meta.num_docs())
+                    .unwrap_or_default();
+                let segments_status_name = match segments_status {
+                    SegmentsStatus::Committed => "committed",
+                    SegmentsStatus::Uncommitted => "uncommitted",
+                };
+                tracing::info!(
+                    brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
+                    brainstore_operation = tracing_context.brainstore_operation.as_str(),
+                    commit_payload = tracing_context.payload.as_str(),
+                    merge_segment_ids = tracing::field::debug(&merge_segment_ids),
+                    output_segment_id = output_segment_id,
+                    output_num_docs = output_num_docs,
+                    segments_status = segments_status_name,
+                    "Ended merge candidate",
+                );
 
                 if segments_status == SegmentsStatus::Committed {
                     segment_updater

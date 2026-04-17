@@ -444,9 +444,7 @@ impl SegmentReader {
     pub fn vector_reader(&self, _field: Field) -> io::Result<Option<VectorReader>> {
         match self.vector_file_opt.as_ref() {
             None => Ok(None),
-            Some(file_slice) => {
-                Ok(Some(VectorReader::open(file_slice.read_bytes()?)?))
-            }
+            Some(file_slice) => Ok(Some(VectorReader::open(file_slice.read_bytes()?)?)),
         }
     }
 

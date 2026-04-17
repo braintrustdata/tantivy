@@ -124,7 +124,9 @@ impl Serialize for KeyOrder {
 
 impl<'de> Deserialize<'de> for KeyOrder {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let mut key_order = <HashMap<String, Order>>::deserialize(deserializer)?.into_iter();
         let (field, order) = key_order.next().ok_or(serde::de::Error::custom(
             "Expected exactly one key-value pair in sort parameter of top_hits, found none",
@@ -924,7 +926,7 @@ mod tests {
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         let segment_size = segment_reader.num_docs() as usize;
-        
+
         // Verify segment has 2 documents
         assert_eq!(segment_size, 2);
 
@@ -948,18 +950,18 @@ mod tests {
         };
 
         // Create TopHitsSegmentCollector - it should be capped to segment_size (2)
-        let segment_collector = super::TopHitsSegmentCollector::from_req(
-            &top_hits_req,
-            0,
-            0,
-            segment_size,
-        );
+        let segment_collector =
+            super::TopHitsSegmentCollector::from_req(&top_hits_req, 0, 0, segment_size);
 
         // The internal TopNComputer should have been created with capped size (2)
         // Buffer capacity should be 2 * capped_size = 2 * 2 = 4
         // If it wasn't capped, it would be 2 * 100 = 200
         let buffer_capacity = segment_collector.buffer_capacity();
-        assert_eq!(buffer_capacity, 4, "Buffer should be capped to 2 * segment_size (4), but got {}", buffer_capacity);
+        assert_eq!(
+            buffer_capacity, 4,
+            "Buffer should be capped to 2 * segment_size (4), but got {}",
+            buffer_capacity
+        );
         Ok(())
     }
 }

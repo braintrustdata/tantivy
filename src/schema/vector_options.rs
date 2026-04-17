@@ -43,4 +43,3 @@ mod tests {
         assert_eq!(deserialized, options);
     }
 }
-
