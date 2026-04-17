@@ -27,6 +27,7 @@ use crate::indexer::{
 use crate::{FutureResult, Opstamp};
 
 pub(crate) const DEFAULT_NUM_MERGE_THREADS: usize = 4;
+const LOGGED_SEGMENT_ID_SAMPLE_SIZE: usize = 8;
 
 /// Save the index meta file.
 /// This operation is atomic:
@@ -113,6 +114,34 @@ impl MergeTracingContext {
                 commit_payload.brainstore_segment_id.unwrap_or_default();
         }
         tracing_context
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SegmentSetLogFingerprint {
+    segment_ids_hash: String,
+    segment_ids_sample: Vec<String>,
+}
+
+fn hash_index_meta_for_logging(index_meta: &IndexMeta) -> String {
+    match serde_json::to_vec(index_meta) {
+        Ok(bytes) => format!("{:08x}", crc32fast::hash(&bytes)),
+        Err(_) => "serialization_error".to_string(),
+    }
+}
+
+fn compute_segment_ids_hash_for_logging(segment_ids: &[String]) -> String {
+    format!("{:08x}", crc32fast::hash(segment_ids.join("\n").as_bytes()))
+}
+
+fn fingerprint_segment_ids_for_logging(mut segment_ids: Vec<String>) -> SegmentSetLogFingerprint {
+    segment_ids.sort_unstable();
+    SegmentSetLogFingerprint {
+        segment_ids_hash: compute_segment_ids_hash_for_logging(&segment_ids),
+        segment_ids_sample: segment_ids
+            .into_iter()
+            .take(LOGGED_SEGMENT_ID_SAMPLE_SIZE)
+            .collect(),
     }
 }
 
@@ -687,7 +716,20 @@ impl SegmentUpdater {
         // Committed segments cannot be merged with uncommitted_segments.
         // We therefore consider merges using these two sets of segments independently.
         let merge_policy = self.get_merge_policy();
-        let tracing_context = MergeTracingContext::from_index_meta(self.load_meta().as_ref());
+        let current_meta = self.load_meta();
+        let tracing_context = MergeTracingContext::from_index_meta(current_meta.as_ref());
+        let committed_segments_fingerprint = fingerprint_segment_ids_for_logging(
+            committed_segments
+                .iter()
+                .map(|segment| segment.id().uuid_string())
+                .collect(),
+        );
+        let uncommitted_segments_fingerprint = fingerprint_segment_ids_for_logging(
+            uncommitted_segments
+                .iter()
+                .map(|segment| segment.id().uuid_string())
+                .collect(),
+        );
 
         let current_opstamp = self.stamper.stamp();
         let uncommitted_merge_candidates =
@@ -701,15 +743,23 @@ impl SegmentUpdater {
             })
             .collect();
 
-        let commit_opstamp = self.load_meta().opstamp;
+        let commit_opstamp = current_meta.opstamp;
         let committed_merge_candidates = merge_policy.compute_merge_candidates(&committed_segments);
         let committed_merge_candidate_sizes = merge_candidate_sizes(&committed_merge_candidates);
+        let meta_hash = hash_index_meta_for_logging(current_meta.as_ref());
         tracing::info!(
             brainstore_segment_id = tracing_context.brainstore_segment_id.as_str(),
             brainstore_operation = tracing_context.brainstore_operation.as_str(),
             commit_payload = tracing_context.payload.as_str(),
+            meta_hash = meta_hash.as_str(),
             committed_num_segments = committed_segments.len(),
+            committed_segment_ids_hash = committed_segments_fingerprint.segment_ids_hash.as_str(),
+            committed_segment_ids_sample =
+                tracing::field::debug(&committed_segments_fingerprint.segment_ids_sample),
             uncommitted_num_segments = uncommitted_segments.len(),
+            uncommitted_segment_ids_hash = uncommitted_segments_fingerprint.segment_ids_hash.as_str(),
+            uncommitted_segment_ids_sample =
+                tracing::field::debug(&uncommitted_segments_fingerprint.segment_ids_sample),
             committed_num_merge_candidates = committed_merge_candidates.len(),
             committed_merge_candidate_sizes =
                 tracing::field::debug(&committed_merge_candidate_sizes),
