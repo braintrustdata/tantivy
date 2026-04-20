@@ -1,7 +1,8 @@
 mod warming;
 
 use std::sync::atomic::AtomicU64;
-use std::sync::{atomic, Arc, Weak};
+use std::sync::{atomic, Arc, Mutex, Weak};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 pub use warming::Warmer;
@@ -152,6 +153,78 @@ impl TryInto<IndexReader> for IndexReaderBuilder {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct DurationSummary {
+    total_us: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+}
+
+#[derive(Default)]
+struct SegmentOpenTimingState {
+    queue_times_us: Vec<u64>,
+    run_times_us: Vec<u64>,
+}
+
+#[derive(Default)]
+struct SegmentOpenTimings {
+    state: Mutex<SegmentOpenTimingState>,
+}
+
+impl SegmentOpenTimings {
+    fn record(&self, queue_time_us: u64, run_time_us: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("segment open timing lock should not be poisoned");
+        state.queue_times_us.push(queue_time_us);
+        state.run_times_us.push(run_time_us);
+    }
+
+    fn summaries(&self) -> (DurationSummary, DurationSummary) {
+        let state = self
+            .state
+            .lock()
+            .expect("segment open timing lock should not be poisoned");
+        (
+            duration_summary(&state.queue_times_us),
+            duration_summary(&state.run_times_us),
+        )
+    }
+}
+
+fn duration_summary(values_us: &[u64]) -> DurationSummary {
+    if values_us.is_empty() {
+        return DurationSummary::default();
+    }
+
+    let mut sorted = values_us.to_vec();
+    sorted.sort_unstable();
+
+    DurationSummary {
+        total_us: sorted.iter().sum(),
+        p50_us: percentile(&sorted, 50),
+        p95_us: percentile(&sorted, 95),
+        p99_us: percentile(&sorted, 99),
+        max_us: *sorted.last().unwrap_or(&0),
+    }
+}
+
+fn percentile(sorted_values_us: &[u64], percentile: usize) -> u64 {
+    if sorted_values_us.is_empty() {
+        return 0;
+    }
+    let last_idx = sorted_values_us.len() - 1;
+    let idx = (last_idx * percentile) / 100;
+    sorted_values_us[idx]
+}
+
+fn duration_to_us(duration: std::time::Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
 struct InnerIndexReader {
     doc_store_cache_num_blocks: usize,
     index: Index,
@@ -193,14 +266,76 @@ impl InnerIndexReader {
     /// This function acquires a lock to prevent GC from removing files
     /// as we are opening our index.
     fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
-        // Prevents segment files from getting deleted while we are in the process of opening them
+        let span = tracing::info_span!(
+            "Open segment readers",
+            num_segments = tracing::field::Empty,
+            meta_lock_wait_us = tracing::field::Empty,
+            queue_time_total_us = tracing::field::Empty,
+            queue_time_p50_us = tracing::field::Empty,
+            queue_time_p95_us = tracing::field::Empty,
+            queue_time_p99_us = tracing::field::Empty,
+            queue_time_max_us = tracing::field::Empty,
+            run_time_total_us = tracing::field::Empty,
+            run_time_p50_us = tracing::field::Empty,
+            run_time_p95_us = tracing::field::Empty,
+            run_time_p99_us = tracing::field::Empty,
+            run_time_max_us = tracing::field::Empty,
+        );
+        let collect_task_timings = !span.is_disabled();
+        let _span_guard = span.enter();
+
+        let meta_lock_start = Instant::now();
         let _meta_lock = index.directory().acquire_lock(&META_LOCK)?;
+        span.record(
+            "meta_lock_wait_us",
+            duration_to_us(meta_lock_start.elapsed()),
+        );
         let searchable_segments = index.searchable_segments()?;
+        span.record("num_segments", searchable_segments.len() as u64);
         let executor = index.search_executor();
-        let segment_readers = executor.map(
-            |segment| SegmentReader::open_with_custom_alive_set_parallel(executor, segment, None),
-            searchable_segments.iter(),
-        )?;
+
+        let segment_readers = if collect_task_timings {
+            let timings = Arc::new(SegmentOpenTimings::default());
+            let segment_readers = executor.map(
+                {
+                    let timings = timings.clone();
+                    move |(segment, submitted_at)| {
+                        let started_at = Instant::now();
+                        let queue_time_us = duration_to_us(started_at.duration_since(submitted_at));
+                        let reader = SegmentReader::open_with_custom_alive_set_parallel(
+                            executor, segment, None,
+                        );
+                        timings.record(queue_time_us, duration_to_us(started_at.elapsed()));
+                        reader
+                    }
+                },
+                searchable_segments
+                    .iter()
+                    .map(|segment| (segment, Instant::now())),
+            )?;
+
+            let (queue_summary, run_summary) = timings.summaries();
+            span.record("queue_time_total_us", queue_summary.total_us);
+            span.record("queue_time_p50_us", queue_summary.p50_us);
+            span.record("queue_time_p95_us", queue_summary.p95_us);
+            span.record("queue_time_p99_us", queue_summary.p99_us);
+            span.record("queue_time_max_us", queue_summary.max_us);
+            span.record("run_time_total_us", run_summary.total_us);
+            span.record("run_time_p50_us", run_summary.p50_us);
+            span.record("run_time_p95_us", run_summary.p95_us);
+            span.record("run_time_p99_us", run_summary.p99_us);
+            span.record("run_time_max_us", run_summary.max_us);
+
+            segment_readers
+        } else {
+            executor.map(
+                |segment| {
+                    SegmentReader::open_with_custom_alive_set_parallel(executor, segment, None)
+                },
+                searchable_segments.iter(),
+            )?
+        };
+
         Ok(segment_readers)
     }
 
