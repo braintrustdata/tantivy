@@ -1,5 +1,6 @@
 mod warming;
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{atomic, Arc, Mutex, Weak};
 use std::time::Instant;
@@ -166,6 +167,7 @@ struct DurationSummary {
 struct SegmentOpenTimingState {
     queue_times_us: Vec<u64>,
     run_times_us: Vec<u64>,
+    worker_threads: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -174,16 +176,17 @@ struct SegmentOpenTimings {
 }
 
 impl SegmentOpenTimings {
-    fn record(&self, queue_time_us: u64, run_time_us: u64) {
+    fn record(&self, queue_time_us: u64, run_time_us: u64, worker_thread: String) {
         let mut state = self
             .state
             .lock()
             .expect("segment open timing lock should not be poisoned");
         state.queue_times_us.push(queue_time_us);
         state.run_times_us.push(run_time_us);
+        state.worker_threads.insert(worker_thread);
     }
 
-    fn summaries(&self) -> (DurationSummary, DurationSummary) {
+    fn summaries(&self) -> (DurationSummary, DurationSummary, usize) {
         let state = self
             .state
             .lock()
@@ -191,6 +194,7 @@ impl SegmentOpenTimings {
         (
             duration_summary(&state.queue_times_us),
             duration_summary(&state.run_times_us),
+            state.worker_threads.len(),
         )
     }
 }
@@ -269,6 +273,18 @@ impl InnerIndexReader {
         let span = tracing::info_span!(
             "Open segment readers",
             num_segments = tracing::field::Empty,
+            executor_id = tracing::field::Empty,
+            executor_num_threads = tracing::field::Empty,
+            executor_age_us_before = tracing::field::Empty,
+            executor_map_calls_before = tracing::field::Empty,
+            executor_started_threads_before = tracing::field::Empty,
+            executor_first_thread_start_delay_us_before = tracing::field::Empty,
+            executor_last_thread_start_delay_us_before = tracing::field::Empty,
+            executor_age_us_after = tracing::field::Empty,
+            executor_map_calls_after = tracing::field::Empty,
+            executor_started_threads_after = tracing::field::Empty,
+            executor_first_thread_start_delay_us_after = tracing::field::Empty,
+            executor_last_thread_start_delay_us_after = tracing::field::Empty,
             meta_lock_wait_us = tracing::field::Empty,
             queue_time_total_us = tracing::field::Empty,
             queue_time_p50_us = tracing::field::Empty,
@@ -280,6 +296,7 @@ impl InnerIndexReader {
             run_time_p95_us = tracing::field::Empty,
             run_time_p99_us = tracing::field::Empty,
             run_time_max_us = tracing::field::Empty,
+            worker_thread_count = tracing::field::Empty,
         );
         let collect_task_timings = !span.is_disabled();
         let _span_guard = span.enter();
@@ -293,6 +310,24 @@ impl InnerIndexReader {
         let searchable_segments = index.searchable_segments()?;
         span.record("num_segments", searchable_segments.len() as u64);
         let executor = index.search_executor();
+        if let Some(snapshot) = executor.telemetry_snapshot() {
+            span.record("executor_id", snapshot.executor_id);
+            span.record("executor_num_threads", snapshot.num_threads as u64);
+            span.record("executor_age_us_before", snapshot.age_us);
+            span.record("executor_map_calls_before", snapshot.map_calls);
+            span.record(
+                "executor_started_threads_before",
+                snapshot.started_threads as u64,
+            );
+            span.record(
+                "executor_first_thread_start_delay_us_before",
+                snapshot.first_thread_start_delay_us,
+            );
+            span.record(
+                "executor_last_thread_start_delay_us_before",
+                snapshot.last_thread_start_delay_us,
+            );
+        }
 
         let segment_readers = if collect_task_timings {
             let timings = Arc::new(SegmentOpenTimings::default());
@@ -302,10 +337,19 @@ impl InnerIndexReader {
                     move |(segment, submitted_at)| {
                         let started_at = Instant::now();
                         let queue_time_us = duration_to_us(started_at.duration_since(submitted_at));
+                        let worker_thread = std::thread::current();
+                        let worker_thread_name = worker_thread
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| format!("{:?}", worker_thread.id()));
                         let reader = SegmentReader::open_with_custom_alive_set_parallel(
                             executor, segment, None,
                         );
-                        timings.record(queue_time_us, duration_to_us(started_at.elapsed()));
+                        timings.record(
+                            queue_time_us,
+                            duration_to_us(started_at.elapsed()),
+                            worker_thread_name,
+                        );
                         reader
                     }
                 },
@@ -314,7 +358,7 @@ impl InnerIndexReader {
                     .map(|segment| (segment, Instant::now())),
             )?;
 
-            let (queue_summary, run_summary) = timings.summaries();
+            let (queue_summary, run_summary, worker_thread_count) = timings.summaries();
             span.record("queue_time_total_us", queue_summary.total_us);
             span.record("queue_time_p50_us", queue_summary.p50_us);
             span.record("queue_time_p95_us", queue_summary.p95_us);
@@ -325,6 +369,7 @@ impl InnerIndexReader {
             span.record("run_time_p95_us", run_summary.p95_us);
             span.record("run_time_p99_us", run_summary.p99_us);
             span.record("run_time_max_us", run_summary.max_us);
+            span.record("worker_thread_count", worker_thread_count as u64);
 
             segment_readers
         } else {
@@ -335,6 +380,23 @@ impl InnerIndexReader {
                 searchable_segments.iter(),
             )?
         };
+
+        if let Some(snapshot) = executor.telemetry_snapshot() {
+            span.record("executor_age_us_after", snapshot.age_us);
+            span.record("executor_map_calls_after", snapshot.map_calls);
+            span.record(
+                "executor_started_threads_after",
+                snapshot.started_threads as u64,
+            );
+            span.record(
+                "executor_first_thread_start_delay_us_after",
+                snapshot.first_thread_start_delay_us,
+            );
+            span.record(
+                "executor_last_thread_start_delay_us_after",
+                snapshot.last_thread_start_delay_us,
+            );
+        }
 
         Ok(segment_readers)
     }

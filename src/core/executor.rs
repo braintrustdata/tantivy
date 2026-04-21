@@ -1,6 +1,116 @@
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::TantivyError;
+
+static NEXT_THREAD_POOL_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutorTelemetrySnapshot {
+    pub executor_id: u64,
+    pub num_threads: usize,
+    pub age_us: u64,
+    pub map_calls: u64,
+    pub started_threads: usize,
+    pub first_thread_start_delay_us: u64,
+    pub last_thread_start_delay_us: u64,
+}
+
+struct ThreadPoolTelemetry {
+    executor_id: u64,
+    num_threads: usize,
+    created_at: Instant,
+    map_calls: AtomicU64,
+    started_threads: AtomicUsize,
+    first_thread_start_delay_us: AtomicU64,
+    last_thread_start_delay_us: AtomicU64,
+}
+
+impl ThreadPoolTelemetry {
+    fn new(num_threads: usize) -> Self {
+        Self {
+            executor_id: NEXT_THREAD_POOL_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
+            num_threads,
+            created_at: Instant::now(),
+            map_calls: AtomicU64::new(0),
+            started_threads: AtomicUsize::new(0),
+            first_thread_start_delay_us: AtomicU64::new(u64::MAX),
+            last_thread_start_delay_us: AtomicU64::new(0),
+        }
+    }
+
+    fn record_thread_started(&self) {
+        let start_delay_us = self
+            .created_at
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        self.started_threads.fetch_add(1, Ordering::Relaxed);
+
+        let mut current_first = self.first_thread_start_delay_us.load(Ordering::Relaxed);
+        while start_delay_us < current_first {
+            match self.first_thread_start_delay_us.compare_exchange_weak(
+                current_first,
+                start_delay_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(previous) => current_first = previous,
+            }
+        }
+
+        let mut current_last = self.last_thread_start_delay_us.load(Ordering::Relaxed);
+        while start_delay_us > current_last {
+            match self.last_thread_start_delay_us.compare_exchange_weak(
+                current_last,
+                start_delay_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(previous) => current_last = previous,
+            }
+        }
+    }
+
+    fn increment_map_calls(&self) {
+        self.map_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ExecutorTelemetrySnapshot {
+        let first_thread_start_delay_us = self.first_thread_start_delay_us.load(Ordering::Relaxed);
+        ExecutorTelemetrySnapshot {
+            executor_id: self.executor_id,
+            num_threads: self.num_threads,
+            age_us: self
+                .created_at
+                .elapsed()
+                .as_micros()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            map_calls: self.map_calls.load(Ordering::Relaxed),
+            started_threads: self.started_threads.load(Ordering::Relaxed),
+            first_thread_start_delay_us: if first_thread_start_delay_us == u64::MAX {
+                0
+            } else {
+                first_thread_start_delay_us
+            },
+            last_thread_start_delay_us: self.last_thread_start_delay_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[allow(missing_docs)]
+#[doc(hidden)]
+pub struct ThreadPoolExecutor {
+    pool: ThreadPool,
+    telemetry: Arc<ThreadPoolTelemetry>,
+}
 
 /// Search executor whether search request are single thread or multithread.
 ///
@@ -13,7 +123,7 @@ pub enum Executor {
     /// Single thread variant of an Executor
     SingleThread,
     /// Thread pool variant of an Executor
-    ThreadPool(ThreadPool),
+    ThreadPool(ThreadPoolExecutor),
 }
 
 impl Executor {
@@ -24,11 +134,26 @@ impl Executor {
 
     /// Creates an Executor that dispatches the tasks in a thread pool.
     pub fn multi_thread(num_threads: usize, prefix: &'static str) -> crate::Result<Executor> {
+        let telemetry = Arc::new(ThreadPoolTelemetry::new(num_threads));
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(move |num| format!("{prefix}{num}"))
+            .start_handler({
+                let telemetry = telemetry.clone();
+                move |_| telemetry.record_thread_started()
+            })
             .build()?;
-        Ok(Executor::ThreadPool(pool))
+        Ok(Executor::ThreadPool(ThreadPoolExecutor { pool, telemetry }))
+    }
+
+    /// Returns executor lifecycle telemetry for multithreaded executors.
+    pub fn telemetry_snapshot(&self) -> Option<ExecutorTelemetrySnapshot> {
+        match self {
+            Executor::SingleThread => None,
+            Executor::ThreadPool(thread_pool_executor) => {
+                Some(thread_pool_executor.telemetry.snapshot())
+            }
+        }
     }
 
     /// Perform a map in the thread pool.
@@ -47,13 +172,14 @@ impl Executor {
     ) -> crate::Result<Vec<R>> {
         match self {
             Executor::SingleThread => args.map(f).collect::<crate::Result<_>>(),
-            Executor::ThreadPool(pool) => {
+            Executor::ThreadPool(thread_pool_executor) => {
+                thread_pool_executor.telemetry.increment_map_calls();
                 let args: Vec<A> = args.collect();
                 let num_fruits = args.len();
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
                     let parent_span = tracing::Span::current();
-                    pool.scope(|scope| {
+                    thread_pool_executor.pool.scope(|scope| {
                         let _parent_span_guard = parent_span.enter();
                         for (idx, arg) in args.into_iter().enumerate() {
                             // We name references for f and fruit_sender_ref because we do not
@@ -114,9 +240,9 @@ impl Executor {
                     )
                 })?;
             }
-            Executor::ThreadPool(pool) => {
+            Executor::ThreadPool(thread_pool_executor) => {
                 let parent_span = tracing::Span::current();
-                pool.spawn(move || {
+                thread_pool_executor.pool.spawn(move || {
                     let _parent_span_guard = parent_span.enter();
                     let res = op();
                     match fruit_sender.send(res) {
