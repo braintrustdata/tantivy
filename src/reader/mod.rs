@@ -295,6 +295,8 @@ impl InnerIndexReader {
             spawn_to_start_max_us = tracing::field::Empty,
             spawn_loop_total_us = tracing::field::Empty,
             scope_total_us = tracing::field::Empty,
+            scope_wait_after_spawn_loop_us = tracing::field::Empty,
+            scope_wait_after_last_task_finish_us = tracing::field::Empty,
             result_drain_total_us = tracing::field::Empty,
             first_task_start_since_scope_start_us = tracing::field::Empty,
             last_task_start_since_scope_start_us = tracing::field::Empty,
@@ -377,6 +379,14 @@ impl InnerIndexReader {
             span.record("spawn_to_start_max_us", map_telemetry.spawn_to_start_max_us);
             span.record("spawn_loop_total_us", map_telemetry.spawn_loop_total_us);
             span.record("scope_total_us", map_telemetry.scope_total_us);
+            span.record(
+                "scope_wait_after_spawn_loop_us",
+                map_telemetry.scope_wait_after_spawn_loop_us,
+            );
+            span.record(
+                "scope_wait_after_last_task_finish_us",
+                map_telemetry.scope_wait_after_last_task_finish_us,
+            );
             span.record("result_drain_total_us", map_telemetry.result_drain_total_us);
             span.record(
                 "first_task_start_since_scope_start_us",

@@ -20,6 +20,8 @@ pub(crate) struct MapExecutionTelemetry {
     pub spawn_to_start_max_us: u64,
     pub spawn_loop_total_us: u64,
     pub scope_total_us: u64,
+    pub scope_wait_after_spawn_loop_us: u64,
+    pub scope_wait_after_last_task_finish_us: u64,
     pub result_drain_total_us: u64,
     pub first_task_start_since_scope_start_us: u64,
     pub last_task_start_since_scope_start_us: u64,
@@ -126,6 +128,10 @@ impl MapExecutionTimings {
             spawn_to_start_max_us: spawn_to_start_summary.max_us,
             spawn_loop_total_us,
             scope_total_us,
+            scope_wait_after_spawn_loop_us: scope_total_us.saturating_sub(spawn_loop_total_us),
+            scope_wait_after_last_task_finish_us: scope_total_us.saturating_sub(
+                state.last_task_finish_since_scope_start_us,
+            ),
             result_drain_total_us,
             first_task_start_since_scope_start_us: state
                 .first_task_start_since_scope_start_us
@@ -402,6 +408,8 @@ impl Executor {
                     MapExecutionTelemetry {
                         args_collect_us,
                         scope_total_us,
+                        scope_wait_after_spawn_loop_us: 0,
+                        scope_wait_after_last_task_finish_us: 0,
                         first_task_start_since_scope_start_us: first_task_start_since_scope_start_us
                             .unwrap_or(0),
                         last_task_start_since_scope_start_us,
@@ -423,13 +431,12 @@ impl Executor {
                 let timings = Arc::new(MapExecutionTimings::default());
                 let spawn_loop_finished = Arc::new(AtomicBool::new(false));
                 let spawn_loop_total_us = Arc::new(AtomicU64::new(0));
-                let scope_total_us = Arc::new(AtomicU64::new(0));
+                let scope_start = Instant::now();
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
                     let parent_span = tracing::Span::current();
                     thread_pool_executor.pool.scope(|scope| {
                         let _parent_span_guard = parent_span.enter();
-                        let scope_start = Instant::now();
                         let spawn_loop_start = Instant::now();
                         for (idx, arg) in args.into_iter().enumerate() {
                             // We name references for f and fruit_sender_ref because we do not
@@ -473,13 +480,13 @@ impl Executor {
                             Ordering::Relaxed,
                         );
                         spawn_loop_finished.store(true, Ordering::Relaxed);
-                        scope_total_us.store(duration_to_us(scope_start.elapsed()), Ordering::Relaxed);
                     });
                     fruit_receiver
                     // This ends the scope of fruit_sender.
                     // This is important as it makes it possible for the fruit_receiver iteration to
                     // terminate.
                 };
+                let scope_total_us = duration_to_us(scope_start.elapsed());
                 let mut result_placeholders: Vec<Option<R>> =
                     std::iter::repeat_with(|| None).take(num_fruits).collect();
                 let result_drain_start = Instant::now();
@@ -499,7 +506,7 @@ impl Executor {
                     timings.summary(
                         args_collect_us,
                         spawn_loop_total_us.load(Ordering::Relaxed),
-                        scope_total_us.load(Ordering::Relaxed),
+                        scope_total_us,
                         result_drain_total_us,
                     ),
                 ))
