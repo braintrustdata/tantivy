@@ -282,6 +282,7 @@ impl InnerIndexReader {
             executor_first_thread_start_delay_us_after = tracing::field::Empty,
             executor_last_thread_start_delay_us_after = tracing::field::Empty,
             meta_lock_wait_us = tracing::field::Empty,
+            args_collect_us = tracing::field::Empty,
             queue_time_total_us = tracing::field::Empty,
             queue_time_p50_us = tracing::field::Empty,
             queue_time_p95_us = tracing::field::Empty,
@@ -293,6 +294,12 @@ impl InnerIndexReader {
             spawn_to_start_p99_us = tracing::field::Empty,
             spawn_to_start_max_us = tracing::field::Empty,
             spawn_loop_total_us = tracing::field::Empty,
+            scope_total_us = tracing::field::Empty,
+            result_drain_total_us = tracing::field::Empty,
+            first_task_start_since_scope_start_us = tracing::field::Empty,
+            last_task_start_since_scope_start_us = tracing::field::Empty,
+            first_task_finish_since_scope_start_us = tracing::field::Empty,
+            last_task_finish_since_scope_start_us = tracing::field::Empty,
             tasks_started_before_spawn_loop_end = tracing::field::Empty,
             tasks_started_after_spawn_loop_end = tracing::field::Empty,
             run_time_total_us = tracing::field::Empty,
@@ -354,6 +361,7 @@ impl InnerIndexReader {
             )?;
 
             let (queue_summary, run_summary) = timings.summaries();
+            span.record("args_collect_us", map_telemetry.args_collect_us);
             span.record("queue_time_total_us", queue_summary.total_us);
             span.record("queue_time_p50_us", queue_summary.p50_us);
             span.record("queue_time_p95_us", queue_summary.p95_us);
@@ -368,6 +376,24 @@ impl InnerIndexReader {
             span.record("spawn_to_start_p99_us", map_telemetry.spawn_to_start_p99_us);
             span.record("spawn_to_start_max_us", map_telemetry.spawn_to_start_max_us);
             span.record("spawn_loop_total_us", map_telemetry.spawn_loop_total_us);
+            span.record("scope_total_us", map_telemetry.scope_total_us);
+            span.record("result_drain_total_us", map_telemetry.result_drain_total_us);
+            span.record(
+                "first_task_start_since_scope_start_us",
+                map_telemetry.first_task_start_since_scope_start_us,
+            );
+            span.record(
+                "last_task_start_since_scope_start_us",
+                map_telemetry.last_task_start_since_scope_start_us,
+            );
+            span.record(
+                "first_task_finish_since_scope_start_us",
+                map_telemetry.first_task_finish_since_scope_start_us,
+            );
+            span.record(
+                "last_task_finish_since_scope_start_us",
+                map_telemetry.last_task_finish_since_scope_start_us,
+            );
             span.record(
                 "tasks_started_before_spawn_loop_end",
                 map_telemetry.tasks_started_before_spawn_loop_end as u64,

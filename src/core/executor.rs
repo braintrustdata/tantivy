@@ -12,12 +12,19 @@ static NEXT_THREAD_POOL_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MapExecutionTelemetry {
+    pub args_collect_us: u64,
     pub spawn_to_start_total_us: u64,
     pub spawn_to_start_p50_us: u64,
     pub spawn_to_start_p95_us: u64,
     pub spawn_to_start_p99_us: u64,
     pub spawn_to_start_max_us: u64,
     pub spawn_loop_total_us: u64,
+    pub scope_total_us: u64,
+    pub result_drain_total_us: u64,
+    pub first_task_start_since_scope_start_us: u64,
+    pub last_task_start_since_scope_start_us: u64,
+    pub first_task_finish_since_scope_start_us: u64,
+    pub last_task_finish_since_scope_start_us: u64,
     pub tasks_started_before_spawn_loop_end: usize,
     pub tasks_started_after_spawn_loop_end: usize,
     pub worker_thread_count: usize,
@@ -36,6 +43,10 @@ struct DurationSummary {
 struct MapExecutionTimingState {
     spawn_to_start_times_us: Vec<u64>,
     worker_threads: HashSet<String>,
+    first_task_start_since_scope_start_us: Option<u64>,
+    last_task_start_since_scope_start_us: u64,
+    first_task_finish_since_scope_start_us: Option<u64>,
+    last_task_finish_since_scope_start_us: u64,
     tasks_started_before_spawn_loop_end: usize,
     tasks_started_after_spawn_loop_end: usize,
 }
@@ -51,6 +62,8 @@ impl MapExecutionTimings {
         spawn_to_start_time_us: u64,
         worker_thread: String,
         started_before_spawn_loop_end: bool,
+        started_since_scope_start_us: u64,
+        finished_since_scope_start_us: u64,
     ) {
         let mut state = self
             .state
@@ -58,6 +71,33 @@ impl MapExecutionTimings {
             .expect("map execution timing lock should not be poisoned");
         state.spawn_to_start_times_us.push(spawn_to_start_time_us);
         state.worker_threads.insert(worker_thread);
+        match state.first_task_start_since_scope_start_us {
+            Some(current_first) => {
+                if started_since_scope_start_us < current_first {
+                    state.first_task_start_since_scope_start_us = Some(started_since_scope_start_us);
+                }
+            }
+            None => {
+                state.first_task_start_since_scope_start_us = Some(started_since_scope_start_us);
+            }
+        }
+        if started_since_scope_start_us > state.last_task_start_since_scope_start_us {
+            state.last_task_start_since_scope_start_us = started_since_scope_start_us;
+        }
+        match state.first_task_finish_since_scope_start_us {
+            Some(current_first) => {
+                if finished_since_scope_start_us < current_first {
+                    state.first_task_finish_since_scope_start_us =
+                        Some(finished_since_scope_start_us);
+                }
+            }
+            None => {
+                state.first_task_finish_since_scope_start_us = Some(finished_since_scope_start_us);
+            }
+        }
+        if finished_since_scope_start_us > state.last_task_finish_since_scope_start_us {
+            state.last_task_finish_since_scope_start_us = finished_since_scope_start_us;
+        }
         if started_before_spawn_loop_end {
             state.tasks_started_before_spawn_loop_end += 1;
         } else {
@@ -65,19 +105,36 @@ impl MapExecutionTimings {
         }
     }
 
-    fn summary(&self, spawn_loop_total_us: u64) -> MapExecutionTelemetry {
+    fn summary(
+        &self,
+        args_collect_us: u64,
+        spawn_loop_total_us: u64,
+        scope_total_us: u64,
+        result_drain_total_us: u64,
+    ) -> MapExecutionTelemetry {
         let state = self
             .state
             .lock()
             .expect("map execution timing lock should not be poisoned");
         let spawn_to_start_summary = duration_summary(&state.spawn_to_start_times_us);
         MapExecutionTelemetry {
+            args_collect_us,
             spawn_to_start_total_us: spawn_to_start_summary.total_us,
             spawn_to_start_p50_us: spawn_to_start_summary.p50_us,
             spawn_to_start_p95_us: spawn_to_start_summary.p95_us,
             spawn_to_start_p99_us: spawn_to_start_summary.p99_us,
             spawn_to_start_max_us: spawn_to_start_summary.max_us,
             spawn_loop_total_us,
+            scope_total_us,
+            result_drain_total_us,
+            first_task_start_since_scope_start_us: state
+                .first_task_start_since_scope_start_us
+                .unwrap_or(0),
+            last_task_start_since_scope_start_us: state.last_task_start_since_scope_start_us,
+            first_task_finish_since_scope_start_us: state
+                .first_task_finish_since_scope_start_us
+                .unwrap_or(0),
+            last_task_finish_since_scope_start_us: state.last_task_finish_since_scope_start_us,
             tasks_started_before_spawn_loop_end: state.tasks_started_before_spawn_loop_end,
             tasks_started_after_spawn_loop_end: state.tasks_started_after_spawn_loop_end,
             worker_thread_count: state.worker_threads.len(),
@@ -293,14 +350,64 @@ impl Executor {
     ) -> crate::Result<(Vec<R>, MapExecutionTelemetry)> {
         match self {
             Executor::SingleThread => {
+                let args_collect_start = Instant::now();
+                let args: Vec<A> = args.collect();
+                let args_collect_us = duration_to_us(args_collect_start.elapsed());
                 let mut results = Vec::new();
+                let scope_start = Instant::now();
+                let mut first_task_start_since_scope_start_us = None;
+                let mut first_task_finish_since_scope_start_us = None;
+                let mut last_task_start_since_scope_start_us = 0;
+                let mut last_task_finish_since_scope_start_us = 0;
                 for arg in args {
+                    let started_at = Instant::now();
+                    let started_since_scope_start_us =
+                        duration_to_us(started_at.duration_since(scope_start));
                     results.push(f(arg)?);
+                    let finished_since_scope_start_us = duration_to_us(scope_start.elapsed());
+                    match first_task_start_since_scope_start_us {
+                        Some(current_first) => {
+                            if started_since_scope_start_us < current_first {
+                                first_task_start_since_scope_start_us =
+                                    Some(started_since_scope_start_us);
+                            }
+                        }
+                        None => {
+                            first_task_start_since_scope_start_us = Some(started_since_scope_start_us);
+                        }
+                    }
+                    if started_since_scope_start_us > last_task_start_since_scope_start_us {
+                        last_task_start_since_scope_start_us = started_since_scope_start_us;
+                    }
+                    match first_task_finish_since_scope_start_us {
+                        Some(current_first) => {
+                            if finished_since_scope_start_us < current_first {
+                                first_task_finish_since_scope_start_us =
+                                    Some(finished_since_scope_start_us);
+                            }
+                        }
+                        None => {
+                            first_task_finish_since_scope_start_us =
+                                Some(finished_since_scope_start_us);
+                        }
+                    }
+                    if finished_since_scope_start_us > last_task_finish_since_scope_start_us {
+                        last_task_finish_since_scope_start_us = finished_since_scope_start_us;
+                    }
                 }
+                let scope_total_us = duration_to_us(scope_start.elapsed());
                 let num_tasks = results.len();
                 Ok((
                     results,
                     MapExecutionTelemetry {
+                        args_collect_us,
+                        scope_total_us,
+                        first_task_start_since_scope_start_us: first_task_start_since_scope_start_us
+                            .unwrap_or(0),
+                        last_task_start_since_scope_start_us,
+                        first_task_finish_since_scope_start_us:
+                            first_task_finish_since_scope_start_us.unwrap_or(0),
+                        last_task_finish_since_scope_start_us,
                         tasks_started_before_spawn_loop_end: num_tasks,
                         worker_thread_count: usize::from(num_tasks > 0),
                         ..MapExecutionTelemetry::default()
@@ -309,16 +416,20 @@ impl Executor {
             }
             Executor::ThreadPool(thread_pool_executor) => {
                 thread_pool_executor.telemetry.increment_map_calls();
+                let args_collect_start = Instant::now();
                 let args: Vec<A> = args.collect();
+                let args_collect_us = duration_to_us(args_collect_start.elapsed());
                 let num_fruits = args.len();
                 let timings = Arc::new(MapExecutionTimings::default());
                 let spawn_loop_finished = Arc::new(AtomicBool::new(false));
                 let spawn_loop_total_us = Arc::new(AtomicU64::new(0));
+                let scope_total_us = Arc::new(AtomicU64::new(0));
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
                     let parent_span = tracing::Span::current();
                     thread_pool_executor.pool.scope(|scope| {
                         let _parent_span_guard = parent_span.enter();
+                        let scope_start = Instant::now();
                         let spawn_loop_start = Instant::now();
                         for (idx, arg) in args.into_iter().enumerate() {
                             // We name references for f and fruit_sender_ref because we do not
@@ -328,6 +439,7 @@ impl Executor {
                             let parent_span = tracing::Span::current();
                             let timings = timings.clone();
                             let spawn_loop_finished = spawn_loop_finished.clone();
+                            let scope_start = scope_start;
                             let spawned_at = Instant::now();
                             scope.spawn(move |_| {
                                 let _parent_span_guard = parent_span.enter();
@@ -338,10 +450,14 @@ impl Executor {
                                     .map(ToOwned::to_owned)
                                     .unwrap_or_else(|| format!("{:?}", worker_thread.id()));
                                 let fruit = f_ref(arg);
+                                let finished_since_scope_start_us =
+                                    duration_to_us(scope_start.elapsed());
                                 timings.record(
                                     duration_to_us(started_at.duration_since(spawned_at)),
                                     worker_thread_name,
                                     !spawn_loop_finished.load(Ordering::Relaxed),
+                                    duration_to_us(started_at.duration_since(scope_start)),
+                                    finished_since_scope_start_us,
                                 );
                                 if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
                                     error!(
@@ -357,6 +473,7 @@ impl Executor {
                             Ordering::Relaxed,
                         );
                         spawn_loop_finished.store(true, Ordering::Relaxed);
+                        scope_total_us.store(duration_to_us(scope_start.elapsed()), Ordering::Relaxed);
                     });
                     fruit_receiver
                     // This ends the scope of fruit_sender.
@@ -365,10 +482,12 @@ impl Executor {
                 };
                 let mut result_placeholders: Vec<Option<R>> =
                     std::iter::repeat_with(|| None).take(num_fruits).collect();
+                let result_drain_start = Instant::now();
                 for (pos, fruit_res) in fruit_receiver {
                     let fruit = fruit_res?;
                     result_placeholders[pos] = Some(fruit);
                 }
+                let result_drain_total_us = duration_to_us(result_drain_start.elapsed());
                 let results: Vec<R> = result_placeholders.into_iter().flatten().collect();
                 if results.len() != num_fruits {
                     return Err(TantivyError::InternalError(
@@ -377,7 +496,12 @@ impl Executor {
                 }
                 Ok((
                     results,
-                    timings.summary(spawn_loop_total_us.load(Ordering::Relaxed)),
+                    timings.summary(
+                        args_collect_us,
+                        spawn_loop_total_us.load(Ordering::Relaxed),
+                        scope_total_us.load(Ordering::Relaxed),
+                        result_drain_total_us,
+                    ),
                 ))
             }
         }
