@@ -435,7 +435,7 @@ impl Executor {
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
                     let parent_span = tracing::Span::current();
-                    thread_pool_executor.pool.scope(|scope| {
+                    thread_pool_executor.pool.in_place_scope(|scope| {
                         let _parent_span_guard = parent_span.enter();
                         let spawn_loop_start = Instant::now();
                         for (idx, arg) in args.into_iter().enumerate() {
