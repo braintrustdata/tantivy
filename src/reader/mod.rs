@@ -1,6 +1,5 @@
 mod warming;
 
-use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::{atomic, Arc, Mutex, Weak};
 use std::time::Instant;
@@ -167,7 +166,6 @@ struct DurationSummary {
 struct SegmentOpenTimingState {
     queue_times_us: Vec<u64>,
     run_times_us: Vec<u64>,
-    worker_threads: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -176,17 +174,16 @@ struct SegmentOpenTimings {
 }
 
 impl SegmentOpenTimings {
-    fn record(&self, queue_time_us: u64, run_time_us: u64, worker_thread: String) {
+    fn record(&self, queue_time_us: u64, run_time_us: u64) {
         let mut state = self
             .state
             .lock()
             .expect("segment open timing lock should not be poisoned");
         state.queue_times_us.push(queue_time_us);
         state.run_times_us.push(run_time_us);
-        state.worker_threads.insert(worker_thread);
     }
 
-    fn summaries(&self) -> (DurationSummary, DurationSummary, usize) {
+    fn summaries(&self) -> (DurationSummary, DurationSummary) {
         let state = self
             .state
             .lock()
@@ -194,7 +191,6 @@ impl SegmentOpenTimings {
         (
             duration_summary(&state.queue_times_us),
             duration_summary(&state.run_times_us),
-            state.worker_threads.len(),
         )
     }
 }
@@ -291,6 +287,14 @@ impl InnerIndexReader {
             queue_time_p95_us = tracing::field::Empty,
             queue_time_p99_us = tracing::field::Empty,
             queue_time_max_us = tracing::field::Empty,
+            spawn_to_start_total_us = tracing::field::Empty,
+            spawn_to_start_p50_us = tracing::field::Empty,
+            spawn_to_start_p95_us = tracing::field::Empty,
+            spawn_to_start_p99_us = tracing::field::Empty,
+            spawn_to_start_max_us = tracing::field::Empty,
+            spawn_loop_total_us = tracing::field::Empty,
+            tasks_started_before_spawn_loop_end = tracing::field::Empty,
+            tasks_started_after_spawn_loop_end = tracing::field::Empty,
             run_time_total_us = tracing::field::Empty,
             run_time_p50_us = tracing::field::Empty,
             run_time_p95_us = tracing::field::Empty,
@@ -331,25 +335,16 @@ impl InnerIndexReader {
 
         let segment_readers = if collect_task_timings {
             let timings = Arc::new(SegmentOpenTimings::default());
-            let segment_readers = executor.map(
+            let (segment_readers, map_telemetry) = executor.map_with_telemetry(
                 {
                     let timings = timings.clone();
                     move |(segment, submitted_at)| {
                         let started_at = Instant::now();
                         let queue_time_us = duration_to_us(started_at.duration_since(submitted_at));
-                        let worker_thread = std::thread::current();
-                        let worker_thread_name = worker_thread
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_else(|| format!("{:?}", worker_thread.id()));
                         let reader = SegmentReader::open_with_custom_alive_set_parallel(
                             executor, segment, None,
                         );
-                        timings.record(
-                            queue_time_us,
-                            duration_to_us(started_at.elapsed()),
-                            worker_thread_name,
-                        );
+                        timings.record(queue_time_us, duration_to_us(started_at.elapsed()));
                         reader
                     }
                 },
@@ -358,18 +353,35 @@ impl InnerIndexReader {
                     .map(|segment| (segment, Instant::now())),
             )?;
 
-            let (queue_summary, run_summary, worker_thread_count) = timings.summaries();
+            let (queue_summary, run_summary) = timings.summaries();
             span.record("queue_time_total_us", queue_summary.total_us);
             span.record("queue_time_p50_us", queue_summary.p50_us);
             span.record("queue_time_p95_us", queue_summary.p95_us);
             span.record("queue_time_p99_us", queue_summary.p99_us);
             span.record("queue_time_max_us", queue_summary.max_us);
+            span.record(
+                "spawn_to_start_total_us",
+                map_telemetry.spawn_to_start_total_us,
+            );
+            span.record("spawn_to_start_p50_us", map_telemetry.spawn_to_start_p50_us);
+            span.record("spawn_to_start_p95_us", map_telemetry.spawn_to_start_p95_us);
+            span.record("spawn_to_start_p99_us", map_telemetry.spawn_to_start_p99_us);
+            span.record("spawn_to_start_max_us", map_telemetry.spawn_to_start_max_us);
+            span.record("spawn_loop_total_us", map_telemetry.spawn_loop_total_us);
+            span.record(
+                "tasks_started_before_spawn_loop_end",
+                map_telemetry.tasks_started_before_spawn_loop_end as u64,
+            );
+            span.record(
+                "tasks_started_after_spawn_loop_end",
+                map_telemetry.tasks_started_after_spawn_loop_end as u64,
+            );
             span.record("run_time_total_us", run_summary.total_us);
             span.record("run_time_p50_us", run_summary.p50_us);
             span.record("run_time_p95_us", run_summary.p95_us);
             span.record("run_time_p99_us", run_summary.p99_us);
             span.record("run_time_max_us", run_summary.max_us);
-            span.record("worker_thread_count", worker_thread_count as u64);
+            span.record("worker_thread_count", map_telemetry.worker_thread_count as u64);
 
             segment_readers
         } else {

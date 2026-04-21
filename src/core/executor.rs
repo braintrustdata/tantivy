@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -7,6 +9,111 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use crate::TantivyError;
 
 static NEXT_THREAD_POOL_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MapExecutionTelemetry {
+    pub spawn_to_start_total_us: u64,
+    pub spawn_to_start_p50_us: u64,
+    pub spawn_to_start_p95_us: u64,
+    pub spawn_to_start_p99_us: u64,
+    pub spawn_to_start_max_us: u64,
+    pub spawn_loop_total_us: u64,
+    pub tasks_started_before_spawn_loop_end: usize,
+    pub tasks_started_after_spawn_loop_end: usize,
+    pub worker_thread_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DurationSummary {
+    total_us: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+}
+
+#[derive(Default)]
+struct MapExecutionTimingState {
+    spawn_to_start_times_us: Vec<u64>,
+    worker_threads: HashSet<String>,
+    tasks_started_before_spawn_loop_end: usize,
+    tasks_started_after_spawn_loop_end: usize,
+}
+
+#[derive(Default)]
+struct MapExecutionTimings {
+    state: Mutex<MapExecutionTimingState>,
+}
+
+impl MapExecutionTimings {
+    fn record(
+        &self,
+        spawn_to_start_time_us: u64,
+        worker_thread: String,
+        started_before_spawn_loop_end: bool,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("map execution timing lock should not be poisoned");
+        state.spawn_to_start_times_us.push(spawn_to_start_time_us);
+        state.worker_threads.insert(worker_thread);
+        if started_before_spawn_loop_end {
+            state.tasks_started_before_spawn_loop_end += 1;
+        } else {
+            state.tasks_started_after_spawn_loop_end += 1;
+        }
+    }
+
+    fn summary(&self, spawn_loop_total_us: u64) -> MapExecutionTelemetry {
+        let state = self
+            .state
+            .lock()
+            .expect("map execution timing lock should not be poisoned");
+        let spawn_to_start_summary = duration_summary(&state.spawn_to_start_times_us);
+        MapExecutionTelemetry {
+            spawn_to_start_total_us: spawn_to_start_summary.total_us,
+            spawn_to_start_p50_us: spawn_to_start_summary.p50_us,
+            spawn_to_start_p95_us: spawn_to_start_summary.p95_us,
+            spawn_to_start_p99_us: spawn_to_start_summary.p99_us,
+            spawn_to_start_max_us: spawn_to_start_summary.max_us,
+            spawn_loop_total_us,
+            tasks_started_before_spawn_loop_end: state.tasks_started_before_spawn_loop_end,
+            tasks_started_after_spawn_loop_end: state.tasks_started_after_spawn_loop_end,
+            worker_thread_count: state.worker_threads.len(),
+        }
+    }
+}
+
+fn duration_summary(values_us: &[u64]) -> DurationSummary {
+    if values_us.is_empty() {
+        return DurationSummary::default();
+    }
+
+    let mut sorted = values_us.to_vec();
+    sorted.sort_unstable();
+
+    DurationSummary {
+        total_us: sorted.iter().sum(),
+        p50_us: percentile(&sorted, 50),
+        p95_us: percentile(&sorted, 95),
+        p99_us: percentile(&sorted, 99),
+        max_us: *sorted.last().unwrap_or(&0),
+    }
+}
+
+fn percentile(sorted_values_us: &[u64], percentile: usize) -> u64 {
+    if sorted_values_us.is_empty() {
+        return 0;
+    }
+    let last_idx = sorted_values_us.len() - 1;
+    let idx = (last_idx * percentile) / 100;
+    sorted_values_us[idx]
+}
+
+fn duration_to_us(duration: std::time::Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutorTelemetrySnapshot {
@@ -170,26 +277,72 @@ impl Executor {
         f: F,
         args: AIterator,
     ) -> crate::Result<Vec<R>> {
+        let (results, _telemetry) = self.map_with_telemetry(f, args)?;
+        Ok(results)
+    }
+
+    pub(crate) fn map_with_telemetry<
+        A: Send,
+        R: Send,
+        AIterator: Iterator<Item = A>,
+        F: Sized + Sync + Fn(A) -> crate::Result<R>,
+    >(
+        &self,
+        f: F,
+        args: AIterator,
+    ) -> crate::Result<(Vec<R>, MapExecutionTelemetry)> {
         match self {
-            Executor::SingleThread => args.map(f).collect::<crate::Result<_>>(),
+            Executor::SingleThread => {
+                let mut results = Vec::new();
+                for arg in args {
+                    results.push(f(arg)?);
+                }
+                let num_tasks = results.len();
+                Ok((
+                    results,
+                    MapExecutionTelemetry {
+                        tasks_started_before_spawn_loop_end: num_tasks,
+                        worker_thread_count: usize::from(num_tasks > 0),
+                        ..MapExecutionTelemetry::default()
+                    },
+                ))
+            }
             Executor::ThreadPool(thread_pool_executor) => {
                 thread_pool_executor.telemetry.increment_map_calls();
                 let args: Vec<A> = args.collect();
                 let num_fruits = args.len();
+                let timings = Arc::new(MapExecutionTimings::default());
+                let spawn_loop_finished = Arc::new(AtomicBool::new(false));
+                let spawn_loop_total_us = Arc::new(AtomicU64::new(0));
                 let fruit_receiver = {
                     let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
                     let parent_span = tracing::Span::current();
                     thread_pool_executor.pool.scope(|scope| {
                         let _parent_span_guard = parent_span.enter();
+                        let spawn_loop_start = Instant::now();
                         for (idx, arg) in args.into_iter().enumerate() {
                             // We name references for f and fruit_sender_ref because we do not
                             // want these two to be moved into the closure.
                             let f_ref = &f;
                             let fruit_sender_ref = &fruit_sender;
                             let parent_span = tracing::Span::current();
+                            let timings = timings.clone();
+                            let spawn_loop_finished = spawn_loop_finished.clone();
+                            let spawned_at = Instant::now();
                             scope.spawn(move |_| {
                                 let _parent_span_guard = parent_span.enter();
+                                let started_at = Instant::now();
+                                let worker_thread = std::thread::current();
+                                let worker_thread_name = worker_thread
+                                    .name()
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_else(|| format!("{:?}", worker_thread.id()));
                                 let fruit = f_ref(arg);
+                                timings.record(
+                                    duration_to_us(started_at.duration_since(spawned_at)),
+                                    worker_thread_name,
+                                    !spawn_loop_finished.load(Ordering::Relaxed),
+                                );
                                 if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
                                     error!(
                                         "Failed to send search task. It probably means all search \
@@ -199,6 +352,11 @@ impl Executor {
                                 }
                             });
                         }
+                        spawn_loop_total_us.store(
+                            duration_to_us(spawn_loop_start.elapsed()),
+                            Ordering::Relaxed,
+                        );
+                        spawn_loop_finished.store(true, Ordering::Relaxed);
                     });
                     fruit_receiver
                     // This ends the scope of fruit_sender.
@@ -217,7 +375,10 @@ impl Executor {
                         "One of the mapped execution failed.".to_string(),
                     ));
                 }
-                Ok(results)
+                Ok((
+                    results,
+                    timings.summary(spawn_loop_total_us.load(Ordering::Relaxed)),
+                ))
             }
         }
     }
