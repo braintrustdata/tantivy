@@ -17,7 +17,10 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::{read_vector_presence, PresenceBitset, VectorReader};
+use crate::vector::{
+    open_vector_column_reader, read_vector_presence, PresenceBitset, VectorColumnReader,
+    VectorReader,
+};
 use crate::{DocId, Executor, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -459,6 +462,18 @@ impl SegmentReader {
         match self.vector_file_opt.as_ref() {
             None => Ok(None),
             Some(file_slice) => read_vector_presence(file_slice, field, vector_id),
+        }
+    }
+
+    /// Returns a lazy reader for a specific vector column in this segment.
+    pub fn vector_column_reader(
+        &self,
+        field: Field,
+        vector_id: &str,
+    ) -> io::Result<Option<VectorColumnReader>> {
+        match self.vector_file_opt.as_ref() {
+            None => Ok(None),
+            Some(file_slice) => open_vector_column_reader(file_slice, field, vector_id),
         }
     }
 
