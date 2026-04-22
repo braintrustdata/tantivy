@@ -15,9 +15,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read};
 
+use common::HasLen;
+
 use super::format::{
     decode_vector, Int8QuantParams, PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
 };
+use crate::directory::FileSlice;
 use crate::schema::Field;
 use crate::DocId;
 
@@ -88,6 +91,158 @@ pub struct VectorReader {
     num_docs: u32,
     /// Encoding used in this file
     encoding: VectorEncoding,
+}
+
+struct FileSliceCursor<'a> {
+    file_slice: &'a FileSlice,
+    offset: usize,
+    len: usize,
+}
+
+impl<'a> FileSliceCursor<'a> {
+    fn new(file_slice: &'a FileSlice) -> Self {
+        Self {
+            file_slice,
+            offset: 0,
+            len: file_slice.len(),
+        }
+    }
+
+    fn read_slice(&mut self, len: usize) -> io::Result<common::OwnedBytes> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "vector file offset overflow")
+        })?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vector file ended before presence metadata could be read",
+            ));
+        }
+        let bytes = self.file_slice.read_bytes_slice(self.offset..end)?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        Ok(self.read_slice(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        let bytes = self.read_slice(4)?;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(bytes.as_ref());
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn skip(&mut self, len: usize) -> io::Result<()> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "vector file offset overflow")
+        })?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vector file ended before vector payload could be skipped",
+            ));
+        }
+        self.offset = end;
+        Ok(())
+    }
+}
+
+fn count_ones_in_bitset_bytes(bytes: &[u8]) -> usize {
+    bytes
+        .chunks(8)
+        .map(|chunk| {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u64::from_le_bytes(word).count_ones() as usize
+        })
+        .sum()
+}
+
+/// Reads only the presence bitset for a specific vector ID without loading vector payloads.
+pub fn read_vector_presence(
+    file_slice: &FileSlice,
+    field: Field,
+    vector_id: &str,
+) -> io::Result<Option<PresenceBitset>> {
+    let mut reader = FileSliceCursor::new(file_slice);
+    let magic = reader.read_u32()?;
+    if magic != VECTOR_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid vector file magic: expected {:x}, got {:x}",
+                VECTOR_MAGIC, magic
+            ),
+        ));
+    }
+
+    let version = reader.read_u8()?;
+    if version != VECTOR_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported vector format version: {version}"),
+        ));
+    }
+
+    let encoding = VectorEncoding::from_u8(reader.read_u8()?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Unknown vector encoding"))?;
+
+    let num_fields = reader.read_u32()?;
+    let mut field_ids = Vec::with_capacity(num_fields as usize);
+    for _ in 0..num_fields {
+        field_ids.push(reader.read_u32()?);
+    }
+
+    let num_docs = reader.read_u32()?;
+    let bitset_len = num_docs.div_ceil(64) as usize * 8;
+    let target_field_id = field.field_id();
+    let target_vector_id = vector_id.as_bytes();
+    let bytes_per_dim = encoding.bytes_per_dim();
+
+    for field_id in field_ids {
+        let num_vector_ids = reader.read_u32()?;
+        for _ in 0..num_vector_ids {
+            let id_len = reader.read_u32()? as usize;
+            let metadata = reader.read_slice(
+                id_len
+                    .checked_add(4)
+                    .and_then(|len| len.checked_add(bitset_len))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vector metadata length overflow",
+                        )
+                    })?,
+            )?;
+            let id_end = id_len;
+            let dims_end = id_end + 4;
+            let vector_name = &metadata[..id_end];
+            let mut dims = [0u8; 4];
+            dims.copy_from_slice(&metadata[id_end..dims_end]);
+            let dimensions = u32::from_le_bytes(dims) as usize;
+            let presence_bytes = &metadata[dims_end..];
+
+            if field_id == target_field_id && vector_name == target_vector_id {
+                return Ok(Some(PresenceBitset::from_bytes(presence_bytes, num_docs)));
+            }
+
+            if encoding == VectorEncoding::Int8 {
+                reader.skip(8)?;
+            }
+
+            let vector_data_len = count_ones_in_bitset_bytes(presence_bytes)
+                .checked_mul(dimensions)
+                .and_then(|count| count.checked_mul(bytes_per_dim))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "vector payload length overflow")
+                })?;
+            reader.skip(vector_data_len)?;
+        }
+    }
+
+    Ok(None)
 }
 
 impl VectorReader {
@@ -365,6 +520,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    use crate::directory::FileSlice;
+
     fn write_test_data() -> Vec<u8> {
         let mut data = Vec::new();
 
@@ -477,6 +634,24 @@ mod tests {
         let field = Field::from_field_id(0);
         assert_eq!(reader.num_docs(), 0);
         assert!(reader.get(field, "any", 0).is_none());
+    }
+
+    #[test]
+    fn test_read_vector_presence_from_file_slice() {
+        let data = write_test_data();
+        let field = Field::from_field_id(0);
+        let file_slice = FileSlice::from(data);
+
+        let presence = read_vector_presence(&file_slice, field, "summary")
+            .unwrap()
+            .expect("presence bitset should exist");
+        assert_eq!(presence.count_ones(), 2);
+        assert!(presence.get(0));
+        assert!(!presence.get(1));
+        assert!(presence.get(2));
+
+        let missing = read_vector_presence(&file_slice, field, "missing").unwrap();
+        assert!(missing.is_none());
     }
 
     #[test]

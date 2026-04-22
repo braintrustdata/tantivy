@@ -17,7 +17,7 @@ use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
-use crate::vector::VectorReader;
+use crate::vector::{read_vector_presence, PresenceBitset, VectorReader};
 use crate::{DocId, Executor, Opstamp};
 
 /// Entry point to access all of the datastructures of the `Segment`
@@ -447,6 +447,18 @@ impl SegmentReader {
             Some(file_slice) => {
                 Ok(Some(VectorReader::open(file_slice.read_bytes()?)?))
             }
+        }
+    }
+
+    /// Returns the presence bitset for a specific vector ID in this segment.
+    pub fn vector_presence(
+        &self,
+        field: Field,
+        vector_id: &str,
+    ) -> io::Result<Option<PresenceBitset>> {
+        match self.vector_file_opt.as_ref() {
+            None => Ok(None),
+            Some(file_slice) => read_vector_presence(file_slice, field, vector_id),
         }
     }
 
