@@ -129,6 +129,13 @@ pub fn decode_f16(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
 /// Encode f32 vector to bytes based on encoding.
 pub fn encode_vector(
     vec: &[f32],
@@ -153,7 +160,10 @@ pub fn decode_vector<'a>(
     quant: Option<&Int8QuantParams>,
 ) -> Cow<'a, [f32]> {
     match encoding {
-        VectorEncoding::F32 => Cow::Borrowed(bytemuck::cast_slice(bytes)),
+        VectorEncoding::F32 => match bytemuck::try_cast_slice(bytes) {
+            Ok(floats) => Cow::Borrowed(floats),
+            Err(_) => Cow::Owned(decode_f32(bytes)),
+        },
         VectorEncoding::F16 => Cow::Owned(decode_f16(bytes)),
         VectorEncoding::Int8 => {
             let quant = quant.expect("Int8 encoding requires quantization params");
@@ -339,6 +349,15 @@ mod tests {
                 assert!((o - d).abs() < 0.01, "int8 roundtrip: {} vs {}", o, d);
             }
         }
+    }
+
+    #[test]
+    fn test_decode_vector_handles_unaligned_f32_bytes() {
+        let mut encoded = vec![0u8];
+        encoded.extend_from_slice(&encode_vector(&[1.5, -2.0, 3.25], VectorEncoding::F32, None));
+
+        let decoded = decode_vector(&encoded[1..], VectorEncoding::F32, None);
+        assert_eq!(decoded.as_ref(), &[1.5, -2.0, 3.25]);
     }
 
     #[test]

@@ -15,9 +15,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read};
 
+use common::HasLen;
+
 use super::format::{
     decode_vector, Int8QuantParams, PresenceBitset, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
 };
+use crate::directory::FileSlice;
 use crate::schema::Field;
 use crate::DocId;
 
@@ -88,6 +91,342 @@ pub struct VectorReader {
     num_docs: u32,
     /// Encoding used in this file
     encoding: VectorEncoding,
+}
+
+/// Reader for a single vector column backed by a lazy `FileSlice`.
+///
+/// Unlike `VectorReader`, this only tracks metadata and a payload slice for one
+/// `(field, vector_id)` pair. Vector bytes are fetched on demand for specific
+/// doc ids.
+#[derive(Clone)]
+pub struct VectorColumnReader {
+    dimensions: u32,
+    presence: PresenceBitset,
+    data: FileSlice,
+    encoding: VectorEncoding,
+    quant_params: Option<Int8QuantParams>,
+}
+
+impl VectorColumnReader {
+    /// Gets the dimensions of vectors in this column.
+    pub fn dimensions(&self) -> u32 {
+        self.dimensions
+    }
+
+    /// Gets the number of vectors in this column.
+    pub fn count(&self) -> u32 {
+        self.presence.count_ones()
+    }
+
+    /// Checks whether the given doc has a vector in this column.
+    pub fn has_vector(&self, doc_id: DocId) -> bool {
+        self.presence.get(doc_id)
+    }
+
+    /// Reads a single vector for a document.
+    pub fn get(&self, doc_id: DocId) -> io::Result<Option<Vec<f32>>> {
+        if !self.has_vector(doc_id) {
+            return Ok(None);
+        }
+
+        let bytes_per_vec = self.dimensions as usize * self.encoding.bytes_per_dim();
+        let vector_idx = self.presence.count_ones_before(doc_id) as usize;
+        let start = vector_idx * bytes_per_vec;
+        let end = start + bytes_per_vec;
+        let bytes = self.data.read_bytes_slice(start..end)?;
+        Ok(Some(
+            decode_vector(bytes.as_ref(), self.encoding, self.quant_params.as_ref()).into_owned(),
+        ))
+    }
+
+    /// Reads vectors for a set of doc ids without materializing the whole column.
+    pub fn get_batch(&self, doc_ids: &[DocId]) -> io::Result<Vec<Option<Vec<f32>>>> {
+        let mut results = vec![None; doc_ids.len()];
+        if doc_ids.is_empty() {
+            return Ok(results);
+        }
+
+        let bytes_per_vec = self.dimensions as usize * self.encoding.bytes_per_dim();
+        let mut requests: Vec<(usize, usize)> = doc_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(result_idx, &doc_id)| {
+                self.has_vector(doc_id).then(|| {
+                    let vector_idx = self.presence.count_ones_before(doc_id) as usize;
+                    (result_idx, vector_idx * bytes_per_vec)
+                })
+            })
+            .collect();
+
+        if requests.is_empty() {
+            return Ok(results);
+        }
+
+        requests.sort_by_key(|(_, start)| *start);
+
+        let mut run_count = 0usize;
+        let mut covered_bytes = 0usize;
+        let mut idx = 0usize;
+        while idx < requests.len() {
+            run_count += 1;
+            let run_start = requests[idx].1;
+            let mut run_end = run_start + bytes_per_vec;
+            idx += 1;
+
+            while idx < requests.len() {
+                let next_start = requests[idx].1;
+                if next_start > run_end {
+                    break;
+                }
+                run_end = run_end.max(next_start + bytes_per_vec);
+                idx += 1;
+            }
+
+            covered_bytes += run_end - run_start;
+        }
+
+        let column_len = self.data.len();
+        let should_read_whole_column =
+            column_len <= 1 << 20 || run_count >= 4 || covered_bytes * 2 >= column_len;
+
+        if should_read_whole_column {
+            let bytes = self.data.read_bytes()?;
+            let bytes_ref = bytes.as_ref();
+
+            for &(result_idx, absolute_start) in &requests {
+                let end = absolute_start + bytes_per_vec;
+                results[result_idx] = Some(
+                    decode_vector(
+                        &bytes_ref[absolute_start..end],
+                        self.encoding,
+                        self.quant_params.as_ref(),
+                    )
+                    .into_owned(),
+                );
+            }
+
+            return Ok(results);
+        }
+
+        let mut run_start_idx = 0;
+        while run_start_idx < requests.len() {
+            let run_start = requests[run_start_idx].1;
+            let mut run_end = run_start + bytes_per_vec;
+            let mut run_end_idx = run_start_idx + 1;
+
+            while run_end_idx < requests.len() {
+                let next_start = requests[run_end_idx].1;
+                if next_start > run_end {
+                    break;
+                }
+                run_end = run_end.max(next_start + bytes_per_vec);
+                run_end_idx += 1;
+            }
+
+            let bytes = self.data.read_bytes_slice(run_start..run_end)?;
+            let bytes_ref = bytes.as_ref();
+
+            for &(result_idx, absolute_start) in &requests[run_start_idx..run_end_idx] {
+                let local_start = absolute_start - run_start;
+                let local_end = local_start + bytes_per_vec;
+                results[result_idx] = Some(
+                    decode_vector(
+                        &bytes_ref[local_start..local_end],
+                        self.encoding,
+                        self.quant_params.as_ref(),
+                    )
+                    .into_owned(),
+                );
+            }
+
+            run_start_idx = run_end_idx;
+        }
+
+        Ok(results)
+    }
+}
+
+struct FileSliceCursor<'a> {
+    file_slice: &'a FileSlice,
+    offset: usize,
+    len: usize,
+}
+
+impl<'a> FileSliceCursor<'a> {
+    fn new(file_slice: &'a FileSlice) -> Self {
+        Self {
+            file_slice,
+            offset: 0,
+            len: file_slice.len(),
+        }
+    }
+
+    fn read_slice(&mut self, len: usize) -> io::Result<common::OwnedBytes> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "vector file offset overflow")
+        })?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vector file ended before presence metadata could be read",
+            ));
+        }
+        let bytes = self.file_slice.read_bytes_slice(self.offset..end)?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        Ok(self.read_slice(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        let bytes = self.read_slice(4)?;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(bytes.as_ref());
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn read_f32(&mut self) -> io::Result<f32> {
+        let bytes = self.read_slice(4)?;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(bytes.as_ref());
+        Ok(f32::from_le_bytes(raw))
+    }
+
+    fn skip(&mut self, len: usize) -> io::Result<()> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "vector file offset overflow")
+        })?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "vector file ended before vector payload could be skipped",
+            ));
+        }
+        self.offset = end;
+        Ok(())
+    }
+}
+
+fn open_vector_column(
+    file_slice: &FileSlice,
+    field: Field,
+    vector_id: &str,
+) -> io::Result<Option<VectorColumnReader>> {
+    let mut reader = FileSliceCursor::new(file_slice);
+    let magic = reader.read_u32()?;
+    if magic != VECTOR_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid vector file magic: expected {:x}, got {:x}",
+                VECTOR_MAGIC, magic
+            ),
+        ));
+    }
+
+    let version = reader.read_u8()?;
+    if version != VECTOR_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported vector format version: {version}"),
+        ));
+    }
+
+    let encoding = VectorEncoding::from_u8(reader.read_u8()?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Unknown vector encoding"))?;
+
+    let num_fields = reader.read_u32()?;
+    let mut field_ids = Vec::with_capacity(num_fields as usize);
+    for _ in 0..num_fields {
+        field_ids.push(reader.read_u32()?);
+    }
+
+    let num_docs = reader.read_u32()?;
+    let bitset_len = num_docs.div_ceil(64) as usize * 8;
+    let target_field_id = field.field_id();
+    let target_vector_id = vector_id.as_bytes();
+    let bytes_per_dim = encoding.bytes_per_dim();
+
+    for field_id in field_ids {
+        let num_vector_ids = reader.read_u32()?;
+        for _ in 0..num_vector_ids {
+            let id_len = reader.read_u32()? as usize;
+            let metadata = reader.read_slice(
+                id_len
+                    .checked_add(4)
+                    .and_then(|len| len.checked_add(bitset_len))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vector metadata length overflow",
+                        )
+                    })?,
+            )?;
+            let id_end = id_len;
+            let dims_end = id_end + 4;
+            let vector_name = &metadata[..id_end];
+            let mut dims = [0u8; 4];
+            dims.copy_from_slice(&metadata[id_end..dims_end]);
+            let dimensions = u32::from_le_bytes(dims);
+            let presence_bytes = &metadata[dims_end..];
+            let presence = PresenceBitset::from_bytes(presence_bytes, num_docs);
+
+            let quant_params = if encoding == VectorEncoding::Int8 {
+                Some(Int8QuantParams {
+                    scale: reader.read_f32()?,
+                    zero_point: reader.read_f32()?,
+                })
+            } else {
+                None
+            };
+
+            let vector_data_len = presence
+                .count_ones()
+                .try_into()
+                .ok()
+                .and_then(|count: usize| count.checked_mul(dimensions as usize))
+                .and_then(|count| count.checked_mul(bytes_per_dim))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "vector payload length overflow")
+                })?;
+
+            if field_id == target_field_id && vector_name == target_vector_id {
+                let data = file_slice.slice(reader.offset..reader.offset + vector_data_len);
+                return Ok(Some(VectorColumnReader {
+                    dimensions,
+                    presence,
+                    data,
+                    encoding,
+                    quant_params,
+                }));
+            }
+
+            reader.skip(vector_data_len)?;
+        }
+    }
+
+    Ok(None)
+}
+
+/// Reads only the presence bitset for a specific vector ID without loading vector payloads.
+pub fn read_vector_presence(
+    file_slice: &FileSlice,
+    field: Field,
+    vector_id: &str,
+) -> io::Result<Option<PresenceBitset>> {
+    Ok(open_vector_column(file_slice, field, vector_id)?.map(|column| column.presence))
+}
+
+/// Opens a lazy reader for a specific vector column without materializing the
+/// rest of the segment's vector payloads.
+pub fn open_vector_column_reader(
+    file_slice: &FileSlice,
+    field: Field,
+    vector_id: &str,
+) -> io::Result<Option<VectorColumnReader>> {
+    open_vector_column(file_slice, field, vector_id)
 }
 
 impl VectorReader {
@@ -365,6 +704,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    use crate::directory::FileSlice;
+
     fn write_test_data() -> Vec<u8> {
         let mut data = Vec::new();
 
@@ -477,6 +818,58 @@ mod tests {
         let field = Field::from_field_id(0);
         assert_eq!(reader.num_docs(), 0);
         assert!(reader.get(field, "any", 0).is_none());
+    }
+
+    #[test]
+    fn test_read_vector_presence_from_file_slice() {
+        let data = write_test_data();
+        let field = Field::from_field_id(0);
+        let file_slice = FileSlice::from(data);
+
+        let presence = read_vector_presence(&file_slice, field, "summary")
+            .unwrap()
+            .expect("presence bitset should exist");
+        assert_eq!(presence.count_ones(), 2);
+        assert!(presence.get(0));
+        assert!(!presence.get(1));
+        assert!(presence.get(2));
+
+        let missing = read_vector_presence(&file_slice, field, "missing").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_open_vector_column_reader_reads_only_requested_docs() {
+        let data = write_test_data();
+        let field = Field::from_field_id(0);
+        let file_slice = FileSlice::from(data);
+
+        let column = open_vector_column_reader(&file_slice, field, "summary")
+            .unwrap()
+            .expect("summary column should exist");
+
+        assert_eq!(column.dimensions(), 3);
+        assert_eq!(column.count(), 2);
+        assert!(column.has_vector(0));
+        assert!(!column.has_vector(1));
+        assert!(column.has_vector(2));
+
+        assert_eq!(column.get(1).unwrap(), None);
+        assert_eq!(
+            column.get(0).unwrap(),
+            Some(vec![10.0f32, 20.0, 30.0])
+        );
+        assert_eq!(
+            column.get(2).unwrap(),
+            Some(vec![40.0f32, 50.0, 60.0])
+        );
+
+        let batch = column.get_batch(&[2, 1, 0]).unwrap();
+        assert_eq!(batch, vec![
+            Some(vec![40.0f32, 50.0, 60.0]),
+            None,
+            Some(vec![10.0f32, 20.0, 30.0]),
+        ]);
     }
 
     #[test]

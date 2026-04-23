@@ -73,7 +73,7 @@ mod reader;
 mod writer;
 
 pub use format::{VectorEncoding, Int8QuantParams, PresenceBitset, PresenceBitsetBuilder, VECTOR_MAGIC, VECTOR_VERSION};
-pub use reader::VectorReader;
+pub use reader::{open_vector_column_reader, read_vector_presence, VectorColumnReader, VectorReader};
 pub use writer::VectorFieldsWriter;
 
 #[cfg(test)]
@@ -579,4 +579,3 @@ mod tests {
         assert_eq!(vectors.get(&1).unwrap().len(), 3, "Doc 2 should have 3 dimensions");
     }
 }
-
