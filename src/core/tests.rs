@@ -6,9 +6,10 @@ use crate::query::TermQuery;
 use crate::schema::{Field, IndexRecordOption, Schema, Type, INDEXED, STRING, TEXT};
 use crate::tokenizer::TokenizerManager;
 use crate::{
-    Directory, DocSet, Index, IndexBuilder, IndexReader, IndexSettings, IndexWriter, Postings,
-    ReloadPolicy, SegmentId, TantivyDocument, Term,
+    Directory, DocSet, Executor, Index, IndexBuilder, IndexReader, IndexSettings, IndexWriter,
+    Postings, ReloadPolicy, SegmentId, TantivyDocument, Term,
 };
+use std::sync::Arc;
 
 #[test]
 fn test_indexer_for_field() {
@@ -127,6 +128,25 @@ fn test_index_on_commit_reload_policy() -> crate::Result<()> {
         .unwrap();
     assert_eq!(reader.searcher().num_docs(), 0);
     test_index_on_commit_reload_policy_aux(field, &index, &reader)
+}
+
+#[test]
+fn test_reader_builder_with_executor_does_not_mutate_index() -> crate::Result<()> {
+    let index = Index::create_in_ram(throw_away_schema());
+    assert!(matches!(index.search_executor(), Executor::SingleThread));
+
+    let executor = Arc::new(Executor::multi_thread(2, "reader-builder-test-")?);
+    let reader = index
+        .reader_builder_with_executor(executor)?
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?;
+
+    assert!(matches!(
+        reader.index().search_executor(),
+        Executor::ThreadPool(_)
+    ));
+    assert!(matches!(index.search_executor(), Executor::SingleThread));
+    Ok(())
 }
 
 #[cfg(feature = "mmap")]

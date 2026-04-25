@@ -480,6 +480,31 @@ impl Index {
         IndexReaderBuilder::new(self.clone())
     }
 
+    /// Create a default [`IndexReader`] using a clone of this index configured
+    /// with the given search executor.
+    ///
+    /// This does not mutate this index's configured search executor.
+    pub fn reader_with_executor(
+        &self,
+        shared_thread_pool: Arc<Executor>,
+    ) -> crate::Result<IndexReader> {
+        self.reader_builder_with_executor(shared_thread_pool)?
+            .try_into()
+    }
+
+    /// Create an [`IndexReaderBuilder`] using a clone of this index configured
+    /// with the given search executor.
+    ///
+    /// This does not mutate this index's configured search executor.
+    pub fn reader_builder_with_executor(
+        &self,
+        shared_thread_pool: Arc<Executor>,
+    ) -> crate::Result<IndexReaderBuilder> {
+        let mut index = self.clone();
+        index.set_shared_multithread_executor(shared_thread_pool)?;
+        Ok(IndexReaderBuilder::new(index))
+    }
+
     /// Opens a new directory from an index path.
     #[cfg(feature = "mmap")]
     pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
