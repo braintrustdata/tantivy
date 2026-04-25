@@ -3,11 +3,12 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
 use super::{FieldMetadata, IndexSettings};
+use crate::artifact::SegmentArtifactProvider;
 use crate::core::{Executor, META_FILEPATH};
 use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
@@ -289,6 +290,7 @@ pub struct Index {
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
+    segment_artifact_providers: Arc<RwLock<Vec<Arc<dyn SegmentArtifactProvider>>>>,
 }
 
 impl Index {
@@ -412,6 +414,7 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Arc::new(Executor::single_thread()),
             inventory,
+            segment_artifact_providers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -478,6 +481,41 @@ impl Index {
     /// This method is typically called only once per `Index` instance.
     pub fn reader_builder(&self) -> IndexReaderBuilder {
         IndexReaderBuilder::new(self.clone())
+    }
+
+    /// Registers a provider for per-segment artifact files.
+    pub fn add_segment_artifact_provider(&self, provider: Arc<dyn SegmentArtifactProvider>) {
+        let mut providers = self
+            .segment_artifact_providers
+            .write()
+            .expect("segment artifact provider lock should not be poisoned");
+        providers.retain(|existing| existing.id() != provider.id());
+        providers.push(provider);
+    }
+
+    /// Returns the currently registered segment artifact providers.
+    pub fn segment_artifact_providers(&self) -> Vec<Arc<dyn SegmentArtifactProvider>> {
+        self.segment_artifact_providers
+            .read()
+            .expect("segment artifact provider lock should not be poisoned")
+            .clone()
+    }
+
+    pub(crate) fn segment_artifact_extensions(&self) -> Vec<String> {
+        self.segment_artifact_providers()
+            .into_iter()
+            .map(|provider| {
+                provider
+                    .file_extension()
+                    .trim_start_matches('.')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    pub(crate) fn list_segment_files(&self, segment_meta: &SegmentMeta) -> HashSet<PathBuf> {
+        let artifact_extensions = self.segment_artifact_extensions();
+        segment_meta.list_files_with_artifacts(artifact_extensions.iter().map(String::as_str))
     }
 
     /// Opens a new directory from an index path.
@@ -706,7 +744,7 @@ impl Index {
         let active_segments_files: HashSet<PathBuf> = self
             .searchable_segment_metas()?
             .iter()
-            .flat_map(|segment_meta| segment_meta.list_files())
+            .flat_map(|segment_meta| self.list_segment_files(segment_meta))
             .collect();
         let active_existing_files: HashSet<&PathBuf> =
             active_segments_files.intersection(&managed_files).collect();

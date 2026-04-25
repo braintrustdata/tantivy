@@ -154,37 +154,6 @@ impl TantivyDocument {
         self.add_field_value(field, object);
     }
 
-    /// Add a named vector to a vector field.
-    ///
-    /// Multiple calls with the same field will merge vectors into the same map.
-    /// This is the preferred way to add vectors when you have multiple named vectors
-    /// per document (e.g., "chunk_0", "chunk_1", "summary").
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// doc.add_named_vector(embedding_field, "chunk_0", vec![0.1, 0.2, 0.3]);
-    /// doc.add_named_vector(embedding_field, "summary", vec![1.0, 2.0]);
-    /// ```
-    pub fn add_named_vector(&mut self, field: Field, vector_id: impl Into<String>, vector: Vec<f32>) {
-        let vector_id = vector_id.into();
-        
-        // Check if we already have a vector map for this field
-        for field_value in &mut self.field_values {
-            if field_value.field() == field {
-                if let OwnedValue::VectorMap(ref mut map) = field_value.value {
-                    map.insert(vector_id, vector);
-                    return;
-                }
-            }
-        }
-        
-        // No existing vector map, create a new one
-        let mut map = BTreeMap::new();
-        map.insert(vector_id, vector);
-        self.add_field_value(field, map);
-    }
-
     /// Add a (field, value) to the document.
     pub fn add_field_value<T: Into<OwnedValue>>(&mut self, field: Field, typed_val: T) {
         let value = typed_val.into();

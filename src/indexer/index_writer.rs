@@ -761,7 +761,11 @@ impl<D: Document> IndexWriter<D> {
     /// document queue.
     pub fn add_document(&self, document: D) -> crate::Result<Opstamp> {
         let opstamp = self.stamper.stamp();
-        self.send_add_documents_batch(smallvec![AddOperation { opstamp, document }])?;
+        self.send_add_documents_batch(smallvec![AddOperation {
+            opstamp,
+            document,
+            artifacts: Vec::new()
+        }])?;
         Ok(opstamp)
     }
 
@@ -821,7 +825,22 @@ impl<D: Document> IndexWriter<D> {
                     self.delete_queue.push(delete_operation);
                 }
                 UserOperation::Add(document) => {
-                    let add_operation = AddOperation { opstamp, document };
+                    let add_operation = AddOperation {
+                        opstamp,
+                        document,
+                        artifacts: Vec::new(),
+                    };
+                    adds.push(add_operation);
+                }
+                UserOperation::AddWithArtifacts {
+                    document,
+                    artifacts,
+                } => {
+                    let add_operation = AddOperation {
+                        opstamp,
+                        document,
+                        artifacts,
+                    };
                     adds.push(add_operation);
                 }
             }

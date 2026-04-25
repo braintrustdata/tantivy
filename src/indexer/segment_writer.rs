@@ -1,10 +1,12 @@
 use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
 use itertools::Itertools;
+use std::collections::HashMap;
 use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
+use crate::artifact::{SegmentArtifactProvider, SegmentArtifactWriter};
 use crate::core::json_utils::index_json_values;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
@@ -18,7 +20,6 @@ use crate::schema::document::{Document, ReferenceValue, Value};
 use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
 use crate::store::{StoreReader, StoreWriter};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::vector::VectorFieldsWriter;
 use crate::{DocId, Opstamp, SegmentComponent, TantivyError};
 
 /// Computes the initial size of the hash table.
@@ -68,9 +69,10 @@ pub struct SegmentWriter {
     pub(crate) segment_serializer: SegmentSerializer,
     pub(crate) fast_field_writers: FastFieldsWriter,
     pub(crate) fieldnorms_writer: FieldNormsWriter,
-    pub(crate) vector_fields_writer: VectorFieldsWriter,
     pub(crate) json_path_writer: JsonPathWriter,
     pub(crate) doc_opstamps: Vec<Opstamp>,
+    artifact_providers: Vec<std::sync::Arc<dyn SegmentArtifactProvider>>,
+    artifact_writers: HashMap<String, Box<dyn SegmentArtifactWriter>>,
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: Term,
     schema: Schema,
@@ -90,6 +92,7 @@ impl SegmentWriter {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
+        let artifact_providers = segment.index().segment_artifact_providers();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -120,7 +123,6 @@ impl SegmentWriter {
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
-            vector_fields_writer: VectorFieldsWriter::from_schema(&schema),
             json_path_writer: JsonPathWriter::default(),
             segment_serializer,
             fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
@@ -128,6 +130,11 @@ impl SegmentWriter {
                 tokenizer_manager_fast_field,
             )?,
             doc_opstamps: Vec::with_capacity(1_000),
+            artifact_writers: artifact_providers
+                .iter()
+                .map(|provider| (provider.id().to_string(), provider.make_writer()))
+                .collect(),
+            artifact_providers,
             per_field_text_analyzers,
             term_buffer: Term::with_capacity(16),
             schema,
@@ -155,9 +162,11 @@ impl SegmentWriter {
             self.ctx,
             self.fast_field_writers,
             &self.fieldnorms_writer,
-            self.vector_fields_writer,
+            self.artifact_providers,
+            self.artifact_writers,
             self.segment_serializer,
             mapping.as_ref(),
+            self.max_doc,
         )?;
         let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
         Ok(doc_opstamps)
@@ -169,7 +178,11 @@ impl SegmentWriter {
         self.ctx.mem_usage()
             + self.fieldnorms_writer.mem_usage()
             + self.fast_field_writers.mem_usage()
-            + self.vector_fields_writer.mem_usage()
+            + self
+                .artifact_writers
+                .values()
+                .map(|writer| writer.mem_usage())
+                .sum::<usize>()
             + self.segment_serializer.mem_usage()
     }
 
@@ -383,10 +396,7 @@ impl SegmentWriter {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
-                FieldType::VectorMap(_) => {
-                    // VectorMap fields are handled separately in the vector writer
-                    // They are not indexed in postings
-                }
+                FieldType::Artifact(_) => {}
             }
         }
         Ok(())
@@ -399,11 +409,19 @@ impl SegmentWriter {
         &mut self,
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
-        let AddOperation { document, opstamp } = add_operation;
+        let AddOperation {
+            document,
+            opstamp,
+            artifacts,
+        } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
-        self.vector_fields_writer.add_document(&document)?;
         self.index_document(&document)?;
+        for artifact in artifacts {
+            if let Some(writer) = self.artifact_writers.get_mut(&artifact.provider_id) {
+                writer.record(self.max_doc, &artifact.payload)?;
+            }
+        }
         let doc_writer = self.segment_serializer.get_store_writer();
         doc_writer.store(&document, &self.schema)?;
         self.max_doc += 1;
@@ -442,9 +460,11 @@ fn remap_and_write(
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
-    vector_fields_writer: VectorFieldsWriter,
+    artifact_providers: Vec<std::sync::Arc<dyn SegmentArtifactProvider>>,
+    mut artifact_writers: HashMap<String, Box<dyn SegmentArtifactWriter>>,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
+    max_doc: DocId,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
@@ -465,13 +485,17 @@ fn remap_and_write(
     debug!("fastfield-serialize");
     fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
 
-    // Serialize vectors if there are any vector fields
-    if vector_fields_writer.has_vector_fields() {
-        debug!("vector-serialize");
-        let vector_write = serializer
+    for provider in artifact_providers {
+        let Some(writer) = artifact_writers.get_mut(provider.id()) else {
+            continue;
+        };
+        if !writer.has_documents() {
+            continue;
+        }
+        let artifact_write = serializer
             .segment_mut()
-            .open_write(SegmentComponent::Vectors)?;
-        vector_fields_writer.serialize(vector_write, doc_id_map)?;
+            .open_artifact_write(provider.file_extension())?;
+        writer.serialize(artifact_write, doc_id_map, max_doc)?;
     }
 
     // finalize temp docstore and create version, which reflects the doc_id_map

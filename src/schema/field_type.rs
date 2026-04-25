@@ -10,9 +10,9 @@ use thiserror::Error;
 
 use super::ip_options::IpAddrOptions;
 use super::IntoIpv6Addr;
+use crate::schema::artifact_options::ArtifactOptions;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::facet_options::FacetOptions;
-use crate::schema::vector_options::VectorMapOptions;
 use crate::schema::{
     DateOptions, Facet, IndexRecordOption, JsonObjectOptions, NumericOptions, OwnedValue,
     TextFieldIndexing, TextOptions,
@@ -72,8 +72,8 @@ pub enum Type {
     Json = b'j',
     /// IpAddr
     IpAddr = b'p',
-    /// VectorMap embedding `BTreeMap<String, Vec<f32>>`
-    VectorMap = b'v',
+    /// External per-segment artifact.
+    Artifact = b'v',
 }
 
 impl From<ColumnType> for Type {
@@ -102,7 +102,7 @@ const ALL_TYPES: [Type; 11] = [
     Type::Bytes,
     Type::Json,
     Type::IpAddr,
-    Type::VectorMap,
+    Type::Artifact,
 ];
 
 impl Type {
@@ -131,7 +131,7 @@ impl Type {
             Type::Bytes => "Bytes",
             Type::Json => "Json",
             Type::IpAddr => "IpAddr",
-            Type::VectorMap => "VectorMap",
+            Type::Artifact => "Artifact",
         }
     }
 
@@ -150,7 +150,7 @@ impl Type {
             b'b' => Some(Type::Bytes),
             b'j' => Some(Type::Json),
             b'p' => Some(Type::IpAddr),
-            b'v' => Some(Type::VectorMap),
+            b'v' => Some(Type::Artifact),
             _ => None,
         }
     }
@@ -183,8 +183,9 @@ pub enum FieldType {
     JsonObject(JsonObjectOptions),
     /// IpAddr field
     IpAddr(IpAddrOptions),
-    /// VectorMap embeddings field (BTreeMap<String, Vec<f32>>)
-    VectorMap(VectorMapOptions),
+    /// External per-segment artifact field.
+    #[serde(rename = "artifact", alias = "vector_map")]
+    Artifact(ArtifactOptions),
 }
 
 impl FieldType {
@@ -201,7 +202,7 @@ impl FieldType {
             FieldType::Bytes(_) => Type::Bytes,
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
-            FieldType::VectorMap(_) => Type::VectorMap,
+            FieldType::Artifact(_) => Type::Artifact,
         }
     }
 
@@ -228,7 +229,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
-            FieldType::VectorMap(_) => false, // VectorMaps are not indexed for text search
+            FieldType::Artifact(_) => false,
         }
     }
 
@@ -266,7 +267,7 @@ impl FieldType {
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_fast(),
             FieldType::Facet(_) => true,
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_fast(),
-            FieldType::VectorMap(_) => false, // VectorMaps are stored separately, not as fast fields
+            FieldType::Artifact(_) => false,
         }
     }
 
@@ -286,7 +287,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.fieldnorms(),
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
-            FieldType::VectorMap(_) => false,
+            FieldType::Artifact(_) => false,
         }
     }
 
@@ -338,13 +339,13 @@ impl FieldType {
                     None
                 }
             }
-            FieldType::VectorMap(_) => None, // VectorMaps are not indexed
+            FieldType::Artifact(_) => None,
         }
     }
 
-    /// Returns true if this field is a vector map field.
-    pub fn is_vector_map(&self) -> bool {
-        matches!(self, FieldType::VectorMap(_))
+    /// Returns true if this field type is an artifact field.
+    pub fn is_artifact(&self) -> bool {
+        matches!(self, FieldType::Artifact(_))
     }
 
     /// Parses a field value from json, given the target FieldType.
@@ -445,8 +446,8 @@ impl FieldType {
 
                         Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                     }
-                    FieldType::VectorMap(_) => Err(ValueParsingError::TypeError {
-                        expected: "an array of numbers or object with arrays of numbers",
+                    FieldType::Artifact(_) => Err(ValueParsingError::TypeError {
+                        expected: "an external artifact",
                         json: JsonValue::String(field_text),
                     }),
                 }
@@ -508,8 +509,8 @@ impl FieldType {
                     expected: "a string with an ip addr",
                     json: JsonValue::Number(field_val_num),
                 }),
-                FieldType::VectorMap(_) => Err(ValueParsingError::TypeError {
-                    expected: "an array of numbers or object with arrays of numbers",
+                FieldType::Artifact(_) => Err(ValueParsingError::TypeError {
+                    expected: "an external artifact",
                     json: JsonValue::Number(field_val_num),
                 }),
             },
@@ -527,33 +528,10 @@ impl FieldType {
                     }
                 }
                 FieldType::JsonObject(_) => Ok(OwnedValue::from(json_map)),
-                FieldType::VectorMap(_) => {
-                    // Parse as a map of vector ID -> vector
-                    let mut map = std::collections::BTreeMap::new();
-                    for (key, val) in json_map.iter() {
-                        if let Some(arr) = val.as_array() {
-                            let mut vector = Vec::with_capacity(arr.len());
-                            for v in arr {
-                                match v.as_f64() {
-                                    Some(f) => vector.push(f as f32),
-                                    None => {
-                                        return Err(ValueParsingError::TypeError {
-                                            expected: "object with arrays of numbers",
-                                            json: JsonValue::Object(json_map),
-                                        });
-                                    }
-                                }
-                            }
-                            map.insert(key.clone(), vector);
-                        } else {
-                            return Err(ValueParsingError::TypeError {
-                                expected: "object with arrays of numbers",
-                                json: JsonValue::Object(json_map),
-                            });
-                        }
-                    }
-                    Ok(OwnedValue::VectorMap(map))
-                }
+                FieldType::Artifact(_) => Err(ValueParsingError::TypeError {
+                    expected: "an external artifact",
+                    json: JsonValue::Object(json_map),
+                }),
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Object(json_map),
@@ -593,30 +571,10 @@ impl FieldType {
                     json: JsonValue::Null,
                 }),
             },
-            JsonValue::Array(json_array) => match self {
-                FieldType::VectorMap(_) => {
-                    // Parse as a single vector with default key "default"
-                    let mut vector = Vec::with_capacity(json_array.len());
-                    for val in json_array.iter() {
-                        match val.as_f64() {
-                            Some(f) => vector.push(f as f32),
-                            None => {
-                                return Err(ValueParsingError::TypeError {
-                                    expected: "array of numbers",
-                                    json: JsonValue::Array(json_array),
-                                });
-                            }
-                        }
-                    }
-                    let mut map = std::collections::BTreeMap::new();
-                    map.insert("default".to_string(), vector);
-                    Ok(OwnedValue::VectorMap(map))
-                }
-                _ => Err(ValueParsingError::TypeError {
-                    expected: self.value_type().name(),
-                    json: JsonValue::Array(json_array),
-                }),
-            },
+            JsonValue::Array(json_array) => Err(ValueParsingError::TypeError {
+                expected: self.value_type().name(),
+                json: JsonValue::Array(json_array),
+            }),
         }
     }
 }
