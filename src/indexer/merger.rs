@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use rayon::ThreadPool;
 
 use super::segment_serializer::SegmentSerializerParts;
+use crate::artifact::SegmentArtifactMergeContext;
 use crate::directory::{Directory, WritePtr};
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
@@ -25,7 +26,6 @@ use crate::postings::{
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::vector::VectorReader;
 use crate::{
     DocAddress, DocId, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
     SegmentComponent, SegmentOrdinal,
@@ -150,7 +150,6 @@ pub struct IndexMerger {
     index_settings: IndexSettings,
     schema: Schema,
     pub(crate) readers: Vec<SegmentReader>,
-    /// The original segments (stored for accessing vector files during merge)
     segments: Vec<Segment>,
     max_doc: u32,
 }
@@ -956,7 +955,6 @@ impl IndexMerger {
         merge_thread_pool: Option<&ThreadPool>,
     ) -> crate::Result<u32> {
         let input_space_usage = MergeInputSpaceUsage::from_readers(&self.readers)?;
-        let has_vector_fields = self.has_vector_fields();
         let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
         {
             // If the documents are already sorted and stackable, we ignore the mapping and execute
@@ -973,7 +971,6 @@ impl IndexMerger {
             "index_merger_write",
             num_readers = self.readers.len(),
             max_doc = self.max_doc,
-            has_vector_fields = has_vector_fields,
             sort_by_field = ?self
                 .index_settings
                 .sort_by_field
@@ -1076,13 +1073,17 @@ impl IndexMerger {
             total_serialized_postings_output_bytes,
         );
 
-        // Write vectors if there are any vector fields
-        if has_vector_fields {
-            debug!("write-vectors");
-            let vector_write = tracing::info_span!("open_vector_writer")
-                .in_scope(|| segment.open_write(SegmentComponent::Vectors))?;
-            tracing::info_span!("write_vectors")
-                .in_scope(|| self.write_vectors(vector_write, &doc_id_mapping))?;
+        for provider in segment.index().segment_artifact_providers() {
+            if !provider.has_merge_input(&self.segments)? {
+                continue;
+            }
+            let artifact_write = segment.open_artifact_write(provider.file_extension())?;
+            provider.merge(SegmentArtifactMergeContext {
+                output: artifact_write,
+                segments: &self.segments,
+                doc_id_mapping: &doc_id_mapping,
+                max_doc: self.max_doc,
+            })?;
         }
 
         debug!("close-serializer");
@@ -1093,141 +1094,6 @@ impl IndexMerger {
             Ok(())
         })?;
         Ok(self.max_doc)
-    }
-
-    /// Returns true if the schema contains any vector fields.
-    fn has_vector_fields(&self) -> bool {
-        self.schema
-            .fields()
-            .any(|(_, entry)| matches!(entry.field_type(), FieldType::VectorMap(_)))
-    }
-
-    /// Writes merged vectors from all segments to the output in columnar format.
-    fn write_vectors(
-        &self,
-        mut wrt: WritePtr,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
-        use std::collections::BTreeSet;
-        use std::io::Write;
-
-        // Get vector fields from schema
-        let vector_fields: Vec<Field> = self
-            .schema
-            .fields()
-            .filter_map(|(field, entry)| {
-                if matches!(entry.field_type(), FieldType::VectorMap(_)) {
-                    Some(field)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if vector_fields.is_empty() {
-            return Ok(());
-        }
-
-        // Load vector readers for each segment
-        let mut segment_vector_readers: Vec<Option<VectorReader>> = Vec::new();
-        for segment in &self.segments {
-            match segment.open_read(SegmentComponent::Vectors) {
-                Ok(vec_data) => {
-                    let vec_bytes = vec_data.read_bytes()?;
-                    let vec_reader = VectorReader::open(vec_bytes.as_slice())?;
-                    segment_vector_readers.push(Some(vec_reader));
-                }
-                Err(crate::directory::error::OpenReadError::FileDoesNotExist(_)) => {
-                    // Segment was created before vectors field existed - no .vec file
-                    segment_vector_readers.push(None);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        use crate::vector::format::{
-            PresenceBitsetBuilder, VectorEncoding, VECTOR_MAGIC, VECTOR_VERSION,
-        };
-
-        // Write V2 header
-        wrt.write_all(&VECTOR_MAGIC.to_le_bytes())?;
-        wrt.write_all(&[VECTOR_VERSION])?;
-        wrt.write_all(&[VectorEncoding::F32 as u8])?; // Always use F32 for merges
-
-        let num_fields = vector_fields.len() as u32;
-        wrt.write_all(&num_fields.to_le_bytes())?;
-
-        for field in &vector_fields {
-            wrt.write_all(&field.field_id().to_le_bytes())?;
-        }
-
-        wrt.write_all(&self.max_doc.to_le_bytes())?;
-
-        // Write vectors for each field in columnar format
-        for field in &vector_fields {
-            // Collect all vector IDs from all segments for this field
-            let mut all_vector_ids: BTreeSet<String> = BTreeSet::new();
-            for opt_reader in &segment_vector_readers {
-                if let Some(reader) = opt_reader {
-                    if let Some(ids) = reader.vector_ids(*field) {
-                        all_vector_ids.extend(ids.map(|s| s.to_string()));
-                    }
-                }
-            }
-
-            // Write number of vector IDs
-            wrt.write_all(&(all_vector_ids.len() as u32).to_le_bytes())?;
-
-            // Write each vector ID's data (columnar: all docs for each ID)
-            for vector_id in &all_vector_ids {
-                // Write vector ID string
-                let id_bytes = vector_id.as_bytes();
-                wrt.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
-                wrt.write_all(id_bytes)?;
-
-                // First pass: collect vectors and determine dimensions
-                let mut presence_builder = PresenceBitsetBuilder::new(self.max_doc);
-                let mut ordered_vectors: Vec<Vec<f32>> = Vec::new();
-                let mut dimensions = 0u32;
-
-                for (new_doc_id, doc_addr) in
-                    doc_id_mapping.new_doc_id_to_old_doc_addr.iter().enumerate()
-                {
-                    let segment_ord = doc_addr.segment_ord as usize;
-                    let old_doc_id = doc_addr.doc_id;
-
-                    if let Some(vec) = segment_vector_readers
-                        .get(segment_ord)
-                        .and_then(|opt_reader| opt_reader.as_ref())
-                        .and_then(|reader| reader.get(*field, vector_id, old_doc_id))
-                    {
-                        if dimensions == 0 {
-                            dimensions = vec.len() as u32;
-                        }
-                        presence_builder.set(new_doc_id as u32);
-                        ordered_vectors.push(vec.into_owned());
-                    }
-                }
-
-                // Write dimensions
-                wrt.write_all(&dimensions.to_le_bytes())?;
-
-                // Write presence bitset
-                let bitset_bytes = presence_builder.as_bytes();
-                wrt.write_all(&bitset_bytes)?;
-
-                // Write vectors contiguously
-                for vec in &ordered_vectors {
-                    for &v in vec {
-                        wrt.write_all(&v.to_le_bytes())?;
-                    }
-                }
-            }
-        }
-
-        // Terminate with footer (adds magic bytes required by tantivy's file reading)
-        wrt.terminate()?;
-        Ok(())
     }
 }
 

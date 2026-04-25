@@ -186,6 +186,7 @@ pub mod error;
 pub mod tokenizer;
 
 pub mod aggregation;
+pub mod artifact;
 pub mod collector;
 pub mod directory;
 pub mod fastfield;
@@ -201,7 +202,6 @@ pub mod schema;
 pub mod space_usage;
 pub mod store;
 pub mod termdict;
-pub mod vector;
 
 mod reader;
 

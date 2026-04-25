@@ -111,20 +111,44 @@ impl SegmentMeta {
     /// is by removing all files that have been created by tantivy
     /// and are not used by any segment anymore.
     pub fn list_files(&self) -> HashSet<PathBuf> {
+        self.list_files_with_artifacts(std::iter::empty::<&str>())
+    }
+
+    /// Returns the list of files required for the segment meta, including artifact files.
+    pub fn list_files_with_artifacts<'a>(
+        &self,
+        artifact_extensions: impl Iterator<Item = &'a str>,
+    ) -> HashSet<PathBuf> {
         if self
             .tracked
             .include_temp_doc_store
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            SegmentComponent::iterator()
+            let mut files = SegmentComponent::iterator()
                 .map(|component| self.relative_path(*component))
-                .collect::<HashSet<PathBuf>>()
+                .collect::<HashSet<PathBuf>>();
+            files.extend(
+                artifact_extensions.map(|extension| self.artifact_relative_path(extension)),
+            );
+            files
         } else {
-            SegmentComponent::iterator()
+            let mut files = SegmentComponent::iterator()
                 .filter(|comp| *comp != &SegmentComponent::TempStore)
                 .map(|component| self.relative_path(*component))
-                .collect::<HashSet<PathBuf>>()
+                .collect::<HashSet<PathBuf>>();
+            files.extend(
+                artifact_extensions.map(|extension| self.artifact_relative_path(extension)),
+            );
+            files
         }
+    }
+
+    /// Returns the relative path of an artifact file for this segment.
+    pub fn artifact_relative_path(&self, extension: &str) -> PathBuf {
+        let mut path = self.id().uuid_string();
+        path.push('.');
+        path.push_str(extension.trim_start_matches('.'));
+        PathBuf::from(path)
     }
 
     /// Returns the relative path of a component of our segment.
@@ -142,7 +166,6 @@ impl SegmentMeta {
             SegmentComponent::FastFields => ".fast".to_string(),
             SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
             SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
-            SegmentComponent::Vectors => ".vec".to_string(),
         });
         PathBuf::from(path)
     }

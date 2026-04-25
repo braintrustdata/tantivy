@@ -8,7 +8,7 @@ use crate::schema::{Field, Schema};
 use crate::{DocAddress, DocId, IndexSortByField, TantivyError};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-pub enum MappingType {
+pub(crate) enum MappingType {
     Stacked,
     StackedWithDeletes,
     Shuffled,
@@ -16,7 +16,7 @@ pub enum MappingType {
 
 /// Struct to provide mapping from new doc_id to old doc_id and segment.
 #[derive(Clone)]
-pub(crate) struct SegmentDocIdMapping {
+pub struct SegmentDocIdMapping {
     pub(crate) new_doc_id_to_old_doc_addr: Vec<DocAddress>,
     pub(crate) alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
     mapping_type: MappingType,
@@ -35,7 +35,7 @@ impl SegmentDocIdMapping {
         }
     }
 
-    pub fn mapping_type(&self) -> MappingType {
+    pub(crate) fn mapping_type(&self) -> MappingType {
         self.mapping_type
     }
 
@@ -43,7 +43,7 @@ impl SegmentDocIdMapping {
     ///
     /// In the returned `DocAddress`, the `segment_ord` is the ordinal of targeted segment
     /// in the list of merged segments.
-    pub(crate) fn iter_old_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
+    pub fn iter_old_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
         self.new_doc_id_to_old_doc_addr.iter().copied()
     }
 
@@ -71,6 +71,7 @@ pub struct DocIdMapping {
 }
 
 impl DocIdMapping {
+    /// Creates a mapping from new document ids to old document ids.
     pub fn from_new_id_to_old_id(new_doc_id_to_old: Vec<DocId>) -> Self {
         let max_doc = new_doc_id_to_old.len();
         let old_max_doc = new_doc_id_to_old
@@ -102,6 +103,7 @@ impl DocIdMapping {
         self.new_doc_id_to_old.iter().cloned()
     }
 
+    /// Returns the old-document-id to new-document-id mapping.
     pub fn old_to_new_ids(&self) -> &[DocId] {
         &self.old_doc_id_to_new[..]
     }
@@ -113,9 +115,11 @@ impl DocIdMapping {
             .map(|old_doc| els[*old_doc as usize])
             .collect()
     }
+    /// Returns the number of new document ids.
     pub fn num_new_doc_ids(&self) -> usize {
         self.new_doc_id_to_old.len()
     }
+    /// Returns the number of old document ids.
     pub fn num_old_doc_ids(&self) -> usize {
         self.old_doc_id_to_new.len()
     }

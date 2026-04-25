@@ -125,9 +125,6 @@ pub trait ValueDeserializer<'de> {
     /// Attempts to deserialize a pre-tokenized string value from the deserializer.
     fn deserialize_pre_tokenized_string(self) -> Result<PreTokenizedString, DeserializeError>;
 
-    /// Attempts to deserialize a vector map value from the deserializer.
-    fn deserialize_vector(self) -> Result<BTreeMap<String, Vec<f32>>, DeserializeError>;
-
     /// Attempts to deserialize the value using a given visitor.
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
     where V: ValueVisitor;
@@ -165,8 +162,6 @@ pub enum ValueType {
     /// A JSON object value. Deprecated.
     #[deprecated(note = "We keep this for backwards compatibility, use Object instead")]
     JSONObject,
-    /// A vector embedding value.
-    Vector,
 }
 
 /// A value visitor for deserializing a document value.
@@ -245,15 +240,6 @@ pub trait ValueVisitor {
         _val: PreTokenizedString,
     ) -> Result<Self::Value, DeserializeError> {
         Err(DeserializeError::UnsupportedType(ValueType::PreTokStr))
-    }
-
-    #[inline]
-    /// Called when the deserializer visits a vector map value.
-    fn visit_vector_map(
-        &self,
-        _val: BTreeMap<String, Vec<f32>>,
-    ) -> Result<Self::Value, DeserializeError> {
-        Err(DeserializeError::UnsupportedType(ValueType::Vector))
     }
 
     #[inline]
@@ -395,7 +381,6 @@ where R: Read
             type_codes::NULL_CODE => ValueType::Null,
             type_codes::ARRAY_CODE => ValueType::Array,
             type_codes::OBJECT_CODE => ValueType::Object,
-            type_codes::VECTOR_CODE => ValueType::Vector,
             #[allow(deprecated)]
             type_codes::JSON_OBJ_CODE => ValueType::JSONObject,
             _ => {
@@ -484,33 +469,6 @@ where R: Read
             .map_err(DeserializeError::from)
     }
 
-    fn deserialize_vector(self) -> Result<BTreeMap<String, Vec<f32>>, DeserializeError> {
-        self.validate_type(ValueType::Vector)?;
-        // Read number of entries in the map
-        let num_entries = <u64 as BinarySerializable>::deserialize(&mut *self.reader)
-            .map_err(DeserializeError::from)? as usize;
-        let mut vector_map = BTreeMap::new();
-        for _ in 0..num_entries {
-            // Read the key (string)
-            let key = <String as BinarySerializable>::deserialize(&mut *self.reader)
-                .map_err(DeserializeError::from)?;
-            // Read the vector length
-            let vec_len = <u64 as BinarySerializable>::deserialize(&mut *self.reader)
-                .map_err(DeserializeError::from)? as usize;
-            // Read the vector data
-            let mut vector = Vec::with_capacity(vec_len);
-            for _ in 0..vec_len {
-                let mut bytes = [0u8; 4];
-                self.reader
-                    .read_exact(&mut bytes)
-                    .map_err(DeserializeError::from)?;
-                vector.push(f32::from_le_bytes(bytes));
-            }
-            vector_map.insert(key, vector);
-        }
-        Ok(vector_map)
-    }
-
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeserializeError>
     where V: ValueVisitor {
         match self.value_type {
@@ -582,10 +540,6 @@ where R: Read
                 let access = BinaryObjectDeserializer::from_reader(&mut slice)?;
 
                 visitor.visit_object(access)
-            }
-            ValueType::Vector => {
-                let val = self.deserialize_vector()?;
-                visitor.visit_vector_map(val)
             }
         }
     }
