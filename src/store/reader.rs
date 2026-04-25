@@ -4,9 +4,16 @@ use std::num::NonZeroUsize;
 use std::ops::{AddAssign, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use common::{BinarySerializable, OwnedBytes};
 use lru::LruCache;
+use once_cell::sync::Lazy;
+use opentelemetry::{
+    global,
+    metrics::{Counter, Gauge, Histogram},
+    KeyValue,
+};
 
 use super::footer::DocStoreFooter;
 use super::index::SkipIndex;
@@ -22,6 +29,93 @@ use crate::DocId;
 pub(crate) const DOCSTORE_CACHE_CAPACITY: usize = 100;
 
 type Block = OwnedBytes;
+
+static STORE_READER_METRICS: Lazy<StoreReaderMetrics> = Lazy::new(StoreReaderMetrics::new);
+
+struct StoreReaderMetrics {
+    block_cache_hits: Counter<u64>,
+    block_cache_misses: Counter<u64>,
+    block_cache_entries: Gauge<u64>,
+    block_cache_lock_wait_ns: Histogram<u64>,
+    compressed_block_read_duration_ns: Histogram<u64>,
+    decompress_duration_ns: Histogram<u64>,
+    read_block_duration_ns: Histogram<u64>,
+}
+
+impl StoreReaderMetrics {
+    fn new() -> Self {
+        let meter = global::meter("brainstore");
+        Self {
+            block_cache_hits: meter
+                .u64_counter("brainstore.tantivy.store_reader.block_cache_hits")
+                .with_description("Number of doc store block cache hits")
+                .build(),
+            block_cache_misses: meter
+                .u64_counter("brainstore.tantivy.store_reader.block_cache_misses")
+                .with_description("Number of doc store block cache misses")
+                .build(),
+            block_cache_entries: meter
+                .u64_gauge("brainstore.tantivy.store_reader.block_cache_entries")
+                .with_description("Number of entries in doc store block caches")
+                .build(),
+            block_cache_lock_wait_ns: meter
+                .u64_histogram("brainstore.tantivy.store_reader.block_cache_lock_wait_ns")
+                .with_description("Time spent waiting for doc store block cache mutexes")
+                .build(),
+            compressed_block_read_duration_ns: meter
+                .u64_histogram("brainstore.tantivy.store_reader.compressed_block_read_duration_ns")
+                .with_description("Time spent reading compressed doc store blocks")
+                .build(),
+            decompress_duration_ns: meter
+                .u64_histogram("brainstore.tantivy.store_reader.decompress_duration_ns")
+                .with_description("Time spent decompressing doc store blocks")
+                .build(),
+            read_block_duration_ns: meter
+                .u64_histogram("brainstore.tantivy.store_reader.read_block_duration_ns")
+                .with_description("Time spent reading doc store blocks")
+                .build(),
+        }
+    }
+
+    fn record_lock_wait(&self, operation: &'static str, elapsed: Duration) {
+        let attributes = [KeyValue::new("operation", operation)];
+        self.block_cache_lock_wait_ns
+            .record(duration_ns(elapsed), &attributes);
+    }
+
+    fn record_cache_hit(&self, entries: usize) {
+        self.block_cache_hits.add(1, &[]);
+        self.block_cache_entries.record(entries as u64, &[]);
+    }
+
+    fn record_cache_miss(&self) {
+        self.block_cache_misses.add(1, &[]);
+    }
+
+    fn record_cache_entries(&self, entries: usize) {
+        self.block_cache_entries.record(entries as u64, &[]);
+    }
+
+    fn record_compressed_block_read_duration(&self, elapsed: Duration) {
+        self.compressed_block_read_duration_ns
+            .record(duration_ns(elapsed), &[]);
+    }
+
+    fn record_decompress_duration(&self, elapsed: Duration) {
+        self.decompress_duration_ns
+            .record(duration_ns(elapsed), &[]);
+    }
+
+    fn record_read_block_duration(&self, outcome: &'static str, elapsed: Duration) {
+        let attributes = [KeyValue::new("outcome", outcome)];
+        self.read_block_duration_ns
+            .record(duration_ns(elapsed), &attributes);
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
@@ -41,21 +135,32 @@ struct BlockCache {
 
 impl BlockCache {
     fn get_from_cache(&self, pos: usize) -> Option<Block> {
-        if let Some(block) = self
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.lock().unwrap().get(&pos).cloned())
-        {
-            self.cache_hits.fetch_add(1, Ordering::SeqCst);
-            return Some(block);
+        if let Some(cache) = self.cache.as_ref() {
+            let start = Instant::now();
+            let mut cache = cache.lock().unwrap();
+            STORE_READER_METRICS.record_lock_wait("get", start.elapsed());
+            let block = cache.get(&pos).cloned();
+            let entries = cache.len();
+            drop(cache);
+
+            if let Some(block) = block {
+                self.cache_hits.fetch_add(1, Ordering::SeqCst);
+                STORE_READER_METRICS.record_cache_hit(entries);
+                return Some(block);
+            }
         }
         self.cache_misses.fetch_add(1, Ordering::SeqCst);
+        STORE_READER_METRICS.record_cache_miss();
         None
     }
 
     fn put_into_cache(&self, pos: usize, data: Block) {
         if let Some(cache) = self.cache.as_ref() {
-            cache.lock().unwrap().put(pos, data);
+            let start = Instant::now();
+            let mut cache = cache.lock().unwrap();
+            STORE_READER_METRICS.record_lock_wait("put", start.elapsed());
+            cache.put(pos, data);
+            STORE_READER_METRICS.record_cache_entries(cache.len());
         }
     }
 
@@ -167,25 +272,33 @@ impl StoreReader {
     }
 
     fn get_compressed_block(&self, checkpoint: &Checkpoint) -> io::Result<OwnedBytes> {
-        self.data.slice(checkpoint.byte_range.clone()).read_bytes()
+        let start = Instant::now();
+        let result = self.data.slice(checkpoint.byte_range.clone()).read_bytes();
+        STORE_READER_METRICS.record_compressed_block_read_duration(start.elapsed());
+        result
     }
 
     /// Loads and decompresses a block.
     ///
     /// Advanced API. In most cases use [`get`](Self::get).
     fn read_block(&self, checkpoint: &Checkpoint) -> io::Result<Block> {
+        let read_block_start = Instant::now();
         let cache_key = checkpoint.byte_range.start;
         if let Some(block) = self.cache.get_from_cache(cache_key) {
+            STORE_READER_METRICS.record_read_block_duration("hit", read_block_start.elapsed());
             return Ok(block);
         }
 
         let compressed_block = self.get_compressed_block(checkpoint)?;
+        let decompress_start = Instant::now();
         let decompressed_block =
             OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        STORE_READER_METRICS.record_decompress_duration(decompress_start.elapsed());
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
 
+        STORE_READER_METRICS.record_read_block_duration("miss", read_block_start.elapsed());
         Ok(decompressed_block)
     }
 
@@ -342,23 +455,30 @@ impl StoreReader {
     ///
     /// Loads and decompresses a block asynchronously.
     async fn read_block_async(&self, checkpoint: &Checkpoint) -> io::Result<Block> {
+        let read_block_start = Instant::now();
         let cache_key = checkpoint.byte_range.start;
         if let Some(block) = self.cache.get_from_cache(checkpoint.byte_range.start) {
+            STORE_READER_METRICS.record_read_block_duration("hit", read_block_start.elapsed());
             return Ok(block);
         }
 
+        let compressed_read_start = Instant::now();
         let compressed_block = self
             .data
             .slice(checkpoint.byte_range.clone())
             .read_bytes_async()
             .await?;
+        STORE_READER_METRICS.record_compressed_block_read_duration(compressed_read_start.elapsed());
 
+        let decompress_start = Instant::now();
         let decompressed_block =
             OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        STORE_READER_METRICS.record_decompress_duration(decompress_start.elapsed());
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
 
+        STORE_READER_METRICS.record_read_block_duration("miss", read_block_start.elapsed());
         Ok(decompressed_block)
     }
 
