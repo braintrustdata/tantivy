@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use super::artifact_options::ArtifactOptions;
 use super::ip_options::IpAddrOptions;
 use crate::schema::bytes_options::BytesOptions;
-use crate::schema::vector_options::VectorMapOptions;
 use crate::schema::{
     is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
     TextOptions,
@@ -82,9 +82,9 @@ impl FieldEntry {
         Self::new(field_name, FieldType::JsonObject(json_object_options))
     }
 
-    /// Creates a field entry for a vector map field
-    pub fn new_vector_map(field_name: String, vector_map_options: VectorMapOptions) -> FieldEntry {
-        Self::new(field_name, FieldType::VectorMap(vector_map_options))
+    /// Creates a field entry for an artifact field.
+    pub fn new_artifact(field_name: String, artifact_options: ArtifactOptions) -> FieldEntry {
+        Self::new(field_name, FieldType::Artifact(artifact_options))
     }
 
     /// Returns the name of the field
@@ -136,13 +136,13 @@ impl FieldEntry {
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
-            FieldType::VectorMap(_) => false, // VectorMaps are stored in .vec file, not doc store
+            FieldType::Artifact(_) => false,
         }
     }
 
-    /// Returns true if this field is a vector map field
-    pub fn is_vector_map(&self) -> bool {
-        self.field_type.is_vector_map()
+    /// Returns true if the field is an artifact field.
+    pub fn is_artifact(&self) -> bool {
+        self.field_type.is_artifact()
     }
 }
 

@@ -33,8 +33,11 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn add_document(&mut self, document: D) -> crate::Result<()> {
         let opstamp = self.opstamp;
         self.opstamp += 1;
-        self.segment_writer
-            .add_document(AddOperation { opstamp, document })
+        self.segment_writer.add_document(AddOperation {
+            opstamp,
+            document,
+            artifacts: Vec::new(),
+        })
     }
 
     pub fn finalize(self) -> crate::Result<Index> {

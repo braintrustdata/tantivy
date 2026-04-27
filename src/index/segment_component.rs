@@ -27,14 +27,12 @@ pub enum SegmentComponent {
     /// Bitset describing which document of the segment is alive.
     /// (It was representing deleted docs but changed to represent alive docs from v0.17)
     Delete,
-    /// Vector embeddings stored as JSON lines (one vector per doc_id line).
-    Vectors,
 }
 
 impl SegmentComponent {
     /// Iterates through the components.
     pub fn iterator() -> slice::Iter<'static, SegmentComponent> {
-        static SEGMENT_COMPONENTS: [SegmentComponent; 9] = [
+        static SEGMENT_COMPONENTS: [SegmentComponent; 8] = [
             SegmentComponent::Postings,
             SegmentComponent::Positions,
             SegmentComponent::FastFields,
@@ -43,7 +41,6 @@ impl SegmentComponent {
             SegmentComponent::Store,
             SegmentComponent::TempStore,
             SegmentComponent::Delete,
-            SegmentComponent::Vectors,
         ];
         SEGMENT_COMPONENTS.iter()
     }

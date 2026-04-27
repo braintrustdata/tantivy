@@ -75,6 +75,11 @@ impl Segment {
         self.meta.relative_path(component)
     }
 
+    /// Returns the relative path of an artifact file for this segment.
+    pub fn artifact_relative_path(&self, extension: &str) -> PathBuf {
+        self.meta.artifact_relative_path(extension)
+    }
+
     /// Open one of the component file for a *regular* read.
     pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
         let path = self.relative_path(component);
@@ -86,5 +91,17 @@ impl Segment {
         let path = self.relative_path(component);
         let write = self.index.directory_mut().open_write(&path)?;
         Ok(write)
+    }
+
+    /// Opens an artifact file for reading.
+    pub fn open_artifact_read(&self, extension: &str) -> Result<FileSlice, OpenReadError> {
+        let path = self.artifact_relative_path(extension);
+        self.index.directory().open_read(&path)
+    }
+
+    /// Opens an artifact file for writing.
+    pub fn open_artifact_write(&mut self, extension: &str) -> Result<WritePtr, OpenWriteError> {
+        let path = self.artifact_relative_path(extension);
+        self.index.directory_mut().open_write(&path)
     }
 }

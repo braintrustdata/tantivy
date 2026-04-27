@@ -463,7 +463,7 @@ impl SegmentUpdater {
             .index
             .list_all_segment_metas()
             .into_iter()
-            .flat_map(|segment_meta| segment_meta.list_files())
+            .flat_map(|segment_meta| self.index.list_segment_files(&segment_meta))
             .collect();
         files.insert(META_FILEPATH.to_path_buf());
         files
