@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::term_scorer::TermScorer;
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fieldnorm::FieldNormReader;
@@ -63,9 +65,38 @@ impl Weight for TermWeight {
         reader: &SegmentReader,
         callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
+        let field = self.term.field();
+        let span = tracing::info_span!(
+            "tantivy_term_weight_for_each_no_score",
+            field_id = field.field_id(),
+            term_type = ?self.term.typ(),
+            term_value_bytes = self.term.serialized_value_bytes().len(),
+            max_doc = reader.max_doc(),
+            scoring_enabled = self.scoring_enabled,
+            index_record_option = ?self.index_record_option,
+            scorer_build_ns = tracing::field::Empty,
+            iterate_ns = tracing::field::Empty,
+            blocks_seen = tracing::field::Empty,
+            docs_seen = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
+        let scorer_start = Instant::now();
         let mut scorer = self.specialized_scorer(reader, 1.0)?;
+        span.record("scorer_build_ns", scorer_start.elapsed().as_nanos() as u64);
+
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        for_each_docset_buffered(&mut scorer, &mut buffer, callback);
+        let mut blocks_seen = 0u64;
+        let mut docs_seen = 0u64;
+        let iterate_start = Instant::now();
+        for_each_docset_buffered(&mut scorer, &mut buffer, &mut |docs: &[DocId]| {
+            blocks_seen += 1;
+            docs_seen += docs.len() as u64;
+            callback(docs);
+        });
+        span.record("iterate_ns", iterate_start.elapsed().as_nanos() as u64);
+        span.record("blocks_seen", blocks_seen);
+        span.record("docs_seen", docs_seen);
         Ok(())
     }
 
@@ -116,7 +147,34 @@ impl TermWeight {
         boost: Score,
     ) -> crate::Result<TermScorer> {
         let field = self.term.field();
+        let span = tracing::info_span!(
+            "tantivy_term_weight_scorer",
+            field_id = field.field_id(),
+            term_type = ?self.term.typ(),
+            term_value_bytes = self.term.serialized_value_bytes().len(),
+            max_doc = reader.max_doc(),
+            scoring_enabled = self.scoring_enabled,
+            index_record_option = ?self.index_record_option,
+            found = tracing::field::Empty,
+            doc_freq = tracing::field::Empty,
+            postings_bytes = tracing::field::Empty,
+            positions_bytes = tracing::field::Empty,
+            inverted_index_open_ns = tracing::field::Empty,
+            fieldnorm_open_ns = tracing::field::Empty,
+            term_info_ns = tracing::field::Empty,
+            postings_read_ns = tracing::field::Empty,
+            scorer_build_ns = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
+        let inverted_index_start = Instant::now();
         let inverted_index = reader.inverted_index(field)?;
+        span.record(
+            "inverted_index_open_ns",
+            inverted_index_start.elapsed().as_nanos() as u64,
+        );
+
+        let fieldnorm_start = Instant::now();
         let fieldnorm_reader_opt = if self.scoring_enabled {
             reader.fieldnorms_readers().get_field(field)?
         } else {
@@ -124,21 +182,51 @@ impl TermWeight {
         };
         let fieldnorm_reader =
             fieldnorm_reader_opt.unwrap_or_else(|| FieldNormReader::constant(reader.max_doc(), 1));
+        span.record(
+            "fieldnorm_open_ns",
+            fieldnorm_start.elapsed().as_nanos() as u64,
+        );
+
         let similarity_weight = self.similarity_weight.boost_by(boost);
-        let postings_opt: Option<SegmentPostings> =
-            inverted_index.read_postings(&self.term, self.index_record_option)?;
-        if let Some(segment_postings) = postings_opt {
-            Ok(TermScorer::new(
-                segment_postings,
-                fieldnorm_reader,
-                similarity_weight,
-            ))
+
+        let term_info_start = Instant::now();
+        let term_info_opt = inverted_index.get_term_info(&self.term)?;
+        span.record("term_info_ns", term_info_start.elapsed().as_nanos() as u64);
+
+        if let Some(term_info) = term_info_opt {
+            span.record("found", true);
+            span.record("doc_freq", term_info.doc_freq);
+            span.record("postings_bytes", term_info.postings_range.len() as u64);
+            span.record("positions_bytes", term_info.positions_range.len() as u64);
+
+            let postings_start = Instant::now();
+            let segment_postings =
+                inverted_index.read_postings_from_terminfo(&term_info, self.index_record_option)?;
+            span.record(
+                "postings_read_ns",
+                postings_start.elapsed().as_nanos() as u64,
+            );
+
+            let scorer_build_start = Instant::now();
+            let scorer = TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight);
+            span.record(
+                "scorer_build_ns",
+                scorer_build_start.elapsed().as_nanos() as u64,
+            );
+            Ok(scorer)
         } else {
-            Ok(TermScorer::new(
+            span.record("found", false);
+            let scorer_build_start = Instant::now();
+            let scorer = TermScorer::new(
                 SegmentPostings::empty(),
                 fieldnorm_reader,
                 similarity_weight,
-            ))
+            );
+            span.record(
+                "scorer_build_ns",
+                scorer_build_start.elapsed().as_nanos() as u64,
+            );
+            Ok(scorer)
         }
     }
 }
