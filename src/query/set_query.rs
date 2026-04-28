@@ -34,9 +34,28 @@ impl TermSetQuery {
         &self,
         schema: &Schema,
     ) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
+        let total_terms = self
+            .terms_map
+            .values()
+            .map(|terms| terms.len() as u64)
+            .sum::<u64>();
+        let span = tracing::info_span!(
+            "tantivy_term_set_query_weight",
+            num_fields = self.terms_map.len(),
+            total_terms,
+        );
+        let _guard = span.enter();
+
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
 
         for (&field, sorted_terms) in self.terms_map.iter() {
+            let field_span = tracing::info_span!(
+                "tantivy_term_set_query_field_weight",
+                field_id = field.field_id(),
+                num_terms = sorted_terms.len(),
+            );
+            let _field_guard = field_span.enter();
+
             let field_entry = schema.get_field_entry(field);
             let field_type = field_entry.field_type();
             if !field_type.is_indexed() {
