@@ -5,7 +5,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use tantivy_fst::automaton::AlwaysMatch;
 use tantivy_fst::Automaton;
 
@@ -187,22 +187,41 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
-        let sstable_index_bytes = index_slice.read_bytes()?;
 
         let sstable_index = match version {
-            2 => SSTableIndex::V2(
-                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?,
-            ),
+            2 => {
+                let sstable_index_bytes = index_slice.read_bytes()?;
+                SSTableIndex::V2(
+                    crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(
+                        |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                    )?,
+                )
+            }
             3 => {
-                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
+                let index_slice_len = index_slice.len();
+                if index_slice_len < 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SSTable corruption",
+                    ));
+                }
+                let mut footerv3_len_bytes = index_slice.slice_from_end(8).read_bytes()?;
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
+                    let index_body_len = index_slice_len - 8;
+                    let store_offset = store_offset as usize;
+                    if store_offset > index_body_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SSTable corruption",
+                        ));
+                    }
+                    let fst_slice = index_slice.slice_to(store_offset).read_bytes()?;
+                    let block_addr_store_slice = index_slice.slice(store_offset..index_body_len);
                     SSTableIndex::V3(
-                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                        })?,
+                        SSTableIndexV3::load_lazy(fst_slice, block_addr_store_slice).map_err(
+                            |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                        )?,
                     )
                 } else {
                     // if store_offset is zero, there is no index, so we build a pseudo-index
@@ -416,7 +435,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
 
-    use common::OwnedBytes;
+    use common::{HasLen, OwnedBytes};
 
     use super::Dictionary;
     use crate::MonotonicU64SSTable;
@@ -425,6 +444,7 @@ mod tests {
     struct PermissionedHandle {
         bytes: OwnedBytes,
         allowed_range: Mutex<Range<usize>>,
+        always_allowed_range: Mutex<Option<Range<usize>>>,
     }
 
     impl PermissionedHandle {
@@ -432,12 +452,17 @@ mod tests {
             let bytes = OwnedBytes::new(bytes);
             PermissionedHandle {
                 allowed_range: Mutex::new(0..bytes.len()),
+                always_allowed_range: Mutex::new(None),
                 bytes,
             }
         }
 
         fn restrict(&self, range: Range<usize>) {
             *self.allowed_range.lock().unwrap() = range;
+        }
+
+        fn allow_index_from(&self, offset: usize) {
+            *self.always_allowed_range.lock().unwrap() = Some(offset..self.bytes.len());
         }
     }
 
@@ -450,7 +475,16 @@ mod tests {
     impl common::file_slice::FileHandle for PermissionedHandle {
         fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
             let allowed_range = self.allowed_range.lock().unwrap();
-            if !allowed_range.contains(&range.start) || !allowed_range.contains(&(range.end - 1)) {
+            let always_allowed_range = self.always_allowed_range.lock().unwrap();
+            let allowed = allowed_range.contains(&range.start)
+                && allowed_range.contains(&(range.end - 1));
+            let always_allowed = always_allowed_range
+                .as_ref()
+                .is_some_and(|always_allowed_range| {
+                    always_allowed_range.contains(&range.start)
+                        && always_allowed_range.contains(&(range.end - 1))
+                });
+            if !allowed && !always_allowed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("invalid range, allowed {allowed_range:?}, requested {range:?}"),
@@ -475,6 +509,7 @@ mod tests {
         let slice = common::file_slice::FileSlice::new(table.clone());
 
         let dictionary = Dictionary::<MonotonicU64SSTable>::open(slice).unwrap();
+        table.allow_index_from(dictionary.sstable_slice.len());
 
         // if the last block is id 0, tests are meaningless
         assert_ne!(dictionary.sstable_index.locate_with_ord(u64::MAX), 0);
