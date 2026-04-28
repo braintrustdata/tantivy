@@ -69,6 +69,8 @@ fn posting_writer_from_field_entry(field_entry: &FieldEntry) -> Box<dyn Postings
                 JsonPostingsWriter::<DocIdRecorder>::default().into()
             }
         }
-        FieldType::Artifact(_) => Box::<SpecializedPostingsWriter<DocIdRecorder>>::default(),
+        FieldType::Artifact(_) | FieldType::VectorMap(_) => {
+            Box::<SpecializedPostingsWriter<DocIdRecorder>>::default()
+        }
     }
 }

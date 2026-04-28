@@ -184,8 +184,11 @@ pub enum FieldType {
     /// IpAddr field
     IpAddr(IpAddrOptions),
     /// External per-segment artifact field.
-    #[serde(rename = "artifact", alias = "vector_map")]
+    #[serde(rename = "artifact")]
     Artifact(ArtifactOptions),
+    /// Vector map field backed by external per-segment artifacts.
+    #[serde(rename = "vector_map")]
+    VectorMap(ArtifactOptions),
 }
 
 impl FieldType {
@@ -202,7 +205,7 @@ impl FieldType {
             FieldType::Bytes(_) => Type::Bytes,
             FieldType::JsonObject(_) => Type::Json,
             FieldType::IpAddr(_) => Type::IpAddr,
-            FieldType::Artifact(_) => Type::Artifact,
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => Type::Artifact,
         }
     }
 
@@ -229,7 +232,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.is_indexed(),
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_indexed(),
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_indexed(),
-            FieldType::Artifact(_) => false,
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => false,
         }
     }
 
@@ -267,7 +270,7 @@ impl FieldType {
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.is_fast(),
             FieldType::Facet(_) => true,
             FieldType::JsonObject(ref json_object_options) => json_object_options.is_fast(),
-            FieldType::Artifact(_) => false,
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => false,
         }
     }
 
@@ -287,7 +290,7 @@ impl FieldType {
             FieldType::Bytes(ref bytes_options) => bytes_options.fieldnorms(),
             FieldType::JsonObject(ref _json_object_options) => false,
             FieldType::IpAddr(ref ip_addr_options) => ip_addr_options.fieldnorms(),
-            FieldType::Artifact(_) => false,
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => false,
         }
     }
 
@@ -339,13 +342,13 @@ impl FieldType {
                     None
                 }
             }
-            FieldType::Artifact(_) => None,
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => None,
         }
     }
 
     /// Returns true if this field type is an artifact field.
     pub fn is_artifact(&self) -> bool {
-        matches!(self, FieldType::Artifact(_))
+        matches!(self, FieldType::Artifact(_) | FieldType::VectorMap(_))
     }
 
     /// Parses a field value from json, given the target FieldType.
@@ -446,10 +449,12 @@ impl FieldType {
 
                         Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                     }
-                    FieldType::Artifact(_) => Err(ValueParsingError::TypeError {
-                        expected: "an external artifact",
-                        json: JsonValue::String(field_text),
-                    }),
+                    FieldType::Artifact(_) | FieldType::VectorMap(_) => {
+                        Err(ValueParsingError::TypeError {
+                            expected: "an external artifact",
+                            json: JsonValue::String(field_text),
+                        })
+                    }
                 }
             }
             JsonValue::Number(field_val_num) => match self {
@@ -509,10 +514,12 @@ impl FieldType {
                     expected: "a string with an ip addr",
                     json: JsonValue::Number(field_val_num),
                 }),
-                FieldType::Artifact(_) => Err(ValueParsingError::TypeError {
-                    expected: "an external artifact",
-                    json: JsonValue::Number(field_val_num),
-                }),
+                FieldType::Artifact(_) | FieldType::VectorMap(_) => {
+                    Err(ValueParsingError::TypeError {
+                        expected: "an external artifact",
+                        json: JsonValue::Number(field_val_num),
+                    })
+                }
             },
             JsonValue::Object(json_map) => match self {
                 FieldType::Str(_) => {
@@ -528,10 +535,12 @@ impl FieldType {
                     }
                 }
                 FieldType::JsonObject(_) => Ok(OwnedValue::from(json_map)),
-                FieldType::Artifact(_) => Err(ValueParsingError::TypeError {
-                    expected: "an external artifact",
-                    json: JsonValue::Object(json_map),
-                }),
+                FieldType::Artifact(_) | FieldType::VectorMap(_) => {
+                    Err(ValueParsingError::TypeError {
+                        expected: "an external artifact",
+                        json: JsonValue::Object(json_map),
+                    })
+                }
                 _ => Err(ValueParsingError::TypeError {
                     expected: self.value_type().name(),
                     json: JsonValue::Object(json_map),

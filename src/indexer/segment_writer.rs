@@ -396,7 +396,7 @@ impl SegmentWriter {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
-                FieldType::Artifact(_) => {}
+                FieldType::Artifact(_) | FieldType::VectorMap(_) => {}
             }
         }
         Ok(())
