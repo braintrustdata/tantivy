@@ -223,15 +223,44 @@ impl Searcher {
         executor: &Executor,
         enabled_scoring: EnableScoring,
     ) -> crate::Result<C::Fruit> {
-        let weight = query.weight(enabled_scoring)?;
         let segment_readers = self.segment_readers();
-        let fruits = executor.map(
-            |(segment_ord, segment_reader)| {
-                collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
-            },
-            segment_readers.iter().enumerate(),
-        )?;
-        collector.merge_fruits(fruits)
+        let total_max_doc = segment_readers
+            .iter()
+            .map(|segment_reader| u64::from(segment_reader.max_doc()))
+            .sum::<u64>();
+        let total_num_docs = segment_readers
+            .iter()
+            .map(|segment_reader| u64::from(segment_reader.num_docs()))
+            .sum::<u64>();
+        let search_span = tracing::info_span!(
+            "tantivy_search_with_executor",
+            collector_type = std::any::type_name::<C>(),
+            num_segments = segment_readers.len(),
+            total_max_doc,
+            total_num_docs,
+            deleted_docs = total_max_doc.saturating_sub(total_num_docs),
+            requires_scoring = collector.requires_scoring(),
+            num_segment_fruits = tracing::field::Empty,
+        );
+        let _search_guard = search_span.enter();
+
+        let weight = tracing::info_span!("tantivy_query_weight")
+            .in_scope(|| query.weight(enabled_scoring))?;
+        let fruits = tracing::info_span!(
+            "tantivy_collect_segments",
+            num_segments = segment_readers.len()
+        )
+        .in_scope(|| {
+            executor.map(
+                |(segment_ord, segment_reader)| {
+                    collector.collect_segment(weight.as_ref(), segment_ord as u32, segment_reader)
+                },
+                segment_readers.iter().enumerate(),
+            )
+        })?;
+        tracing::Span::current().record("num_segment_fruits", fruits.len());
+        tracing::info_span!("tantivy_merge_fruits", num_segment_fruits = fruits.len())
+            .in_scope(|| collector.merge_fruits(fruits))
     }
 
     /// Summarize total space usage of this searcher.

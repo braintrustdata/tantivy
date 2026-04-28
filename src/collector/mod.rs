@@ -170,38 +170,99 @@ pub trait Collector: Sync + Send {
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
-        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        let max_doc = reader.max_doc();
+        let num_docs = reader.num_docs();
+        let requires_scoring = self.requires_scoring();
+        let segment_span = tracing::info_span!(
+            "tantivy_collect_segment",
+            segment_ord,
+            segment_id = %reader.segment_id(),
+            max_doc,
+            num_docs,
+            deleted_docs = max_doc.saturating_sub(num_docs),
+            has_alive_bitset = reader.alive_bitset().is_some(),
+            requires_scoring,
+            docs_seen = tracing::field::Empty,
+            docs_collected = tracing::field::Empty,
+            docs_rejected_by_alive_bitset = tracing::field::Empty,
+            blocks_seen = tracing::field::Empty,
+        );
+        let _segment_guard = segment_span.enter();
 
-        match (reader.alive_bitset(), self.requires_scoring()) {
+        let mut segment_collector = tracing::info_span!("tantivy_collector_for_segment")
+            .in_scope(|| self.for_segment(segment_ord, reader))?;
+
+        let mut docs_seen = 0u64;
+        let mut docs_collected = 0u64;
+        let mut docs_rejected_by_alive_bitset = 0u64;
+        let mut blocks_seen = 0u64;
+
+        match (reader.alive_bitset(), requires_scoring) {
             (Some(alive_bitset), true) => {
-                weight.for_each(reader, &mut |doc, score| {
-                    if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, score);
-                    }
+                tracing::info_span!("tantivy_weight_for_each_scored_alive").in_scope(|| {
+                    weight.for_each(reader, &mut |doc, score| {
+                        docs_seen += 1;
+                        if alive_bitset.is_alive(doc) {
+                            docs_collected += 1;
+                            segment_collector.collect(doc, score);
+                        } else {
+                            docs_rejected_by_alive_bitset += 1;
+                        }
+                    })
                 })?;
             }
             (Some(alive_bitset), false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    for doc in docs.iter().cloned() {
-                        if alive_bitset.is_alive(doc) {
-                            segment_collector.collect(doc, 0.0);
+                tracing::info_span!("tantivy_weight_for_each_no_score_alive").in_scope(|| {
+                    weight.for_each_no_score(reader, &mut |docs| {
+                        blocks_seen += 1;
+                        docs_seen += docs.len() as u64;
+                        for doc in docs.iter().cloned() {
+                            if alive_bitset.is_alive(doc) {
+                                docs_collected += 1;
+                                segment_collector.collect(doc, 0.0);
+                            } else {
+                                docs_rejected_by_alive_bitset += 1;
+                            }
                         }
-                    }
+                    })
                 })?;
             }
             (None, true) => {
-                weight.for_each(reader, &mut |doc, score| {
-                    segment_collector.collect(doc, score);
+                tracing::info_span!("tantivy_weight_for_each_scored").in_scope(|| {
+                    weight.for_each(reader, &mut |doc, score| {
+                        docs_seen += 1;
+                        docs_collected += 1;
+                        segment_collector.collect(doc, score);
+                    })
                 })?;
             }
             (None, false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    segment_collector.collect_block(docs);
+                tracing::info_span!("tantivy_weight_for_each_no_score").in_scope(|| {
+                    weight.for_each_no_score(reader, &mut |docs| {
+                        blocks_seen += 1;
+                        docs_seen += docs.len() as u64;
+                        docs_collected += docs.len() as u64;
+                        segment_collector.collect_block(docs);
+                    })
                 })?;
             }
         }
 
-        Ok(segment_collector.harvest())
+        tracing::Span::current().record("docs_seen", docs_seen);
+        tracing::Span::current().record("docs_collected", docs_collected);
+        tracing::Span::current().record(
+            "docs_rejected_by_alive_bitset",
+            docs_rejected_by_alive_bitset,
+        );
+        tracing::Span::current().record("blocks_seen", blocks_seen);
+
+        tracing::info_span!(
+            "tantivy_segment_collector_harvest",
+            docs_seen,
+            docs_collected,
+            blocks_seen,
+        )
+        .in_scope(|| Ok(segment_collector.harvest()))
     }
 }
 
