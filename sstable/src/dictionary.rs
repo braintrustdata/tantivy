@@ -256,9 +256,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                         (index_body_len - store_offset) as u64,
                     );
                     span.record("lazy_block_addr_store", true);
-                    let fst_read_start = Instant::now();
-                    let fst_slice = index_slice.slice_to(store_offset).read_bytes()?;
-                    span.record("fst_read_ns", fst_read_start.elapsed().as_nanos() as u64);
+                    span.record("fst_read_ns", 0u64);
+                    let fst_slice = index_slice.slice_to(store_offset);
                     let block_addr_store_slice = index_slice.slice(store_offset..index_body_len);
                     let index_load_start = Instant::now();
                     let sstable_index = SSTableIndex::V3(
@@ -367,7 +366,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     pub fn term_ord<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermOrdinal>> {
         let key_bytes = key.as_ref();
 
-        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes) else {
+        let Some(block_addr) = self.sstable_index.get_block_with_key_result(key_bytes)? else {
             return Ok(None);
         };
 
@@ -421,7 +420,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
-        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
+        if let Some(block_addr) = self.sstable_index.get_block_with_key_result(key.as_ref())? {
             let sstable_reader = self.sstable_delta_reader_block(block_addr)?;
             return self.do_get(key, sstable_reader);
         }
@@ -430,7 +429,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
-        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
+        if let Some(block_addr) = self.sstable_index.get_block_with_key_result(key.as_ref())? {
             let sstable_reader = self.sstable_delta_reader_block_async(block_addr).await?;
             return self.do_get(key, sstable_reader);
         }

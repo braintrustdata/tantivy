@@ -8,6 +8,7 @@ use tantivy_bitpacker::{compute_num_bits, BitPacker};
 use tantivy_fst::raw::Fst;
 use tantivy_fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
+use crate::lazy_fst::LazyFstIndex;
 use crate::{common_prefix_len, SSTableDataCorruption, TermOrdinal};
 
 #[derive(Debug, Clone)]
@@ -31,10 +32,14 @@ impl SSTableIndex {
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
     pub(crate) fn locate_with_key(&self, key: &[u8]) -> Option<u64> {
+        self.locate_with_key_result(key).ok().flatten()
+    }
+
+    pub(crate) fn locate_with_key_result(&self, key: &[u8]) -> io::Result<Option<u64>> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.locate_with_key(key).map(|i| i as u64),
-            SSTableIndex::V3(v3_index) => v3_index.locate_with_key(key),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.locate_with_key(key),
+            SSTableIndex::V2(v2_index) => Ok(v2_index.locate_with_key(key).map(|i| i as u64)),
+            SSTableIndex::V3(v3_index) => v3_index.locate_with_key_result(key),
+            SSTableIndex::V3Empty(v3_empty) => Ok(v3_empty.locate_with_key(key)),
         }
     }
 
@@ -42,10 +47,14 @@ impl SSTableIndex {
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
     pub fn get_block_with_key(&self, key: &[u8]) -> Option<BlockAddr> {
+        self.get_block_with_key_result(key).ok().flatten()
+    }
+
+    pub(crate) fn get_block_with_key_result(&self, key: &[u8]) -> io::Result<Option<BlockAddr>> {
         match self {
-            SSTableIndex::V2(v2_index) => v2_index.get_block_with_key(key),
-            SSTableIndex::V3(v3_index) => v3_index.get_block_with_key(key),
-            SSTableIndex::V3Empty(v3_empty) => v3_empty.get_block_with_key(key),
+            SSTableIndex::V2(v2_index) => Ok(v2_index.get_block_with_key(key)),
+            SSTableIndex::V3(v3_index) => v3_index.get_block_with_key_result(key),
+            SSTableIndex::V3Empty(v3_empty) => Ok(v3_empty.get_block_with_key(key)),
         }
     }
 
@@ -69,8 +78,28 @@ impl SSTableIndex {
 
 #[derive(Debug, Clone)]
 pub struct SSTableIndexV3 {
-    fst_index: Arc<Map<OwnedBytes>>,
+    fst_index: FstIndex,
     block_addr_store: BlockAddrStore,
+}
+
+#[derive(Debug, Clone)]
+enum FstIndex {
+    Eager(Arc<Map<OwnedBytes>>),
+    Lazy(LazyFstIndex),
+}
+
+impl FstIndex {
+    fn lower_bound(&self, key: &[u8]) -> io::Result<Option<u64>> {
+        match self {
+            FstIndex::Eager(fst_index) => Ok(fst_index
+                .range()
+                .ge(key)
+                .into_stream()
+                .next()
+                .map(|(_key, id)| id)),
+            FstIndex::Lazy(fst_index) => fst_index.lower_bound(key),
+        }
+    }
 }
 
 impl SSTableIndexV3 {
@@ -82,19 +111,19 @@ impl SSTableIndexV3 {
         let (fst_slice, block_addr_store_slice) = data.split(fst_length as usize);
         let block_addr_store =
             BlockAddrStore::open(block_addr_store_slice).map_err(|_| SSTableDataCorruption)?;
-        Self::load_from_parts(fst_slice, block_addr_store)
+        Self::load_eager_from_parts(fst_slice, block_addr_store)
     }
 
     pub fn load_lazy(
-        fst_slice: OwnedBytes,
+        fst_slice: FileSlice,
         block_addr_store_slice: FileSlice,
     ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
         let block_addr_store =
             BlockAddrStore::open_lazy(block_addr_store_slice).map_err(|_| SSTableDataCorruption)?;
-        Self::load_from_parts(fst_slice, block_addr_store)
+        Self::load_lazy_from_parts(fst_slice, block_addr_store)
     }
 
-    fn load_from_parts(
+    fn load_eager_from_parts(
         fst_slice: OwnedBytes,
         block_addr_store: BlockAddrStore,
     ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
@@ -113,7 +142,29 @@ impl SSTableIndexV3 {
         span.record("fst_load_ns", fst_load_start.elapsed().as_nanos() as u64);
 
         Ok(SSTableIndexV3 {
-            fst_index: Arc::new(fst_index),
+            fst_index: FstIndex::Eager(Arc::new(fst_index)),
+            block_addr_store,
+        })
+    }
+
+    fn load_lazy_from_parts(
+        fst_slice: FileSlice,
+        block_addr_store: BlockAddrStore,
+    ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
+        let span = tracing::info_span!(
+            "tantivy_sstable_v3_index_load",
+            fst_bytes = fst_slice.len() as u64,
+            lazy_block_addr_store = block_addr_store.is_lazy(),
+            block_addr_store_bytes = block_addr_store.byte_len() as u64,
+            fst_load_ns = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let fst_load_start = Instant::now();
+        let fst_index = LazyFstIndex::open(fst_slice).map_err(|_| SSTableDataCorruption)?;
+        span.record("fst_load_ns", fst_load_start.elapsed().as_nanos() as u64);
+
+        Ok(SSTableIndexV3 {
+            fst_index: FstIndex::Lazy(fst_index),
             block_addr_store,
         })
     }
@@ -126,20 +177,21 @@ impl SSTableIndexV3 {
     /// Get the block id of the block that would contain `key`.
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
-    pub(crate) fn locate_with_key(&self, key: &[u8]) -> Option<u64> {
-        self.fst_index
-            .range()
-            .ge(key)
-            .into_stream()
-            .next()
-            .map(|(_key, id)| id)
+    pub(crate) fn locate_with_key_result(&self, key: &[u8]) -> io::Result<Option<u64>> {
+        self.fst_index.lower_bound(key)
     }
 
     /// Get the [`BlockAddr`] of the block that would contain `key`.
     ///
     /// Returns None if `key` is lexicographically after the last key recorded.
     pub fn get_block_with_key(&self, key: &[u8]) -> Option<BlockAddr> {
-        self.locate_with_key(key).and_then(|id| self.get_block(id))
+        self.get_block_with_key_result(key).ok().flatten()
+    }
+
+    pub(crate) fn get_block_with_key_result(&self, key: &[u8]) -> io::Result<Option<BlockAddr>> {
+        Ok(self
+            .locate_with_key_result(key)?
+            .and_then(|id| self.get_block(id)))
     }
 
     pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> u64 {
@@ -882,11 +934,38 @@ mod tests {
             })
         );
 
-        assert_eq!(sstable_index.locate_with_key(b"aa").unwrap(), 0);
-        assert_eq!(sstable_index.locate_with_key(b"aaa").unwrap(), 0);
-        assert_eq!(sstable_index.locate_with_key(b"aab").unwrap(), 1);
-        assert_eq!(sstable_index.locate_with_key(b"ccc").unwrap(), 2);
-        assert!(sstable_index.locate_with_key(b"e").is_none());
+        assert_eq!(
+            sstable_index
+                .locate_with_key_result(b"aa")
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sstable_index
+                .locate_with_key_result(b"aaa")
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sstable_index
+                .locate_with_key_result(b"aab")
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sstable_index
+                .locate_with_key_result(b"ccc")
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        assert!(sstable_index
+            .locate_with_key_result(b"e")
+            .unwrap()
+            .is_none());
 
         assert_eq!(sstable_index.locate_with_ord(0), 0);
         assert_eq!(sstable_index.locate_with_ord(1), 0);
@@ -907,9 +986,11 @@ mod tests {
         let buffer = OwnedBytes::new(buffer);
         let eager_index = SSTableIndexV3::load(buffer.clone(), fst_len).unwrap();
         let (fst_slice, block_addr_store_bytes) = buffer.split(fst_len as usize);
-        let lazy_index =
-            SSTableIndexV3::load_lazy(fst_slice, FileSlice::new(Arc::new(block_addr_store_bytes)))
-                .unwrap();
+        let lazy_index = SSTableIndexV3::load_lazy(
+            FileSlice::new(Arc::new(fst_slice)),
+            FileSlice::new(Arc::new(block_addr_store_bytes)),
+        )
+        .unwrap();
 
         for block_id in [0u64, 1, 127, 128, 255, 299] {
             assert_eq!(
@@ -921,6 +1002,75 @@ mod tests {
             assert_eq!(
                 lazy_index.locate_with_ord(ord),
                 eager_index.locate_with_ord(ord)
+            );
+        }
+        for key in [
+            b"0000".as_slice(),
+            b"0001",
+            b"0127",
+            b"0128",
+            b"0255",
+            b"0299",
+            b"0300",
+        ] {
+            assert_eq!(
+                lazy_index.locate_with_key_result(key).unwrap(),
+                eager_index.locate_with_key_result(key).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sstable_index_lazy_fst_locate_matches_eager() {
+        let mut keys = vec![
+            vec![0],
+            b"a".to_vec(),
+            b"aa".to_vec(),
+            b"ab".to_vec(),
+            b"abc".to_vec(),
+            b"b".to_vec(),
+            b"input.config.writerMode\x00".to_vec(),
+            b"input.config.writerMode\x01".to_vec(),
+            vec![b'z', 0xff],
+            vec![0xff],
+        ];
+        keys.sort();
+        keys.dedup();
+
+        let mut sstable_builder = SSTableIndexBuilder::default();
+        for (i, key) in keys.iter().enumerate() {
+            sstable_builder.add_block(key, (i * 10)..(i * 10 + 10), i as u64);
+        }
+        let mut buffer: Vec<u8> = Vec::new();
+        let fst_len = sstable_builder.serialize(&mut buffer).unwrap();
+        let buffer = OwnedBytes::new(buffer);
+        let eager_index = SSTableIndexV3::load(buffer.clone(), fst_len).unwrap();
+        let (fst_slice, block_addr_store_bytes) = buffer.split(fst_len as usize);
+        let lazy_index = SSTableIndexV3::load_lazy(
+            FileSlice::new(Arc::new(fst_slice)),
+            FileSlice::new(Arc::new(block_addr_store_bytes)),
+        )
+        .unwrap();
+
+        let mut queries = vec![
+            Vec::new(),
+            vec![1],
+            b"a".to_vec(),
+            b"a\0".to_vec(),
+            b"aaa".to_vec(),
+            b"input.config.writerMode".to_vec(),
+            b"input.config.writerMode\x00".to_vec(),
+            b"input.config.writerMode\x02".to_vec(),
+            vec![0xff],
+            vec![0xff, 0],
+        ];
+        queries.extend(keys);
+
+        for query in queries {
+            assert_eq!(
+                lazy_index.locate_with_key_result(&query).unwrap(),
+                eager_index.locate_with_key_result(&query).unwrap(),
+                "query {query:?}",
             );
         }
     }
