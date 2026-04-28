@@ -3,6 +3,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
@@ -181,21 +182,49 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
+        let span = tracing::info_span!(
+            "tantivy_sstable_dictionary_open",
+            total_bytes = term_dictionary_file.len() as u64,
+            version = tracing::field::Empty,
+            num_terms = tracing::field::Empty,
+            sstable_bytes = tracing::field::Empty,
+            index_bytes = tracing::field::Empty,
+            index_offset = tracing::field::Empty,
+            fst_bytes = tracing::field::Empty,
+            block_addr_store_bytes = tracing::field::Empty,
+            lazy_block_addr_store = tracing::field::Empty,
+            footer_read_ns = tracing::field::Empty,
+            index_footer_read_ns = tracing::field::Empty,
+            fst_read_ns = tracing::field::Empty,
+            index_load_ns = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
         let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
+        let footer_start = Instant::now();
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
+        span.record("footer_read_ns", footer_start.elapsed().as_nanos() as u64);
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
+        span.record("version", version as u64);
+        span.record("num_terms", num_terms);
+        span.record("index_offset", index_offset);
+        span.record("sstable_bytes", sstable_slice.len() as u64);
+        span.record("index_bytes", index_slice.len() as u64);
 
         let sstable_index = match version {
             2 => {
+                let index_load_start = Instant::now();
                 let sstable_index_bytes = index_slice.read_bytes()?;
-                SSTableIndex::V2(
+                let sstable_index = SSTableIndex::V2(
                     crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(
                         |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
                     )?,
-                )
+                );
+                span.record("index_load_ns", index_load_start.elapsed().as_nanos() as u64);
+                sstable_index
             }
             3 => {
                 let index_slice_len = index_slice.len();
@@ -205,7 +234,12 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                         "SSTable corruption",
                     ));
                 }
+                let index_footer_start = Instant::now();
                 let mut footerv3_len_bytes = index_slice.slice_from_end(8).read_bytes()?;
+                span.record(
+                    "index_footer_read_ns",
+                    index_footer_start.elapsed().as_nanos() as u64,
+                );
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
                     let index_body_len = index_slice_len - 8;
@@ -216,14 +250,26 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                             "SSTable corruption",
                         ));
                     }
+                    span.record("fst_bytes", store_offset as u64);
+                    span.record(
+                        "block_addr_store_bytes",
+                        (index_body_len - store_offset) as u64,
+                    );
+                    span.record("lazy_block_addr_store", true);
+                    let fst_read_start = Instant::now();
                     let fst_slice = index_slice.slice_to(store_offset).read_bytes()?;
+                    span.record("fst_read_ns", fst_read_start.elapsed().as_nanos() as u64);
                     let block_addr_store_slice = index_slice.slice(store_offset..index_body_len);
-                    SSTableIndex::V3(
+                    let index_load_start = Instant::now();
+                    let sstable_index = SSTableIndex::V3(
                         SSTableIndexV3::load_lazy(fst_slice, block_addr_store_slice).map_err(
                             |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
                         )?,
-                    )
+                    );
+                    span.record("index_load_ns", index_load_start.elapsed().as_nanos() as u64);
+                    sstable_index
                 } else {
+                    span.record("lazy_block_addr_store", false);
                     // if store_offset is zero, there is no index, so we build a pseudo-index
                     // assuming a single block of sstable covering everything.
                     SSTableIndex::V3Empty(SSTableIndexV3Empty::load(index_offset as usize))

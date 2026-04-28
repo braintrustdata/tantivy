@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::{file_slice::FileSlice, BinarySerializable, FixedSize, HasLen, OwnedBytes};
 use tantivy_bitpacker::{compute_num_bits, BitPacker};
@@ -97,9 +98,19 @@ impl SSTableIndexV3 {
         fst_slice: OwnedBytes,
         block_addr_store: BlockAddrStore,
     ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
+        let span = tracing::info_span!(
+            "tantivy_sstable_v3_index_load",
+            fst_bytes = fst_slice.len() as u64,
+            lazy_block_addr_store = block_addr_store.is_lazy(),
+            block_addr_store_bytes = block_addr_store.byte_len() as u64,
+            fst_load_ns = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let fst_load_start = Instant::now();
         let fst_index = Fst::new(fst_slice)
             .map_err(|_| SSTableDataCorruption)?
             .into();
+        span.record("fst_load_ns", fst_load_start.elapsed().as_nanos() as u64);
 
         Ok(SSTableIndexV3 {
             fst_index: Arc::new(fst_index),
@@ -535,6 +546,23 @@ impl BlockAddrStore {
             } => block_meta_bytes.len(),
             BlockAddrStore::Lazy { block_meta_len, .. } => *block_meta_len,
         }
+    }
+
+    fn byte_len(&self) -> usize {
+        match self {
+            BlockAddrStore::Eager {
+                block_meta_bytes,
+                addr_bytes,
+            } => 8 + block_meta_bytes.len() + addr_bytes.len(),
+            BlockAddrStore::Lazy {
+                block_addr_store_file,
+                ..
+            } => block_addr_store_file.len(),
+        }
+    }
+
+    fn is_lazy(&self) -> bool {
+        matches!(self, BlockAddrStore::Lazy { .. })
     }
 
     fn get_block_meta(&self, store_block_id: usize) -> Option<BlockAddrBlockMetadata> {
