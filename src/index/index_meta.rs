@@ -270,6 +270,10 @@ pub struct IndexSettings {
     #[serde(default = "default_merge_postings_parallelism")]
     #[serde(skip_serializing_if = "is_default_merge_postings_parallelism")]
     pub merge_postings_parallelism: usize,
+    /// Enables extra verbose debug printing for commit internals.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub extra_verbose_printing: bool,
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -285,6 +289,10 @@ fn is_default_merge_postings_parallelism(val: &usize) -> bool {
     *val == default_merge_postings_parallelism()
 }
 
+fn is_false(val: &bool) -> bool {
+    !*val
+}
+
 impl Default for IndexSettings {
     fn default() -> Self {
         Self {
@@ -293,6 +301,7 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             merge_postings_parallelism: default_merge_postings_parallelism(),
+            extra_verbose_printing: false,
         }
     }
 }

@@ -1,10 +1,12 @@
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
+use std::fmt;
 use std::io::Write;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -27,6 +29,16 @@ use crate::{FutureResult, Opstamp};
 
 pub(crate) const DEFAULT_NUM_MERGE_THREADS: usize = 4;
 
+fn extra_verbose_print(enabled: bool, start_time: Instant, args: fmt::Arguments<'_>) {
+    if enabled {
+        eprintln!(
+            "TANTIVY COMMIT [+{:.3}s]: {}",
+            start_time.elapsed().as_secs_f64(),
+            args,
+        );
+    }
+}
+
 /// Save the index meta file.
 /// This operation is atomic:
 /// Either
@@ -37,18 +49,51 @@ pub(crate) const DEFAULT_NUM_MERGE_THREADS: usize = 4;
 ///
 /// This method is not part of tantivy's public API
 pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
+    let start_time = Instant::now();
+    let extra_verbose = metas.index_settings.extra_verbose_printing;
     debug!("save metas");
     let mut buffer = serde_json::to_vec_pretty(metas)?;
     // Just adding a new line at the end of the buffer.
     writeln!(&mut buffer)?;
+    extra_verbose_print(
+        extra_verbose,
+        start_time,
+        format_args!(
+            "save_metas start; opstamp={}; num_segments={}; payload_present={}; bytes={}",
+            metas.opstamp,
+            metas.segments.len(),
+            metas.payload.is_some(),
+            buffer.len()
+        ),
+    );
     crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
         std::io::Error::new(
             std::io::ErrorKind::Other,
             msg.unwrap_or_else(|| "Undefined".to_string())
         )
     )));
+    extra_verbose_print(
+        extra_verbose,
+        start_time,
+        format_args!("save_metas calling sync_directory"),
+    );
     directory.sync_directory()?;
+    extra_verbose_print(
+        extra_verbose,
+        start_time,
+        format_args!("save_metas finished sync_directory"),
+    );
+    extra_verbose_print(
+        extra_verbose,
+        start_time,
+        format_args!("save_metas calling atomic_write(meta.json)"),
+    );
     directory.atomic_write(&META_FILEPATH, &buffer[..])?;
+    extra_verbose_print(
+        extra_verbose,
+        start_time,
+        format_args!("save_metas finished atomic_write(meta.json)"),
+    );
     debug!("Saved metas {:?}", serde_json::to_string_pretty(&metas));
     Ok(())
 }
@@ -76,11 +121,31 @@ impl Deref for SegmentUpdater {
 fn garbage_collect_files(
     segment_updater: SegmentUpdater,
 ) -> crate::Result<GarbageCollectionResult> {
+    let start_time = Instant::now();
+    let extra_verbose = segment_updater.index.settings().extra_verbose_printing;
     debug!("Running garbage collection");
+    extra_verbose_print(
+        extra_verbose,
+        start_time,
+        format_args!("garbage_collect_files start"),
+    );
     let mut index = segment_updater.index.clone();
-    index
+    let result = index
         .directory_mut()
-        .garbage_collect(move || segment_updater.list_files())
+        .garbage_collect(move || segment_updater.list_files());
+    match &result {
+        Ok(_) => extra_verbose_print(
+            extra_verbose,
+            start_time,
+            format_args!("garbage_collect_files finished successfully"),
+        ),
+        Err(err) => extra_verbose_print(
+            extra_verbose,
+            start_time,
+            format_args!("garbage_collect_files failed: {}", err),
+        ),
+    }
+    result
 }
 
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
@@ -476,11 +541,96 @@ impl SegmentUpdater {
     ) -> FutureResult<Opstamp> {
         let segment_updater: SegmentUpdater = self.clone();
         self.schedule_task(move || {
+            let start_time = Instant::now();
+            let extra_verbose = segment_updater.index.settings().extra_verbose_printing;
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!(
+                    "schedule_commit start; opstamp={}; payload_present={}",
+                    opstamp,
+                    payload.is_some()
+                ),
+            );
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit calling purge_deletes"),
+            );
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
+            let total_docs = segment_entries
+                .iter()
+                .map(|entry| entry.meta().max_doc() as u64)
+                .sum::<u64>();
+            let total_deleted_docs = segment_entries
+                .iter()
+                .map(|entry| entry.meta().num_deleted_docs() as u64)
+                .sum::<u64>();
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!(
+                    "schedule_commit finished purge_deletes; num_segments={}; total_docs={}; total_deleted_docs={}",
+                    segment_entries.len(),
+                    total_docs,
+                    total_deleted_docs
+                ),
+            );
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit calling segment_manager.commit"),
+            );
             segment_updater.segment_manager.commit(segment_entries);
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!(
+                    "schedule_commit finished segment_manager.commit; committed_segments_now={}",
+                    segment_updater.segment_manager.committed_segment_metas().len()
+                ),
+            );
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit calling save_metas"),
+            );
             segment_updater.save_metas(opstamp, payload)?;
-            let _ = garbage_collect_files(segment_updater.clone());
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit finished save_metas"),
+            );
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit calling garbage_collect_files"),
+            );
+            let garbage_collect_result = garbage_collect_files(segment_updater.clone());
+            match &garbage_collect_result {
+                Ok(_) => extra_verbose_print(
+                    extra_verbose,
+                    start_time,
+                    format_args!("schedule_commit finished garbage_collect_files"),
+                ),
+                Err(err) => extra_verbose_print(
+                    extra_verbose,
+                    start_time,
+                    format_args!("schedule_commit garbage_collect_files failed: {}", err),
+                ),
+            }
+            let _ = garbage_collect_result;
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit calling consider_merge_options"),
+            );
             segment_updater.consider_merge_options();
+            extra_verbose_print(
+                extra_verbose,
+                start_time,
+                format_args!("schedule_commit finished consider_merge_options"),
+            );
             Ok(opstamp)
         })
     }
