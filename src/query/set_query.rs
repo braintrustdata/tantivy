@@ -4,9 +4,13 @@ use tantivy_fst::raw::CompiledAddr;
 use tantivy_fst::{Automaton, Map};
 
 use crate::query::score_combiner::DoNothingCombiner;
-use crate::query::{AutomatonWeight, BooleanWeight, EnableScoring, Occur, Query, Weight};
-use crate::schema::{Field, Schema};
+use crate::query::{
+    AutomatonWeight, BooleanWeight, EnableScoring, Occur, Query, TermQuery, Weight,
+};
+use crate::schema::{Field, IndexRecordOption, Schema};
 use crate::Term;
+
+const DIRECT_LOOKUP_TERM_THRESHOLD: usize = 64;
 
 /// A Term Set Query matches all of the documents containing any of the Term provided
 #[derive(Debug, Clone)]
@@ -53,6 +57,7 @@ impl TermSetQuery {
                 "tantivy_term_set_query_field_weight",
                 field_id = field.field_id(),
                 num_terms = sorted_terms.len(),
+                mode = tracing::field::Empty,
             );
             let _field_guard = field_span.enter();
 
@@ -63,6 +68,17 @@ impl TermSetQuery {
                 return Err(crate::TantivyError::SchemaError(error_msg));
             }
 
+            if sorted_terms.len() <= DIRECT_LOOKUP_TERM_THRESHOLD {
+                field_span.record("mode", "direct_lookup");
+                for term in sorted_terms {
+                    let term_weight = TermQuery::new(term.clone(), IndexRecordOption::Basic)
+                        .specialized_weight(EnableScoring::disabled_from_schema(schema))?;
+                    sub_queries.push((Occur::Should, Box::new(term_weight)));
+                }
+                continue;
+            }
+
+            field_span.record("mode", "automaton");
             // In practice this won't fail because:
             // - we are writing to memory, so no IoError
             // - Terms are ordered
