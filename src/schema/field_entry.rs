@@ -87,6 +87,11 @@ impl FieldEntry {
         Self::new(field_name, FieldType::Artifact(artifact_options))
     }
 
+    /// Creates a field entry for a vector map field backed by artifacts.
+    pub fn new_vector_map(field_name: String, artifact_options: ArtifactOptions) -> FieldEntry {
+        Self::new(field_name, FieldType::VectorMap(artifact_options))
+    }
+
     /// Returns the name of the field
     pub fn name(&self) -> &str {
         &self.name
@@ -136,7 +141,7 @@ impl FieldEntry {
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
             FieldType::IpAddr(ref options) => options.is_stored(),
-            FieldType::Artifact(_) => false,
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => false,
         }
     }
 
@@ -150,7 +155,7 @@ impl FieldEntry {
 mod tests {
 
     use super::*;
-    use crate::schema::{Schema, TextFieldIndexing, TEXT};
+    use crate::schema::{ArtifactOptions, Schema, TextFieldIndexing, TEXT};
     use crate::Index;
 
     #[test]
@@ -209,6 +214,29 @@ mod tests {
             FieldType::Str(_) => {}
             _ => panic!("expected FieldType::Str"),
         }
+    }
+
+    #[test]
+    fn test_artifact_schema_type_names() {
+        let vector_entry =
+            FieldEntry::new_vector_map("vectors".to_string(), ArtifactOptions::default());
+        let vector_json = serde_json::to_value(&vector_entry).unwrap();
+        assert_eq!(vector_json["type"], "vector_map");
+        let vector_round_trip: FieldEntry = serde_json::from_value(vector_json).unwrap();
+        assert!(matches!(
+            vector_round_trip.field_type,
+            FieldType::VectorMap(_)
+        ));
+
+        let artifact_entry =
+            FieldEntry::new_artifact("generic_artifact".to_string(), ArtifactOptions::default());
+        let artifact_json = serde_json::to_value(&artifact_entry).unwrap();
+        assert_eq!(artifact_json["type"], "artifact");
+        let artifact_round_trip: FieldEntry = serde_json::from_value(artifact_json).unwrap();
+        assert!(matches!(
+            artifact_round_trip.field_type,
+            FieldType::Artifact(_)
+        ));
     }
 
     #[test]

@@ -509,9 +509,11 @@ impl QueryParser {
                 let ip_v6 = IpAddr::from_str(phrase)?.into_ipv6_addr();
                 Ok(Term::from_field_ip_addr(field, ip_v6))
             }
-            FieldType::Artifact(_) => Err(QueryParserError::UnsupportedQuery(
-                "Artifact fields cannot be queried with text queries.".to_string(),
-            )),
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => {
+                Err(QueryParserError::UnsupportedQuery(
+                    "Artifact fields cannot be queried with text queries.".to_string(),
+                ))
+            }
         }
     }
 
@@ -612,9 +614,11 @@ impl QueryParser {
                 let term = Term::from_field_ip_addr(field, ip_v6);
                 Ok(vec![LogicalLiteral::Term(term)])
             }
-            FieldType::Artifact(_) => Err(QueryParserError::UnsupportedQuery(
-                "Artifact fields cannot be queried with text queries.".to_string(),
-            )),
+            FieldType::Artifact(_) | FieldType::VectorMap(_) => {
+                Err(QueryParserError::UnsupportedQuery(
+                    "Artifact fields cannot be queried with text queries.".to_string(),
+                ))
+            }
         }
     }
 

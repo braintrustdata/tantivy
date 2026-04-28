@@ -204,6 +204,16 @@ impl SchemaBuilder {
         self.add_field(field_entry)
     }
 
+    /// Adds a vector map field backed by artifacts to the schema.
+    pub fn add_vector_map_field<T: Into<ArtifactOptions>>(
+        &mut self,
+        field_name: &str,
+        field_options: T,
+    ) -> Field {
+        let field_entry = FieldEntry::new_vector_map(field_name.to_string(), field_options.into());
+        self.add_field(field_entry)
+    }
+
     /// Adds a field entry to the schema in build.
     pub fn add_field(&mut self, field_entry: FieldEntry) -> Field {
         let field = Field::from_field_id(self.fields.len() as u32);
