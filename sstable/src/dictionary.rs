@@ -208,10 +208,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                         ));
                     }
                     let fst_slice = index_body_slice.slice_to(store_offset);
-                    let block_addr_store_bytes =
-                        index_body_slice.slice_from(store_offset).read_bytes()?;
+                    let block_addr_store_slice = index_body_slice.slice_from(store_offset);
                     SSTableIndex::V3(
-                        SSTableIndexV3::load_lazy_fst(fst_slice, block_addr_store_bytes).map_err(
+                        SSTableIndexV3::load_lazy_fst(fst_slice, block_addr_store_slice).map_err(
                             |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
                         )?,
                     )
@@ -427,7 +426,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
 
-    use common::OwnedBytes;
+    use common::{HasLen, OwnedBytes};
 
     use super::Dictionary;
     use crate::MonotonicU64SSTable;
@@ -436,6 +435,7 @@ mod tests {
     struct PermissionedHandle {
         bytes: OwnedBytes,
         allowed_range: Mutex<Range<usize>>,
+        always_allowed_range: Mutex<Option<Range<usize>>>,
     }
 
     impl PermissionedHandle {
@@ -443,12 +443,17 @@ mod tests {
             let bytes = OwnedBytes::new(bytes);
             PermissionedHandle {
                 allowed_range: Mutex::new(0..bytes.len()),
+                always_allowed_range: Mutex::new(None),
                 bytes,
             }
         }
 
         fn restrict(&self, range: Range<usize>) {
             *self.allowed_range.lock().unwrap() = range;
+        }
+
+        fn allow_index_from(&self, offset: usize) {
+            *self.always_allowed_range.lock().unwrap() = Some(offset..self.bytes.len());
         }
     }
 
@@ -461,7 +466,16 @@ mod tests {
     impl common::file_slice::FileHandle for PermissionedHandle {
         fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
             let allowed_range = self.allowed_range.lock().unwrap();
-            if !allowed_range.contains(&range.start) || !allowed_range.contains(&(range.end - 1)) {
+            let always_allowed_range = self.always_allowed_range.lock().unwrap();
+            let allowed =
+                allowed_range.contains(&range.start) && allowed_range.contains(&(range.end - 1));
+            let always_allowed = always_allowed_range
+                .as_ref()
+                .is_some_and(|always_allowed_range| {
+                    always_allowed_range.contains(&range.start)
+                        && always_allowed_range.contains(&(range.end - 1))
+                });
+            if !allowed && !always_allowed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("invalid range, allowed {allowed_range:?}, requested {range:?}"),
@@ -486,6 +500,7 @@ mod tests {
         let slice = common::file_slice::FileSlice::new(table.clone());
 
         let dictionary = Dictionary::<MonotonicU64SSTable>::open(slice).unwrap();
+        table.allow_index_from(dictionary.sstable_slice.len());
 
         // if the last block is id 0, tests are meaningless
         assert_ne!(dictionary.sstable_index.locate_with_ord(u64::MAX), 0);
