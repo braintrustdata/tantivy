@@ -547,10 +547,27 @@ impl SegmentUpdater {
 
         let verbose_merge_threads = self.index.settings().verbose_merge_threads;
         let merge_segment_ids = merge_operation.segment_ids().to_vec();
+        let num_input_segments = segment_entries.len();
+        let docs_by_input_segment = if verbose_merge_threads {
+            segment_entries
+                .iter()
+                .map(|segment_entry| {
+                    format!(
+                        "{:?}:num_docs={},max_doc={}",
+                        segment_entry.segment_id(),
+                        segment_entry.meta().num_docs(),
+                        segment_entry.meta().max_doc()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        };
         let target_opstamp = merge_operation.target_opstamp();
         let span = tracing::info_span!(
             "merge_thread",
-            num_input_segments = segment_entries.len(),
+            num_input_segments = num_input_segments,
             target_opstamp = target_opstamp
         );
 
@@ -559,9 +576,9 @@ impl SegmentUpdater {
             let merge_start = Instant::now();
             if verbose_merge_threads {
                 eprintln!(
-                    "TANTIVY MERGE THREAD: starting merge: target_opstamp={target_opstamp}, num_input_segments={}, input_segments={:?}",
-                    segment_entries.len(),
-                    merge_segment_ids
+                    "TANTIVY MERGE THREAD: starting merge: target_opstamp={target_opstamp}, num_input_segments={num_input_segments}, input_segments={:?}, docs_by_input_segment=[{}]",
+                    merge_segment_ids,
+                    docs_by_input_segment
                 );
             }
             // The fact that `merge_operation` is moved here is important.
@@ -579,7 +596,8 @@ impl SegmentUpdater {
                         match after_merge_segment_entry.as_ref() {
                             Some(after_merge_segment_entry) => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: finished merge execution: target_opstamp={target_opstamp}, output_segment={:?}, num_docs={}, max_doc={}, merge_elapsed={:?}",
+                                    "TANTIVY MERGE THREAD: finished merge execution: target_opstamp={target_opstamp}, num_input_segments={num_input_segments}, docs_by_input_segment=[{}], output_segment={:?}, num_docs={}, max_doc={}, merge_elapsed={:?}",
+                                    docs_by_input_segment,
                                     after_merge_segment_entry.segment_id(),
                                     after_merge_segment_entry.meta().num_docs(),
                                     after_merge_segment_entry.meta().max_doc(),
@@ -588,7 +606,8 @@ impl SegmentUpdater {
                             }
                             None => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: finished merge execution with no output segment: target_opstamp={target_opstamp}, merge_elapsed={:?}",
+                                    "TANTIVY MERGE THREAD: finished merge execution with no output segment: target_opstamp={target_opstamp}, num_input_segments={num_input_segments}, docs_by_input_segment=[{}], merge_elapsed={:?}",
+                                    docs_by_input_segment,
                                     merge_start.elapsed()
                                 );
                             }
@@ -599,8 +618,9 @@ impl SegmentUpdater {
                         match res.as_ref() {
                             Ok(Some(segment_meta)) => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: completed merge operation: target_opstamp={target_opstamp}, input_segments={:?}, output_segment={:?}, num_docs={}, max_doc={}, total_elapsed={:?}",
+                                    "TANTIVY MERGE THREAD: completed merge operation: target_opstamp={target_opstamp}, num_input_segments={num_input_segments}, input_segments={:?}, docs_by_input_segment=[{}], output_segment={:?}, num_docs={}, max_doc={}, total_elapsed={:?}",
                                     merge_segment_ids,
+                                    docs_by_input_segment,
                                     segment_meta.id(),
                                     segment_meta.num_docs(),
                                     segment_meta.max_doc(),
@@ -609,15 +629,17 @@ impl SegmentUpdater {
                             }
                             Ok(None) => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: completed merge operation with no output segment: target_opstamp={target_opstamp}, input_segments={:?}, total_elapsed={:?}",
+                                    "TANTIVY MERGE THREAD: completed merge operation with no output segment: target_opstamp={target_opstamp}, num_input_segments={num_input_segments}, input_segments={:?}, docs_by_input_segment=[{}], total_elapsed={:?}",
                                     merge_segment_ids,
+                                    docs_by_input_segment,
                                     merge_start.elapsed()
                                 );
                             }
                             Err(merge_error) => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: merge operation failed after merge execution: target_opstamp={target_opstamp}, input_segments={:?}, total_elapsed={:?}, error={:?}",
+                                    "TANTIVY MERGE THREAD: merge operation failed after merge execution: target_opstamp={target_opstamp}, num_input_segments={num_input_segments}, input_segments={:?}, docs_by_input_segment=[{}], total_elapsed={:?}, error={:?}",
                                     merge_segment_ids,
+                                    docs_by_input_segment,
                                     merge_start.elapsed(),
                                     merge_error
                                 );
