@@ -87,7 +87,13 @@ impl Weight for FastFieldRangeWeight {
         if value_range.is_empty() {
             return Ok(Box::new(EmptyScorer));
         }
-        let docset = RangeDocSet::new(value_range, column);
+        let size_hint = estimate_range_size_hint(
+            &value_range,
+            column.min_value(),
+            column.max_value(),
+            column.num_docs(),
+        );
+        let docset = RangeDocSet::new_with_size_hint(value_range, column, size_hint);
         Ok(Box::new(ConstScorer::new(docset, boost)))
     }
 
@@ -126,6 +132,37 @@ fn bound_to_value_range<T: MonotonicallyMappableToU64>(
         Bound::Unbounded => max_value,
     };
     Some(start_value..=end_value)
+}
+
+fn estimate_range_size_hint<T: MonotonicallyMappableToU64 + Copy>(
+    value_range: &RangeInclusive<T>,
+    min_value: T,
+    max_value: T,
+    num_docs: u32,
+) -> u32 {
+    if num_docs == 0 {
+        return 0;
+    }
+
+    let column_min = min_value.to_u64() as u128;
+    let column_max = max_value.to_u64() as u128;
+    let range_start = value_range.start().to_u64() as u128;
+    let range_end = value_range.end().to_u64() as u128;
+
+    if column_max < column_min || range_end < range_start {
+        return 0;
+    }
+
+    let overlap_start = range_start.max(column_min);
+    let overlap_end = range_end.min(column_max);
+    if overlap_end < overlap_start {
+        return 0;
+    }
+
+    let column_width = (column_max - column_min) as f64 + 1.0;
+    let range_width = (overlap_end - overlap_start) as f64 + 1.0;
+    let estimate = (f64::from(num_docs) * range_width / column_width).ceil() as u64;
+    estimate.clamp(1, u64::from(num_docs)) as u32
 }
 
 #[cfg(test)]
@@ -183,6 +220,22 @@ pub mod tests {
     fn range_regression1_test() {
         let ops = vec![doc_from_id_1(0)];
         assert!(test_id_range_for_docs(ops).is_ok());
+    }
+
+    #[test]
+    fn range_size_hint_estimates_selectivity() {
+        assert_eq!(
+            super::estimate_range_size_hint(&(25u64..=49), 0, 99, 1000),
+            250
+        );
+        assert_eq!(
+            super::estimate_range_size_hint(&(0u64..=99), 0, 99, 1000),
+            1000
+        );
+        assert_eq!(
+            super::estimate_range_size_hint(&(100u64..=200), 0, 99, 1000),
+            0
+        );
     }
 
     #[test]

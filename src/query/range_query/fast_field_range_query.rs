@@ -57,11 +57,16 @@ pub(crate) struct RangeDocSet<T> {
     /// Current batch of loaded docs.
     loaded_docs: VecCursor,
     last_seek_pos_opt: Option<u32>,
+    size_hint: u32,
 }
 
 const DEFAULT_FETCH_HORIZON: u32 = 128;
 impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
-    pub(crate) fn new(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
+    pub(crate) fn new_with_size_hint(
+        value_range: RangeInclusive<T>,
+        column: Column<T>,
+        size_hint: u32,
+    ) -> Self {
         let mut range_docset = Self {
             value_range,
             column,
@@ -69,6 +74,7 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
             next_fetch_start: 0,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
+            size_hint,
         };
         range_docset.reset_fetch_range();
         range_docset.fetch_block();
@@ -174,7 +180,7 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     }
 
     fn size_hint(&self) -> u32 {
-        0 // heuristic possible by checking number of hits when fetching a block
+        self.size_hint
     }
 }
 
