@@ -622,14 +622,21 @@ impl SegmentUpdater {
         scheduled_result
     }
 
-    pub(crate) fn get_mergeable_segments(&self) -> (Vec<SegmentMeta>, Vec<SegmentMeta>) {
-        let merge_segment_ids: HashSet<SegmentId> = self.merge_operations.segment_in_merge();
-        self.segment_manager
-            .get_mergeable_segments(&merge_segment_ids)
-    }
-
     fn consider_merge_options(&self) {
-        let (committed_segments, uncommitted_segments) = self.get_mergeable_segments();
+        let merge_segment_ids: HashSet<SegmentId> = self.merge_operations.segment_in_merge();
+        let (total_committed_segments, total_uncommitted_segments) =
+            self.segment_manager.segment_counts();
+        let (committed_segments, uncommitted_segments) = self
+            .segment_manager
+            .get_mergeable_segments(&merge_segment_ids);
+        if self.index.settings().verbose_merge_threads {
+            eprintln!(
+                "TANTIVY MERGE THREAD: considering merge options: total_committed_segments={total_committed_segments}, total_uncommitted_segments={total_uncommitted_segments}, in_merge_segments={}, mergeable_committed_segments={}, mergeable_uncommitted_segments={}",
+                merge_segment_ids.len(),
+                committed_segments.len(),
+                uncommitted_segments.len()
+            );
+        }
 
         // Committed segments cannot be merged with uncommitted_segments.
         // We therefore consider merges using these two sets of segments independently.

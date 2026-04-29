@@ -44,6 +44,10 @@ impl SegmentRegister {
         self.segment_states.clear();
     }
 
+    pub fn len(&self) -> usize {
+        self.segment_states.len()
+    }
+
     pub fn get_mergeable_segments(
         &self,
         in_merge_segment_ids: &HashSet<SegmentId>,

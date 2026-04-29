@@ -90,6 +90,15 @@ impl SegmentManager {
                 .get_mergeable_segments(in_merge_segment_ids),
         )
     }
+
+    pub fn segment_counts(&self) -> (usize, usize) {
+        let registers_lock = self.read();
+        (
+            registers_lock.committed.len(),
+            registers_lock.uncommitted.len(),
+        )
+    }
+
     /// Returns all of the segment entries (committed or uncommitted)
     pub fn segment_entries(&self) -> Vec<SegmentEntry> {
         let registers_lock = self.read();
