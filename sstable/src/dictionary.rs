@@ -5,7 +5,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use tantivy_fst::automaton::AlwaysMatch;
 use tantivy_fst::Automaton;
 
@@ -187,22 +187,33 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
-        let sstable_index_bytes = index_slice.read_bytes()?;
 
         let sstable_index = match version {
             2 => SSTableIndex::V2(
-                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?,
+                crate::sstable_index_v2::SSTableIndex::load(index_slice.read_bytes()?).map_err(
+                    |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                )?,
             ),
             3 => {
-                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
+                let index_body_len = index_slice.len() - 8;
+                let (index_body_slice, footerv3_len_slice) = index_slice.split(index_body_len);
+                let mut footerv3_len_bytes = footerv3_len_slice.read_bytes()?;
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
+                    let store_offset = store_offset as usize;
+                    if store_offset > index_body_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SSTable corruption",
+                        ));
+                    }
+                    let fst_slice = index_body_slice.slice_to(store_offset);
+                    let block_addr_store_bytes =
+                        index_body_slice.slice_from(store_offset).read_bytes()?;
                     SSTableIndex::V3(
-                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                        })?,
+                        SSTableIndexV3::load_lazy_fst(fst_slice, block_addr_store_bytes).map_err(
+                            |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                        )?,
                     )
                 } else {
                     // if store_offset is zero, there is no index, so we build a pseudo-index
@@ -487,7 +498,7 @@ mod tests {
         let (dic, slice) = make_test_sstable();
 
         let block = dic.sstable_index.get_block_with_ord(100_000);
-        slice.restrict(block.byte_range);
+        slice.restrict(block.byte_range.clone());
 
         let mut res = Vec::new();
 
@@ -495,10 +506,12 @@ mod tests {
         assert!(dic.ord_to_term(100_000, &mut res).unwrap());
         assert_eq!(res, format!("{:05X}", 100_000).into_bytes());
         assert_eq!(dic.term_info_from_ord(100_000).unwrap().unwrap(), 100_000);
+        slice.restrict(0..slice.bytes.len());
         assert_eq!(dic.get(&res).unwrap().unwrap(), 100_000);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), 100_000);
 
         // start of a block
+        slice.restrict(block.byte_range.clone());
         assert!(dic.ord_to_term(block.first_ordinal, &mut res).unwrap());
         assert_eq!(res, format!("{:05X}", block.first_ordinal).into_bytes());
         assert_eq!(
@@ -507,6 +520,7 @@ mod tests {
                 .unwrap(),
             block.first_ordinal
         );
+        slice.restrict(0..slice.bytes.len());
         assert_eq!(dic.get(&res).unwrap().unwrap(), block.first_ordinal);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), block.first_ordinal);
 
@@ -517,14 +531,12 @@ mod tests {
         assert!(dic.ord_to_term(ordinal, &mut res).unwrap());
         assert_eq!(res, format!("{ordinal:05X}").into_bytes());
         assert_eq!(dic.term_info_from_ord(ordinal).unwrap().unwrap(), ordinal);
+        slice.restrict(0..slice.bytes.len());
         assert_eq!(dic.get(&res).unwrap().unwrap(), ordinal);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), ordinal);
 
         // before first block
-        // 1st block must be loaded for key-related operations
-        let block = dic.sstable_index.get_block_with_ord(0);
-        slice.restrict(block.byte_range);
-
+        slice.restrict(0..slice.bytes.len());
         assert!(dic.get(b"$$$").unwrap().is_none());
         assert!(dic.term_ord(b"$$$").unwrap().is_none());
 
@@ -536,12 +548,10 @@ mod tests {
         assert!(!dic.ord_to_term(ordinal, &mut res).unwrap());
         assert!(dic.term_info_from_ord(ordinal).unwrap().is_none());
 
-        // last block isn't required to be loaded for key related operations
-        slice.restrict(0..0);
+        slice.restrict(0..slice.bytes.len());
         assert!(dic.get(b"~~~").unwrap().is_none());
         assert!(dic.term_ord(b"~~~").unwrap().is_none());
 
-        slice.restrict(0..slice.bytes.len());
         // between 1000F and 10010, test case where matched prefix > prefix kept
         assert!(dic.term_ord(b"1000G").unwrap().is_none());
         // shorter than 10000, tests prefix case
