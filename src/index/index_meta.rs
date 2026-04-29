@@ -293,6 +293,10 @@ pub struct IndexSettings {
     #[serde(default = "default_merge_postings_parallelism")]
     #[serde(skip_serializing_if = "is_default_merge_postings_parallelism")]
     pub merge_postings_parallelism: usize,
+    /// Enables extra stderr diagnostics from merge threads.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub verbose_merge_threads: bool,
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -316,6 +320,7 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             merge_postings_parallelism: default_merge_postings_parallelism(),
+            verbose_merge_threads: false,
         }
     }
 }
@@ -573,6 +578,7 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 merge_postings_parallelism: IndexSettings::default().merge_postings_parallelism,
+                verbose_merge_threads: false,
             }
         );
         {

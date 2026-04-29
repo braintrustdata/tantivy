@@ -5,6 +5,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -544,14 +545,25 @@ impl SegmentUpdater {
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
 
+        let verbose_merge_threads = self.index.settings().verbose_merge_threads;
+        let merge_segment_ids = merge_operation.segment_ids().to_vec();
+        let target_opstamp = merge_operation.target_opstamp();
         let span = tracing::info_span!(
             "merge_thread",
             num_input_segments = segment_entries.len(),
-            target_opstamp = merge_operation.target_opstamp()
+            target_opstamp = target_opstamp
         );
 
         self.merge_thread_pool.spawn(move || {
             let _enter = span.enter();
+            let merge_start = Instant::now();
+            if verbose_merge_threads {
+                eprintln!(
+                    "TANTIVY MERGE THREAD: starting merge: target_opstamp={target_opstamp}, num_input_segments={}, input_segments={:?}",
+                    segment_entries.len(),
+                    merge_segment_ids
+                );
+            }
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
@@ -563,10 +575,37 @@ impl SegmentUpdater {
                 merge_operation.target_opstamp(),
             ) {
                 Ok(after_merge_segment_entry) => {
+                    if verbose_merge_threads {
+                        match after_merge_segment_entry.as_ref() {
+                            Some(after_merge_segment_entry) => {
+                                eprintln!(
+                                    "TANTIVY MERGE THREAD: finished merge: target_opstamp={target_opstamp}, output_segment={:?}, num_docs={}, max_doc={}, elapsed={:?}",
+                                    after_merge_segment_entry.segment_id(),
+                                    after_merge_segment_entry.meta().num_docs(),
+                                    after_merge_segment_entry.meta().max_doc(),
+                                    merge_start.elapsed()
+                                );
+                            }
+                            None => {
+                                eprintln!(
+                                    "TANTIVY MERGE THREAD: finished merge with no output segment: target_opstamp={target_opstamp}, elapsed={:?}",
+                                    merge_start.elapsed()
+                                );
+                            }
+                        }
+                    }
                     let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
                     let _send_result = merging_future_send.send(res);
                 }
                 Err(merge_error) => {
+                    if verbose_merge_threads {
+                        eprintln!(
+                            "TANTIVY MERGE THREAD: merge failed: target_opstamp={target_opstamp}, input_segments={:?}, elapsed={:?}, error={:?}",
+                            merge_segment_ids,
+                            merge_start.elapsed(),
+                            merge_error
+                        );
+                    }
                     warn!(
                         "Merge of {:?} was cancelled: {:?}",
                         merge_operation.segment_ids().to_vec(),
@@ -705,7 +744,18 @@ impl SegmentUpdater {
     /// Obsolete files will eventually be cleaned up
     /// by the directory garbage collector.
     pub fn wait_merging_thread(&self) -> crate::Result<()> {
+        let verbose_merge_threads = self.index.settings().verbose_merge_threads;
+        let wait_start = Instant::now();
+        if verbose_merge_threads {
+            eprintln!("TANTIVY MERGE THREAD: waiting for merge operations to settle");
+        }
         self.merge_operations.wait_until_empty();
+        if verbose_merge_threads {
+            eprintln!(
+                "TANTIVY MERGE THREAD: merge operations settled: elapsed={:?}",
+                wait_start.elapsed()
+            );
+        }
         Ok(())
     }
 }
