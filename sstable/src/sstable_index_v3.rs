@@ -117,7 +117,7 @@ impl SSTableIndexV3 {
         })
     }
 
-    pub fn load_lazy_fst(
+    pub fn load_lazy(
         fst_slice: FileSlice,
         block_addr_store_slice: FileSlice,
     ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
@@ -909,7 +909,7 @@ mod tests {
         let buffer = OwnedBytes::new(buffer);
         let eager_index = SSTableIndexV3::load(buffer.clone(), fst_len).unwrap();
         let (fst_slice, block_addr_store_bytes) = buffer.split(fst_len as usize);
-        let lazy_index = SSTableIndexV3::load_lazy_fst(
+        let lazy_index = SSTableIndexV3::load_lazy(
             FileSlice::new(Arc::new(fst_slice)),
             FileSlice::new(Arc::new(block_addr_store_bytes)),
         )
@@ -969,7 +969,7 @@ mod tests {
         let buffer = OwnedBytes::new(buffer);
         let eager_index = SSTableIndexV3::load(buffer.clone(), fst_len).unwrap();
         let (fst_slice, block_addr_store_bytes) = buffer.split(fst_len as usize);
-        let lazy_index = SSTableIndexV3::load_lazy_fst(
+        let lazy_index = SSTableIndexV3::load_lazy(
             FileSlice::new(Arc::new(fst_slice)),
             FileSlice::new(Arc::new(block_addr_store_bytes)),
         )

@@ -38,33 +38,24 @@ struct PageCache {
 impl LazyFstIndex {
     pub(crate) fn open(fst_file: FileSlice) -> io::Result<Self> {
         if fst_file.len() < 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FST data is corrupted",
-            ));
+            return Err(corruption_error());
         }
 
         let mut header = fst_file.read_bytes_slice(0..16)?;
         let version = u64::deserialize(&mut header)?;
         if version == 0 || version > FST_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FST data is corrupted",
-            ));
+            return Err(corruption_error());
         }
 
         let mut footer = fst_file.read_bytes_slice(fst_file.len() - 16..fst_file.len())?;
         let _len = u64::deserialize(&mut footer)?;
         let root_addr = usize::try_from(u64::deserialize(&mut footer)?)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "FST data is corrupted"))?;
+            .map_err(|_| corruption_error())?;
 
         if (root_addr == EMPTY_ADDRESS && fst_file.len() != 32)
             || (root_addr != EMPTY_ADDRESS && root_addr + 17 != fst_file.len())
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FST data is corrupted",
-            ));
+            return Err(corruption_error());
         }
 
         Ok(LazyFstIndex {
@@ -242,10 +233,7 @@ impl LazyFstIndex {
 
     fn read_range(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         if range.end > self.fst_file.len() || range.start > range.end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "FST data is corrupted",
-            ));
+            return Err(corruption_error());
         }
         let start_page = range.start / PAGE_SIZE;
         let end_page = (range.end.saturating_sub(1)) / PAGE_SIZE;
@@ -554,8 +542,7 @@ fn unpack_uint(bytes: &[u8]) -> u64 {
 }
 
 fn unpack_delta(delta: u64, node_addr: usize) -> io::Result<usize> {
-    let delta_addr = usize::try_from(delta)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "FST data is corrupted"))?;
+    let delta_addr = usize::try_from(delta).map_err(|_| corruption_error())?;
     if delta_addr == EMPTY_ADDRESS {
         Ok(EMPTY_ADDRESS)
     } else {

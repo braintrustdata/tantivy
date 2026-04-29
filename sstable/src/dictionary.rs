@@ -210,7 +210,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                     let fst_slice = index_body_slice.slice_to(store_offset);
                     let block_addr_store_slice = index_body_slice.slice_from(store_offset);
                     SSTableIndex::V3(
-                        SSTableIndexV3::load_lazy_fst(fst_slice, block_addr_store_slice).map_err(
+                        SSTableIndexV3::load_lazy(fst_slice, block_addr_store_slice).map_err(
                             |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
                         )?,
                     )
