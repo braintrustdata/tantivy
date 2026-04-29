@@ -6,6 +6,7 @@ use merge::ValueMerger;
 
 mod delta;
 mod dictionary;
+mod lazy_fst;
 pub mod merge;
 mod streamer;
 pub mod value;

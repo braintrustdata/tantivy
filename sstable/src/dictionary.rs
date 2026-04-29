@@ -5,7 +5,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use tantivy_fst::automaton::AlwaysMatch;
 use tantivy_fst::Automaton;
 
@@ -187,22 +187,32 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
-        let sstable_index_bytes = index_slice.read_bytes()?;
 
         let sstable_index = match version {
             2 => SSTableIndex::V2(
-                crate::sstable_index_v2::SSTableIndex::load(sstable_index_bytes).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                })?,
+                crate::sstable_index_v2::SSTableIndex::load(index_slice.read_bytes()?).map_err(
+                    |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                )?,
             ),
             3 => {
-                let (sstable_index_bytes, mut footerv3_len_bytes) = sstable_index_bytes.rsplit(8);
+                let index_body_len = index_slice.len() - 8;
+                let (index_body_slice, footerv3_len_slice) = index_slice.split(index_body_len);
+                let mut footerv3_len_bytes = footerv3_len_slice.read_bytes()?;
                 let store_offset = u64::deserialize(&mut footerv3_len_bytes)?;
                 if store_offset != 0 {
+                    let store_offset = store_offset as usize;
+                    if store_offset > index_body_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SSTable corruption",
+                        ));
+                    }
+                    let fst_slice = index_body_slice.slice_to(store_offset);
+                    let block_addr_store_slice = index_body_slice.slice_from(store_offset);
                     SSTableIndex::V3(
-                        SSTableIndexV3::load(sstable_index_bytes, store_offset).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption")
-                        })?,
+                        SSTableIndexV3::load_lazy(fst_slice, block_addr_store_slice).map_err(
+                            |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                        )?,
                     )
                 } else {
                     // if store_offset is zero, there is no index, so we build a pseudo-index
@@ -416,7 +426,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
 
-    use common::OwnedBytes;
+    use common::{HasLen, OwnedBytes};
 
     use super::Dictionary;
     use crate::MonotonicU64SSTable;
@@ -425,6 +435,7 @@ mod tests {
     struct PermissionedHandle {
         bytes: OwnedBytes,
         allowed_range: Mutex<Range<usize>>,
+        always_allowed_range: Mutex<Option<Range<usize>>>,
     }
 
     impl PermissionedHandle {
@@ -432,12 +443,17 @@ mod tests {
             let bytes = OwnedBytes::new(bytes);
             PermissionedHandle {
                 allowed_range: Mutex::new(0..bytes.len()),
+                always_allowed_range: Mutex::new(None),
                 bytes,
             }
         }
 
         fn restrict(&self, range: Range<usize>) {
             *self.allowed_range.lock().unwrap() = range;
+        }
+
+        fn allow_index_from(&self, offset: usize) {
+            *self.always_allowed_range.lock().unwrap() = Some(offset..self.bytes.len());
         }
     }
 
@@ -450,7 +466,16 @@ mod tests {
     impl common::file_slice::FileHandle for PermissionedHandle {
         fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
             let allowed_range = self.allowed_range.lock().unwrap();
-            if !allowed_range.contains(&range.start) || !allowed_range.contains(&(range.end - 1)) {
+            let always_allowed_range = self.always_allowed_range.lock().unwrap();
+            let allowed =
+                allowed_range.contains(&range.start) && allowed_range.contains(&(range.end - 1));
+            let always_allowed = always_allowed_range
+                .as_ref()
+                .is_some_and(|always_allowed_range| {
+                    always_allowed_range.contains(&range.start)
+                        && always_allowed_range.contains(&(range.end - 1))
+                });
+            if !allowed && !always_allowed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("invalid range, allowed {allowed_range:?}, requested {range:?}"),
@@ -475,6 +500,7 @@ mod tests {
         let slice = common::file_slice::FileSlice::new(table.clone());
 
         let dictionary = Dictionary::<MonotonicU64SSTable>::open(slice).unwrap();
+        table.allow_index_from(dictionary.sstable_slice.len());
 
         // if the last block is id 0, tests are meaningless
         assert_ne!(dictionary.sstable_index.locate_with_ord(u64::MAX), 0);
@@ -487,7 +513,7 @@ mod tests {
         let (dic, slice) = make_test_sstable();
 
         let block = dic.sstable_index.get_block_with_ord(100_000);
-        slice.restrict(block.byte_range);
+        slice.restrict(block.byte_range.clone());
 
         let mut res = Vec::new();
 
@@ -495,10 +521,12 @@ mod tests {
         assert!(dic.ord_to_term(100_000, &mut res).unwrap());
         assert_eq!(res, format!("{:05X}", 100_000).into_bytes());
         assert_eq!(dic.term_info_from_ord(100_000).unwrap().unwrap(), 100_000);
+        slice.restrict(0..slice.bytes.len());
         assert_eq!(dic.get(&res).unwrap().unwrap(), 100_000);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), 100_000);
 
         // start of a block
+        slice.restrict(block.byte_range.clone());
         assert!(dic.ord_to_term(block.first_ordinal, &mut res).unwrap());
         assert_eq!(res, format!("{:05X}", block.first_ordinal).into_bytes());
         assert_eq!(
@@ -507,6 +535,7 @@ mod tests {
                 .unwrap(),
             block.first_ordinal
         );
+        slice.restrict(0..slice.bytes.len());
         assert_eq!(dic.get(&res).unwrap().unwrap(), block.first_ordinal);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), block.first_ordinal);
 
@@ -517,14 +546,12 @@ mod tests {
         assert!(dic.ord_to_term(ordinal, &mut res).unwrap());
         assert_eq!(res, format!("{ordinal:05X}").into_bytes());
         assert_eq!(dic.term_info_from_ord(ordinal).unwrap().unwrap(), ordinal);
+        slice.restrict(0..slice.bytes.len());
         assert_eq!(dic.get(&res).unwrap().unwrap(), ordinal);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), ordinal);
 
         // before first block
-        // 1st block must be loaded for key-related operations
-        let block = dic.sstable_index.get_block_with_ord(0);
-        slice.restrict(block.byte_range);
-
+        slice.restrict(0..slice.bytes.len());
         assert!(dic.get(b"$$$").unwrap().is_none());
         assert!(dic.term_ord(b"$$$").unwrap().is_none());
 
@@ -536,12 +563,10 @@ mod tests {
         assert!(!dic.ord_to_term(ordinal, &mut res).unwrap());
         assert!(dic.term_info_from_ord(ordinal).unwrap().is_none());
 
-        // last block isn't required to be loaded for key related operations
-        slice.restrict(0..0);
+        slice.restrict(0..slice.bytes.len());
         assert!(dic.get(b"~~~").unwrap().is_none());
         assert!(dic.term_ord(b"~~~").unwrap().is_none());
 
-        slice.restrict(0..slice.bytes.len());
         // between 1000F and 10010, test case where matched prefix > prefix kept
         assert!(dic.term_ord(b"1000G").unwrap().is_none());
         // shorter than 10000, tests prefix case
