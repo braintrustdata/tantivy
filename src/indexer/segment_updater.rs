@@ -579,7 +579,7 @@ impl SegmentUpdater {
                         match after_merge_segment_entry.as_ref() {
                             Some(after_merge_segment_entry) => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: finished merge: target_opstamp={target_opstamp}, output_segment={:?}, num_docs={}, max_doc={}, elapsed={:?}",
+                                    "TANTIVY MERGE THREAD: finished merge execution: target_opstamp={target_opstamp}, output_segment={:?}, num_docs={}, max_doc={}, merge_elapsed={:?}",
                                     after_merge_segment_entry.segment_id(),
                                     after_merge_segment_entry.meta().num_docs(),
                                     after_merge_segment_entry.meta().max_doc(),
@@ -588,13 +588,42 @@ impl SegmentUpdater {
                             }
                             None => {
                                 eprintln!(
-                                    "TANTIVY MERGE THREAD: finished merge with no output segment: target_opstamp={target_opstamp}, elapsed={:?}",
+                                    "TANTIVY MERGE THREAD: finished merge execution with no output segment: target_opstamp={target_opstamp}, merge_elapsed={:?}",
                                     merge_start.elapsed()
                                 );
                             }
                         }
                     }
                     let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
+                    if verbose_merge_threads {
+                        match res.as_ref() {
+                            Ok(Some(segment_meta)) => {
+                                eprintln!(
+                                    "TANTIVY MERGE THREAD: completed merge operation: target_opstamp={target_opstamp}, input_segments={:?}, output_segment={:?}, num_docs={}, max_doc={}, total_elapsed={:?}",
+                                    merge_segment_ids,
+                                    segment_meta.id(),
+                                    segment_meta.num_docs(),
+                                    segment_meta.max_doc(),
+                                    merge_start.elapsed()
+                                );
+                            }
+                            Ok(None) => {
+                                eprintln!(
+                                    "TANTIVY MERGE THREAD: completed merge operation with no output segment: target_opstamp={target_opstamp}, input_segments={:?}, total_elapsed={:?}",
+                                    merge_segment_ids,
+                                    merge_start.elapsed()
+                                );
+                            }
+                            Err(merge_error) => {
+                                eprintln!(
+                                    "TANTIVY MERGE THREAD: merge operation failed after merge execution: target_opstamp={target_opstamp}, input_segments={:?}, total_elapsed={:?}, error={:?}",
+                                    merge_segment_ids,
+                                    merge_start.elapsed(),
+                                    merge_error
+                                );
+                            }
+                        }
+                    }
                     let _send_result = merging_future_send.send(res);
                 }
                 Err(merge_error) => {
