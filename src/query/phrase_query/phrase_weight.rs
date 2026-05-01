@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::{phrase_telemetry, PhraseScorer};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
@@ -9,6 +11,16 @@ use crate::schema::{Field, IndexRecordOption, Term};
 use crate::{DocId, DocSet, Score, TERMINATED};
 
 const PHRASE_PREFLIGHT_MIN_TERMS: usize = 8;
+const ADAPTIVE_LOOKUP_MIN_OBSERVATIONS: u64 = 16;
+const ADAPTIVE_LOOKUP_MIN_MISS_NUMERATOR: u64 = 1;
+const ADAPTIVE_LOOKUP_MIN_MISS_DENOMINATOR: u64 = 2;
+const ATOMIC_ORDERING: Ordering = Ordering::Relaxed;
+
+#[derive(Default)]
+struct PhraseTermLookupStats {
+    lookups: AtomicU64,
+    misses: AtomicU64,
+}
 
 struct PreloadedPhrasePair {
     left_idx: usize,
@@ -25,6 +37,7 @@ enum PhrasePairPreflight {
 
 pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
+    lookup_stats: Vec<PhraseTermLookupStats>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
 }
@@ -37,8 +50,12 @@ impl PhraseWeight {
         similarity_weight_opt: Option<Bm25Weight>,
     ) -> PhraseWeight {
         let slop = 0;
+        let lookup_stats = (0..phrase_terms.len())
+            .map(|_| PhraseTermLookupStats::default())
+            .collect();
         PhraseWeight {
             phrase_terms,
+            lookup_stats,
             similarity_weight_opt,
             slop,
         }
@@ -62,7 +79,15 @@ impl PhraseWeight {
             (0..self.phrase_terms.len()).map(|_| None).collect();
         let mut found_term_infos: Vec<(&Term, Field, TermInfo)> = Vec::new();
         let mut lookup_depth = 0usize;
-        for term_idx in term_info_lookup_order(&self.phrase_terms) {
+        let lookup_order = term_info_lookup_order(&self.phrase_terms, &self.lookup_stats);
+        let static_first_term_idx = static_term_info_lookup_order(&self.phrase_terms)[0];
+        let adaptive_first_lookup = is_adaptive_lookup_term(&self.lookup_stats[lookup_order[0]]);
+        if adaptive_first_lookup {
+            phrase_telemetry::record_adaptive_first_lookup(
+                lookup_order[0] != static_first_term_idx,
+            );
+        }
+        for term_idx in lookup_order {
             let (offset, term) = &self.phrase_terms[term_idx];
             if let Some((_, field, term_info)) = found_term_infos
                 .iter()
@@ -76,8 +101,17 @@ impl PhraseWeight {
             let inverted_index = reader.inverted_index(field)?;
             let term_info = inverted_index.get_term_info(term)?;
             lookup_depth += 1;
+            self.lookup_stats[term_idx]
+                .lookups
+                .fetch_add(1, ATOMIC_ORDERING);
             phrase_telemetry::record_term_info_lookup(term_info.is_some());
             let Some(term_info) = term_info else {
+                self.lookup_stats[term_idx]
+                    .misses
+                    .fetch_add(1, ATOMIC_ORDERING);
+                if adaptive_first_lookup && lookup_depth == 1 {
+                    phrase_telemetry::record_adaptive_first_lookup_miss();
+                }
                 phrase_telemetry::record_missing_term(lookup_depth);
                 return Ok(None);
             };
@@ -212,7 +246,7 @@ impl PhraseWeight {
     }
 }
 
-fn term_info_lookup_order(phrase_terms: &[(usize, Term)]) -> Vec<usize> {
+fn static_term_info_lookup_order(phrase_terms: &[(usize, Term)]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..phrase_terms.len()).collect();
     order.sort_by(|&left_idx, &right_idx| {
         let left_term = &phrase_terms[left_idx].1;
@@ -224,6 +258,50 @@ fn term_info_lookup_order(phrase_terms: &[(usize, Term)]) -> Vec<usize> {
             .then_with(|| left_idx.cmp(&right_idx))
     });
     order
+}
+
+fn term_info_lookup_order(
+    phrase_terms: &[(usize, Term)],
+    lookup_stats: &[PhraseTermLookupStats],
+) -> Vec<usize> {
+    let mut order = static_term_info_lookup_order(phrase_terms);
+    order.sort_by(|&left_idx, &right_idx| {
+        let left_priority =
+            adaptive_lookup_priority(&phrase_terms[left_idx].1, &lookup_stats[left_idx]);
+        let right_priority =
+            adaptive_lookup_priority(&phrase_terms[right_idx].1, &lookup_stats[right_idx]);
+        right_priority
+            .cmp(&left_priority)
+            .then_with(|| left_idx.cmp(&right_idx))
+    });
+    order
+}
+
+fn adaptive_lookup_priority(term: &Term, stats: &PhraseTermLookupStats) -> (u8, u128, usize) {
+    let lookups = stats.lookups.load(ATOMIC_ORDERING);
+    let misses = stats.misses.load(ATOMIC_ORDERING);
+    let term_len = term.serialized_value_bytes().len();
+    if is_adaptive_lookup_term_from_counts(lookups, misses) {
+        return (
+            1,
+            (misses as u128) * 1_000_000u128 / (lookups as u128),
+            term_len,
+        );
+    }
+    (0, term_len as u128, term_len)
+}
+
+fn is_adaptive_lookup_term(stats: &PhraseTermLookupStats) -> bool {
+    is_adaptive_lookup_term_from_counts(
+        stats.lookups.load(ATOMIC_ORDERING),
+        stats.misses.load(ATOMIC_ORDERING),
+    )
+}
+
+fn is_adaptive_lookup_term_from_counts(lookups: u64, misses: u64) -> bool {
+    lookups >= ADAPTIVE_LOOKUP_MIN_OBSERVATIONS
+        && misses.saturating_mul(ADAPTIVE_LOOKUP_MIN_MISS_DENOMINATOR)
+            >= lookups.saturating_mul(ADAPTIVE_LOOKUP_MIN_MISS_NUMERATOR)
 }
 
 fn select_cheapest_phrase_pair(term_infos: &[(usize, Field, TermInfo)]) -> Option<(usize, usize)> {
