@@ -6,6 +6,11 @@ static SCORER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static SCORER_TERMS: AtomicU64 = AtomicU64::new(0);
 static TERM_INFO_LOOKUPS: AtomicU64 = AtomicU64::new(0);
 static TERM_INFO_FOUND: AtomicU64 = AtomicU64::new(0);
+static TERM_INFO_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static TERM_INFO_MISSING_LOOKUP_DEPTH: AtomicU64 = AtomicU64::new(0);
+static TERM_INFO_MISSING_FIRST_LOOKUP: AtomicU64 = AtomicU64::new(0);
+static TERM_INFO_MISSING_SECOND_LOOKUP: AtomicU64 = AtomicU64::new(0);
+static TERM_INFO_MISSING_LATER_LOOKUP: AtomicU64 = AtomicU64::new(0);
 static MISSING_TERMS: AtomicU64 = AtomicU64::new(0);
 static PREFLIGHT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static PREFLIGHT_TERMS: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +38,16 @@ pub struct PhraseQueryTelemetrySnapshot {
     pub term_info_lookups: u64,
     /// Number of term dictionary lookups that found a term.
     pub term_info_found: u64,
+    /// Number of repeated phrase terms served from the phrase initialization cache.
+    pub term_info_cache_hits: u64,
+    /// Sum of dictionary lookup depths at which phrase scorer attempts found a missing term.
+    pub term_info_missing_lookup_depth: u64,
+    /// Number of phrase scorer attempts that missed on the first dictionary lookup.
+    pub term_info_missing_first_lookup: u64,
+    /// Number of phrase scorer attempts that missed on the second dictionary lookup.
+    pub term_info_missing_second_lookup: u64,
+    /// Number of phrase scorer attempts that missed after the second dictionary lookup.
+    pub term_info_missing_later_lookup: u64,
     /// Number of phrase scorer attempts that found at least one missing term.
     pub missing_terms: u64,
     /// Number of long phrase preflight checks.
@@ -75,6 +90,21 @@ impl PhraseQueryTelemetrySnapshot {
                 .term_info_lookups
                 .saturating_sub(before.term_info_lookups),
             term_info_found: self.term_info_found.saturating_sub(before.term_info_found),
+            term_info_cache_hits: self
+                .term_info_cache_hits
+                .saturating_sub(before.term_info_cache_hits),
+            term_info_missing_lookup_depth: self
+                .term_info_missing_lookup_depth
+                .saturating_sub(before.term_info_missing_lookup_depth),
+            term_info_missing_first_lookup: self
+                .term_info_missing_first_lookup
+                .saturating_sub(before.term_info_missing_first_lookup),
+            term_info_missing_second_lookup: self
+                .term_info_missing_second_lookup
+                .saturating_sub(before.term_info_missing_second_lookup),
+            term_info_missing_later_lookup: self
+                .term_info_missing_later_lookup
+                .saturating_sub(before.term_info_missing_later_lookup),
             missing_terms: self.missing_terms.saturating_sub(before.missing_terms),
             preflight_attempts: self
                 .preflight_attempts
@@ -126,6 +156,11 @@ pub fn phrase_query_telemetry_snapshot() -> PhraseQueryTelemetrySnapshot {
         scorer_terms: SCORER_TERMS.load(ORDERING),
         term_info_lookups: TERM_INFO_LOOKUPS.load(ORDERING),
         term_info_found: TERM_INFO_FOUND.load(ORDERING),
+        term_info_cache_hits: TERM_INFO_CACHE_HITS.load(ORDERING),
+        term_info_missing_lookup_depth: TERM_INFO_MISSING_LOOKUP_DEPTH.load(ORDERING),
+        term_info_missing_first_lookup: TERM_INFO_MISSING_FIRST_LOOKUP.load(ORDERING),
+        term_info_missing_second_lookup: TERM_INFO_MISSING_SECOND_LOOKUP.load(ORDERING),
+        term_info_missing_later_lookup: TERM_INFO_MISSING_LATER_LOOKUP.load(ORDERING),
         missing_terms: MISSING_TERMS.load(ORDERING),
         preflight_attempts: PREFLIGHT_ATTEMPTS.load(ORDERING),
         preflight_terms: PREFLIGHT_TERMS.load(ORDERING),
@@ -156,8 +191,24 @@ pub(crate) fn record_term_info_lookup(found: bool) {
     }
 }
 
-pub(crate) fn record_missing_term() {
+pub(crate) fn record_term_info_cache_hit() {
+    TERM_INFO_CACHE_HITS.fetch_add(1, ORDERING);
+}
+
+pub(crate) fn record_missing_term(lookup_depth: usize) {
     MISSING_TERMS.fetch_add(1, ORDERING);
+    TERM_INFO_MISSING_LOOKUP_DEPTH.fetch_add(lookup_depth as u64, ORDERING);
+    match lookup_depth {
+        0 | 1 => {
+            TERM_INFO_MISSING_FIRST_LOOKUP.fetch_add(1, ORDERING);
+        }
+        2 => {
+            TERM_INFO_MISSING_SECOND_LOOKUP.fetch_add(1, ORDERING);
+        }
+        _ => {
+            TERM_INFO_MISSING_LATER_LOOKUP.fetch_add(1, ORDERING);
+        }
+    }
 }
 
 pub(crate) fn record_pair_preflight_attempt() {

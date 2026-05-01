@@ -58,19 +58,38 @@ impl PhraseWeight {
         &self,
         reader: &SegmentReader,
     ) -> crate::Result<Option<Vec<(usize, Field, TermInfo)>>> {
-        let mut term_infos = Vec::with_capacity(self.phrase_terms.len());
-        for &(offset, ref term) in &self.phrase_terms {
+        let mut term_infos_by_position: Vec<Option<(usize, Field, TermInfo)>> =
+            (0..self.phrase_terms.len()).map(|_| None).collect();
+        let mut found_term_infos: Vec<(&Term, Field, TermInfo)> = Vec::new();
+        let mut lookup_depth = 0usize;
+        for term_idx in term_info_lookup_order(&self.phrase_terms) {
+            let (offset, term) = &self.phrase_terms[term_idx];
+            if let Some((_, field, term_info)) = found_term_infos
+                .iter()
+                .find(|(found_term, _, _)| *found_term == term)
+            {
+                phrase_telemetry::record_term_info_cache_hit();
+                term_infos_by_position[term_idx] = Some((*offset, *field, term_info.clone()));
+                continue;
+            }
             let field = term.field();
             let inverted_index = reader.inverted_index(field)?;
             let term_info = inverted_index.get_term_info(term)?;
+            lookup_depth += 1;
             phrase_telemetry::record_term_info_lookup(term_info.is_some());
             let Some(term_info) = term_info else {
-                phrase_telemetry::record_missing_term();
+                phrase_telemetry::record_missing_term(lookup_depth);
                 return Ok(None);
             };
-            term_infos.push((offset, field, term_info));
+            found_term_infos.push((term, field, term_info.clone()));
+            term_infos_by_position[term_idx] = Some((*offset, field, term_info));
         }
-        Ok(Some(term_infos))
+        Ok(Some(
+            term_infos_by_position
+                .into_iter()
+                .map(|term_info| term_info.expect("term info populated for every phrase term"))
+                .collect(),
+        ))
     }
 
     fn phrase_pair_preflight(
@@ -191,6 +210,20 @@ impl PhraseWeight {
     pub fn slop(&mut self, slop: u32) {
         self.slop = slop;
     }
+}
+
+fn term_info_lookup_order(phrase_terms: &[(usize, Term)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..phrase_terms.len()).collect();
+    order.sort_by(|&left_idx, &right_idx| {
+        let left_term = &phrase_terms[left_idx].1;
+        let right_term = &phrase_terms[right_idx].1;
+        right_term
+            .serialized_value_bytes()
+            .len()
+            .cmp(&left_term.serialized_value_bytes().len())
+            .then_with(|| left_idx.cmp(&right_idx))
+    });
+    order
 }
 
 fn select_cheapest_phrase_pair(term_infos: &[(usize, Field, TermInfo)]) -> Option<(usize, usize)> {
