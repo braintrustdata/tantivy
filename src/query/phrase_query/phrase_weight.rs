@@ -1,12 +1,14 @@
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
-use crate::postings::SegmentPostings;
+use crate::postings::{SegmentPostings, TermInfo};
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
-use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
-use crate::schema::{IndexRecordOption, Term};
-use crate::{DocId, DocSet, Score};
+use crate::query::{EmptyScorer, Explanation, Intersection, Scorer, Weight};
+use crate::schema::{Field, IndexRecordOption, Term};
+use crate::{DocId, DocSet, Score, TERMINATED};
+
+const PHRASE_PREFLIGHT_MIN_TERMS: usize = 8;
 
 pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
@@ -39,6 +41,42 @@ impl PhraseWeight {
         Ok(FieldNormReader::constant(reader.max_doc(), 1))
     }
 
+    fn term_infos(
+        &self,
+        reader: &SegmentReader,
+    ) -> crate::Result<Option<Vec<(usize, Field, TermInfo)>>> {
+        let mut term_infos = Vec::with_capacity(self.phrase_terms.len());
+        for &(offset, ref term) in &self.phrase_terms {
+            let field = term.field();
+            let inverted_index = reader.inverted_index(field)?;
+            let Some(term_info) = inverted_index.get_term_info(term)? else {
+                return Ok(None);
+            };
+            term_infos.push((offset, field, term_info));
+        }
+        Ok(Some(term_infos))
+    }
+
+    fn has_candidate_doc(
+        &self,
+        reader: &SegmentReader,
+        term_infos: &[(usize, Field, TermInfo)],
+    ) -> crate::Result<bool> {
+        if term_infos.len() < PHRASE_PREFLIGHT_MIN_TERMS {
+            return Ok(true);
+        }
+
+        let mut postings = Vec::with_capacity(term_infos.len());
+        for (_, field, term_info) in term_infos {
+            let inverted_index = reader.inverted_index(*field)?;
+            postings.push(
+                inverted_index.read_postings_from_terminfo(term_info, IndexRecordOption::Basic)?,
+            );
+        }
+
+        Ok(Intersection::new(postings).doc() != TERMINATED)
+    }
+
     pub(crate) fn phrase_scorer(
         &self,
         reader: &SegmentReader,
@@ -49,29 +87,22 @@ impl PhraseWeight {
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
+        let Some(term_infos) = self.term_infos(reader)? else {
+            return Ok(None);
+        };
+        if !self.has_candidate_doc(reader, &term_infos)? {
+            return Ok(None);
+        }
+
         let mut term_postings_list = Vec::new();
-        if reader.has_deletes() {
-            for &(offset, ref term) in &self.phrase_terms {
-                if let Some(postings) = reader
-                    .inverted_index(term.field())?
-                    .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
-                {
-                    term_postings_list.push((offset, postings));
-                } else {
-                    return Ok(None);
-                }
-            }
-        } else {
-            for &(offset, ref term) in &self.phrase_terms {
-                if let Some(postings) = reader
-                    .inverted_index(term.field())?
-                    .read_postings_no_deletes(term, IndexRecordOption::WithFreqsAndPositions)?
-                {
-                    term_postings_list.push((offset, postings));
-                } else {
-                    return Ok(None);
-                }
-            }
+        for (offset, field, term_info) in term_infos {
+            let postings = reader
+                .inverted_index(field)?
+                .read_postings_from_terminfo(
+                    &term_info,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?;
+            term_postings_list.push((offset, postings));
         }
         Ok(Some(PhraseScorer::new(
             term_postings_list,
@@ -142,6 +173,59 @@ mod tests {
         assert_eq!(phrase_scorer.advance(), 2);
         assert_eq!(phrase_scorer.doc(), 2);
         assert_eq!(phrase_scorer.phrase_count(), 1);
+        assert_eq!(phrase_scorer.advance(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_long_phrase_without_candidate_doc() -> crate::Result<()> {
+        let index = create_index(&[
+            "alpha bravo charlie delta",
+            "echo foxtrot golf hotel",
+        ])?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let phrase_query = PhraseQuery::new(
+            [
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            ]
+            .iter()
+            .map(|text| Term::from_field_text(text_field, text))
+            .collect(),
+        );
+        let enable_scoring = EnableScoring::disabled_from_schema(searcher.schema());
+        let phrase_weight = phrase_query.phrase_weight(enable_scoring).unwrap();
+        assert!(phrase_weight
+            .phrase_scorer(searcher.segment_reader(0u32), 1.0)?
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_long_phrase_with_candidate_doc() -> crate::Result<()> {
+        let index = create_index(&[
+            "alpha bravo charlie delta echo foxtrot golf hotel",
+            "alpha bravo charlie delta",
+            "echo foxtrot golf hotel",
+        ])?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let phrase_query = PhraseQuery::new(
+            [
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            ]
+            .iter()
+            .map(|text| Term::from_field_text(text_field, text))
+            .collect(),
+        );
+        let enable_scoring = EnableScoring::disabled_from_schema(searcher.schema());
+        let phrase_weight = phrase_query.phrase_weight(enable_scoring).unwrap();
+        let mut phrase_scorer = phrase_weight
+            .phrase_scorer(searcher.segment_reader(0u32), 1.0)?
+            .unwrap();
+        assert_eq!(phrase_scorer.doc(), 0);
         assert_eq!(phrase_scorer.advance(), TERMINATED);
         Ok(())
     }
