@@ -1,14 +1,27 @@
 use super::{phrase_telemetry, PhraseScorer};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
-use crate::postings::{SegmentPostings, TermInfo};
+use crate::postings::{Postings, SegmentPostings, TermInfo};
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
-use crate::query::{EmptyScorer, Explanation, Intersection, Scorer, Weight};
+use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::{DocId, DocSet, Score, TERMINATED};
 
 const PHRASE_PREFLIGHT_MIN_TERMS: usize = 8;
+
+struct PreloadedPhrasePair {
+    left_idx: usize,
+    right_idx: usize,
+    left_postings: Option<SegmentPostings>,
+    right_postings: Option<SegmentPostings>,
+}
+
+enum PhrasePairPreflight {
+    Skipped,
+    NoCandidate,
+    Candidate(PreloadedPhrasePair),
+}
 
 pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
@@ -49,7 +62,9 @@ impl PhraseWeight {
         for &(offset, ref term) in &self.phrase_terms {
             let field = term.field();
             let inverted_index = reader.inverted_index(field)?;
-            let Some(term_info) = inverted_index.get_term_info(term)? else {
+            let term_info = inverted_index.get_term_info(term)?;
+            phrase_telemetry::record_term_info_lookup(term_info.is_some());
+            let Some(term_info) = term_info else {
                 phrase_telemetry::record_missing_term();
                 return Ok(None);
             };
@@ -58,31 +73,56 @@ impl PhraseWeight {
         Ok(Some(term_infos))
     }
 
-    fn has_candidate_doc(
+    fn phrase_pair_preflight(
         &self,
         reader: &SegmentReader,
         term_infos: &[(usize, Field, TermInfo)],
-    ) -> crate::Result<bool> {
-        if term_infos.len() < PHRASE_PREFLIGHT_MIN_TERMS {
-            return Ok(true);
-        }
-        phrase_telemetry::record_preflight_attempt(term_infos.len());
-
-        let mut postings = Vec::with_capacity(term_infos.len());
-        for (_, field, term_info) in term_infos {
-            let inverted_index = reader.inverted_index(*field)?;
-            postings.push(
-                inverted_index.read_postings_from_terminfo(term_info, IndexRecordOption::Basic)?,
-            );
+    ) -> crate::Result<PhrasePairPreflight> {
+        if self.slop != 0 || term_infos.len() < PHRASE_PREFLIGHT_MIN_TERMS {
+            return Ok(PhrasePairPreflight::Skipped);
         }
 
-        let has_candidate = Intersection::new(postings).doc() != TERMINATED;
+        let Some((left_idx, right_idx)) = select_cheapest_phrase_pair(term_infos) else {
+            return Ok(PhrasePairPreflight::Skipped);
+        };
+        phrase_telemetry::record_pair_preflight_attempt();
+
+        let (left_offset, left_field, left_term_info) = &term_infos[left_idx];
+        let (right_offset, right_field, right_term_info) = &term_infos[right_idx];
+        let left_inverted_index = reader.inverted_index(*left_field)?;
+        let right_inverted_index = reader.inverted_index(*right_field)?;
+        phrase_telemetry::record_pair_preflight_positions_load(
+            left_term_info.postings_range.len() + right_term_info.postings_range.len(),
+            left_term_info.positions_range.len() + right_term_info.positions_range.len(),
+        );
+        let left_postings = left_inverted_index.read_postings_from_terminfo(
+            left_term_info,
+            IndexRecordOption::WithFreqsAndPositions,
+        )?;
+        let right_postings = right_inverted_index.read_postings_from_terminfo(
+            right_term_info,
+            IndexRecordOption::WithFreqsAndPositions,
+        )?;
+        let left_postings_for_scorer = left_postings.clone();
+        let right_postings_for_scorer = right_postings.clone();
+        let has_candidate = phrase_pair_has_candidate(
+            left_postings,
+            right_postings,
+            *left_offset as u32,
+            *right_offset as u32,
+        );
         if has_candidate {
-            phrase_telemetry::record_preflight_candidate_found();
+            phrase_telemetry::record_pair_preflight_candidate_found();
+            Ok(PhrasePairPreflight::Candidate(PreloadedPhrasePair {
+                left_idx,
+                right_idx,
+                left_postings: Some(left_postings_for_scorer),
+                right_postings: Some(right_postings_for_scorer),
+            }))
         } else {
-            phrase_telemetry::record_preflight_no_candidate();
+            phrase_telemetry::record_pair_preflight_no_candidate();
+            Ok(PhrasePairPreflight::NoCandidate)
         }
-        Ok(has_candidate)
     }
 
     pub(crate) fn phrase_scorer(
@@ -99,30 +139,125 @@ impl PhraseWeight {
         let Some(term_infos) = self.term_infos(reader)? else {
             return Ok(None);
         };
-        if !self.has_candidate_doc(reader, &term_infos)? {
-            return Ok(None);
-        }
+        let mut preloaded_pair = match self.phrase_pair_preflight(reader, &term_infos)? {
+            PhrasePairPreflight::Skipped => None,
+            PhrasePairPreflight::NoCandidate => return Ok(None),
+            PhrasePairPreflight::Candidate(preloaded_pair) => Some(preloaded_pair),
+        };
 
         let mut term_postings_list = Vec::new();
-        phrase_telemetry::record_positions_load(term_infos.len());
-        for (offset, field, term_info) in term_infos {
-            let postings = reader.inverted_index(field)?.read_postings_from_terminfo(
-                &term_info,
-                IndexRecordOption::WithFreqsAndPositions,
-            )?;
+        let mut loaded_terms = 0usize;
+        let mut loaded_postings_bytes = 0usize;
+        let mut loaded_positions_bytes = 0usize;
+        for (idx, (offset, field, term_info)) in term_infos.into_iter().enumerate() {
+            let postings = match preloaded_pair.as_mut() {
+                Some(pair) if idx == pair.left_idx => {
+                    pair.left_postings.take().expect("left postings preloaded")
+                }
+                Some(pair) if idx == pair.right_idx => pair
+                    .right_postings
+                    .take()
+                    .expect("right postings preloaded"),
+                _ => {
+                    loaded_terms += 1;
+                    loaded_postings_bytes += term_info.postings_range.len();
+                    loaded_positions_bytes += term_info.positions_range.len();
+                    reader.inverted_index(field)?.read_postings_from_terminfo(
+                        &term_info,
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )?
+                }
+            };
             term_postings_list.push((offset, postings));
         }
-        Ok(Some(PhraseScorer::new(
+        phrase_telemetry::record_positions_load(
+            loaded_terms,
+            loaded_postings_bytes,
+            loaded_positions_bytes,
+        );
+        let phrase_scorer = PhraseScorer::new(
             term_postings_list,
             similarity_weight_opt,
             fieldnorm_reader,
             self.slop,
-        )))
+        );
+        if phrase_scorer.doc() == TERMINATED {
+            Ok(None)
+        } else {
+            Ok(Some(phrase_scorer))
+        }
     }
 
     pub fn slop(&mut self, slop: u32) {
         self.slop = slop;
     }
+}
+
+fn select_cheapest_phrase_pair(term_infos: &[(usize, Field, TermInfo)]) -> Option<(usize, usize)> {
+    let mut best_pair = None;
+    let mut best_cost = usize::MAX;
+    for left_idx in 0..term_infos.len() {
+        for right_idx in left_idx + 1..term_infos.len() {
+            let left_info = &term_infos[left_idx].2;
+            let right_info = &term_infos[right_idx].2;
+            let cost = left_info.positions_range.len()
+                + right_info.positions_range.len()
+                + left_info.postings_range.len()
+                + right_info.postings_range.len();
+            if cost < best_cost {
+                best_cost = cost;
+                best_pair = Some((left_idx, right_idx));
+            }
+        }
+    }
+    best_pair
+}
+
+fn phrase_pair_has_candidate(
+    mut left: SegmentPostings,
+    mut right: SegmentPostings,
+    left_offset: u32,
+    right_offset: u32,
+) -> bool {
+    let max_offset = left_offset.max(right_offset);
+    let left_position_offset = max_offset - left_offset;
+    let right_position_offset = max_offset - right_offset;
+    let mut left_positions = Vec::new();
+    let mut right_positions = Vec::new();
+    let mut candidate = left.doc().max(right.doc());
+    loop {
+        if candidate == TERMINATED {
+            return false;
+        }
+        let left_doc = left.seek(candidate);
+        let right_doc = right.seek(candidate);
+        if left_doc == TERMINATED || right_doc == TERMINATED {
+            return false;
+        }
+        if left_doc == right_doc {
+            left.positions_with_offset(left_position_offset, &mut left_positions);
+            right.positions_with_offset(right_position_offset, &mut right_positions);
+            if positions_intersect(&left_positions, &right_positions) {
+                return true;
+            }
+            candidate = left.advance().max(right.doc());
+        } else {
+            candidate = left_doc.max(right_doc);
+        }
+    }
+}
+
+fn positions_intersect(left: &[u32], right: &[u32]) -> bool {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Greater => right_index += 1,
+        }
+    }
+    false
 }
 
 impl Weight for PhraseWeight {
