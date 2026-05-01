@@ -1,4 +1,4 @@
-use super::PhraseScorer;
+use super::{phrase_telemetry, PhraseScorer};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
 use crate::postings::{SegmentPostings, TermInfo};
@@ -50,6 +50,7 @@ impl PhraseWeight {
             let field = term.field();
             let inverted_index = reader.inverted_index(field)?;
             let Some(term_info) = inverted_index.get_term_info(term)? else {
+                phrase_telemetry::record_missing_term();
                 return Ok(None);
             };
             term_infos.push((offset, field, term_info));
@@ -65,6 +66,7 @@ impl PhraseWeight {
         if term_infos.len() < PHRASE_PREFLIGHT_MIN_TERMS {
             return Ok(true);
         }
+        phrase_telemetry::record_preflight_attempt(term_infos.len());
 
         let mut postings = Vec::with_capacity(term_infos.len());
         for (_, field, term_info) in term_infos {
@@ -74,7 +76,13 @@ impl PhraseWeight {
             );
         }
 
-        Ok(Intersection::new(postings).doc() != TERMINATED)
+        let has_candidate = Intersection::new(postings).doc() != TERMINATED;
+        if has_candidate {
+            phrase_telemetry::record_preflight_candidate_found();
+        } else {
+            phrase_telemetry::record_preflight_no_candidate();
+        }
+        Ok(has_candidate)
     }
 
     pub(crate) fn phrase_scorer(
@@ -82,6 +90,7 @@ impl PhraseWeight {
         reader: &SegmentReader,
         boost: Score,
     ) -> crate::Result<Option<PhraseScorer<SegmentPostings>>> {
+        phrase_telemetry::record_scorer_attempt(self.phrase_terms.len());
         let similarity_weight_opt = self
             .similarity_weight_opt
             .as_ref()
@@ -95,13 +104,12 @@ impl PhraseWeight {
         }
 
         let mut term_postings_list = Vec::new();
+        phrase_telemetry::record_positions_load(term_infos.len());
         for (offset, field, term_info) in term_infos {
-            let postings = reader
-                .inverted_index(field)?
-                .read_postings_from_terminfo(
-                    &term_info,
-                    IndexRecordOption::WithFreqsAndPositions,
-                )?;
+            let postings = reader.inverted_index(field)?.read_postings_from_terminfo(
+                &term_info,
+                IndexRecordOption::WithFreqsAndPositions,
+            )?;
             term_postings_list.push((offset, postings));
         }
         Ok(Some(PhraseScorer::new(
@@ -179,10 +187,7 @@ mod tests {
 
     #[test]
     pub fn test_long_phrase_without_candidate_doc() -> crate::Result<()> {
-        let index = create_index(&[
-            "alpha bravo charlie delta",
-            "echo foxtrot golf hotel",
-        ])?;
+        let index = create_index(&["alpha bravo charlie delta", "echo foxtrot golf hotel"])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
         let searcher = index.reader()?.searcher();

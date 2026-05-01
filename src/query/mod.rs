@@ -50,7 +50,9 @@ pub use self::fuzzy_query::FuzzyTermQuery;
 pub use self::intersection::{intersect_scorers, Intersection};
 pub use self::more_like_this::{MoreLikeThisQuery, MoreLikeThisQueryBuilder};
 pub use self::phrase_prefix_query::PhrasePrefixQuery;
-pub use self::phrase_query::PhraseQuery;
+pub use self::phrase_query::{
+    phrase_query_telemetry_snapshot, PhraseQuery, PhraseQueryTelemetrySnapshot,
+};
 pub use self::query::{EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
 pub use self::range_query::{FastFieldRangeWeight, IPFastFieldRangeWeight, RangeQuery};
