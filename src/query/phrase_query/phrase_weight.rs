@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{phrase_telemetry, PhraseScorer};
+use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
 use crate::postings::{Postings, SegmentPostings, TermInfo};
@@ -78,41 +78,26 @@ impl PhraseWeight {
         let mut term_infos_by_position: Vec<Option<(usize, Field, TermInfo)>> =
             (0..self.phrase_terms.len()).map(|_| None).collect();
         let mut found_term_infos: Vec<(&Term, Field, TermInfo)> = Vec::new();
-        let mut lookup_depth = 0usize;
         let lookup_order = term_info_lookup_order(&self.phrase_terms, &self.lookup_stats);
-        let static_first_term_idx = static_term_info_lookup_order(&self.phrase_terms)[0];
-        let adaptive_first_lookup = is_adaptive_lookup_term(&self.lookup_stats[lookup_order[0]]);
-        if adaptive_first_lookup {
-            phrase_telemetry::record_adaptive_first_lookup(
-                lookup_order[0] != static_first_term_idx,
-            );
-        }
         for term_idx in lookup_order {
             let (offset, term) = &self.phrase_terms[term_idx];
             if let Some((_, field, term_info)) = found_term_infos
                 .iter()
                 .find(|(found_term, _, _)| *found_term == term)
             {
-                phrase_telemetry::record_term_info_cache_hit();
                 term_infos_by_position[term_idx] = Some((*offset, *field, term_info.clone()));
                 continue;
             }
             let field = term.field();
             let inverted_index = reader.inverted_index(field)?;
             let term_info = inverted_index.get_term_info(term)?;
-            lookup_depth += 1;
             self.lookup_stats[term_idx]
                 .lookups
                 .fetch_add(1, ATOMIC_ORDERING);
-            phrase_telemetry::record_term_info_lookup(term_info.is_some());
             let Some(term_info) = term_info else {
                 self.lookup_stats[term_idx]
                     .misses
                     .fetch_add(1, ATOMIC_ORDERING);
-                if adaptive_first_lookup && lookup_depth == 1 {
-                    phrase_telemetry::record_adaptive_first_lookup_miss();
-                }
-                phrase_telemetry::record_missing_term(lookup_depth);
                 return Ok(None);
             };
             found_term_infos.push((term, field, term_info.clone()));
@@ -138,16 +123,11 @@ impl PhraseWeight {
         let Some((left_idx, right_idx)) = select_cheapest_phrase_pair(term_infos) else {
             return Ok(PhrasePairPreflight::Skipped);
         };
-        phrase_telemetry::record_pair_preflight_attempt();
 
         let (left_offset, left_field, left_term_info) = &term_infos[left_idx];
         let (right_offset, right_field, right_term_info) = &term_infos[right_idx];
         let left_inverted_index = reader.inverted_index(*left_field)?;
         let right_inverted_index = reader.inverted_index(*right_field)?;
-        phrase_telemetry::record_pair_preflight_positions_load(
-            left_term_info.postings_range.len() + right_term_info.postings_range.len(),
-            left_term_info.positions_range.len() + right_term_info.positions_range.len(),
-        );
         let left_postings = left_inverted_index.read_postings_from_terminfo(
             left_term_info,
             IndexRecordOption::WithFreqsAndPositions,
@@ -165,7 +145,6 @@ impl PhraseWeight {
             *right_offset as u32,
         );
         if has_candidate {
-            phrase_telemetry::record_pair_preflight_candidate_found();
             Ok(PhrasePairPreflight::Candidate(PreloadedPhrasePair {
                 left_idx,
                 right_idx,
@@ -173,7 +152,6 @@ impl PhraseWeight {
                 right_postings: Some(right_postings_for_scorer),
             }))
         } else {
-            phrase_telemetry::record_pair_preflight_no_candidate();
             Ok(PhrasePairPreflight::NoCandidate)
         }
     }
@@ -183,7 +161,6 @@ impl PhraseWeight {
         reader: &SegmentReader,
         boost: Score,
     ) -> crate::Result<Option<PhraseScorer<SegmentPostings>>> {
-        phrase_telemetry::record_scorer_attempt(self.phrase_terms.len());
         let similarity_weight_opt = self
             .similarity_weight_opt
             .as_ref()
@@ -199,9 +176,6 @@ impl PhraseWeight {
         };
 
         let mut term_postings_list = Vec::new();
-        let mut loaded_terms = 0usize;
-        let mut loaded_postings_bytes = 0usize;
-        let mut loaded_positions_bytes = 0usize;
         for (idx, (offset, field, term_info)) in term_infos.into_iter().enumerate() {
             let postings = match preloaded_pair.as_mut() {
                 Some(pair) if idx == pair.left_idx => {
@@ -211,23 +185,13 @@ impl PhraseWeight {
                     .right_postings
                     .take()
                     .expect("right postings preloaded"),
-                _ => {
-                    loaded_terms += 1;
-                    loaded_postings_bytes += term_info.postings_range.len();
-                    loaded_positions_bytes += term_info.positions_range.len();
-                    reader.inverted_index(field)?.read_postings_from_terminfo(
-                        &term_info,
-                        IndexRecordOption::WithFreqsAndPositions,
-                    )?
-                }
+                _ => reader.inverted_index(field)?.read_postings_from_terminfo(
+                    &term_info,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?,
             };
             term_postings_list.push((offset, postings));
         }
-        phrase_telemetry::record_positions_load(
-            loaded_terms,
-            loaded_postings_bytes,
-            loaded_positions_bytes,
-        );
         let phrase_scorer = PhraseScorer::new(
             term_postings_list,
             similarity_weight_opt,
@@ -289,13 +253,6 @@ fn adaptive_lookup_priority(term: &Term, stats: &PhraseTermLookupStats) -> (u8, 
         );
     }
     (0, term_len as u128, term_len)
-}
-
-fn is_adaptive_lookup_term(stats: &PhraseTermLookupStats) -> bool {
-    is_adaptive_lookup_term_from_counts(
-        stats.lookups.load(ATOMIC_ORDERING),
-        stats.misses.load(ATOMIC_ORDERING),
-    )
 }
 
 fn is_adaptive_lookup_term_from_counts(lookups: u64, misses: u64) -> bool {

@@ -1,12 +1,10 @@
 mod phrase_query;
 mod phrase_scorer;
-mod phrase_telemetry;
 mod phrase_weight;
 
 pub use self::phrase_query::PhraseQuery;
 pub(crate) use self::phrase_scorer::intersection_count;
 pub use self::phrase_scorer::PhraseScorer;
-pub use self::phrase_telemetry::{phrase_query_telemetry_snapshot, PhraseQueryTelemetrySnapshot};
 pub use self::phrase_weight::PhraseWeight;
 
 #[cfg(test)]
