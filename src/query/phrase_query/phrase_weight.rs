@@ -10,7 +10,7 @@ use crate::query::{EmptyScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::{DocId, DocSet, Score, TERMINATED};
 
-const PHRASE_PREFLIGHT_MIN_TERMS: usize = 8;
+const DEFAULT_PREFLIGHT_MIN_TERMS: usize = 8;
 const ADAPTIVE_LOOKUP_MIN_OBSERVATIONS: u64 = 16;
 const ADAPTIVE_LOOKUP_MIN_MISS_NUMERATOR: u64 = 1;
 const ADAPTIVE_LOOKUP_MIN_MISS_DENOMINATOR: u64 = 2;
@@ -40,6 +40,7 @@ pub struct PhraseWeight {
     lookup_stats: Vec<PhraseTermLookupStats>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
+    preflight_min_terms: usize,
 }
 
 impl PhraseWeight {
@@ -58,6 +59,7 @@ impl PhraseWeight {
             lookup_stats,
             similarity_weight_opt,
             slop,
+            preflight_min_terms: DEFAULT_PREFLIGHT_MIN_TERMS,
         }
     }
 
@@ -116,7 +118,7 @@ impl PhraseWeight {
         reader: &SegmentReader,
         term_infos: &[(usize, Field, TermInfo)],
     ) -> crate::Result<PhrasePairPreflight> {
-        if self.slop != 0 || term_infos.len() < PHRASE_PREFLIGHT_MIN_TERMS {
+        if self.slop != 0 || term_infos.len() < self.preflight_min_terms {
             return Ok(PhrasePairPreflight::Skipped);
         }
 
@@ -207,6 +209,13 @@ impl PhraseWeight {
 
     pub fn slop(&mut self, slop: u32) {
         self.slop = slop;
+    }
+
+    /// Sets the minimum phrase length for the exact-pair preflight check.
+    ///
+    /// The default is 8 terms. Values less than 2 are clamped to 2.
+    pub fn set_preflight_min_terms(&mut self, value: usize) {
+        self.preflight_min_terms = value.max(2);
     }
 }
 

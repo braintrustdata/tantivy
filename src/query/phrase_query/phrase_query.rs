@@ -24,7 +24,10 @@ pub struct PhraseQuery {
     field: Field,
     phrase_terms: Vec<(usize, Term)>,
     slop: u32,
+    preflight_min_terms: usize,
 }
+
+const DEFAULT_PREFLIGHT_MIN_TERMS: usize = 8;
 
 impl PhraseQuery {
     /// Creates a new `PhraseQuery` given a list of terms.
@@ -60,6 +63,7 @@ impl PhraseQuery {
             field,
             phrase_terms: terms,
             slop,
+            preflight_min_terms: DEFAULT_PREFLIGHT_MIN_TERMS,
         }
     }
 
@@ -79,6 +83,13 @@ impl PhraseQuery {
     /// By default the slop is 0 meaning query terms need to be adjacent.
     pub fn set_slop(&mut self, value: u32) {
         self.slop = value;
+    }
+
+    /// Sets the minimum phrase length for the exact-pair preflight check.
+    ///
+    /// The default is 8 terms. Values less than 2 are clamped to 2.
+    pub fn set_preflight_min_terms(&mut self, value: usize) {
+        self.preflight_min_terms = value.max(2);
     }
 
     /// The [`Field`] this `PhraseQuery` is targeting.
@@ -128,6 +139,7 @@ impl PhraseQuery {
         if self.slop > 0 {
             weight.slop(self.slop);
         }
+        weight.set_preflight_min_terms(self.preflight_min_terms);
         Ok(weight)
     }
 }
