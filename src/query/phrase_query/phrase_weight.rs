@@ -1,6 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
-use super::PhraseScorer;
+use super::{PhraseQueryStats, PhraseScorer};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
 use crate::postings::{Postings, SegmentPostings, TermInfo};
@@ -41,6 +44,7 @@ pub struct PhraseWeight {
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
     preflight_min_terms: usize,
+    stats: Arc<PhraseQueryStats>,
 }
 
 impl PhraseWeight {
@@ -49,6 +53,7 @@ impl PhraseWeight {
     pub fn new(
         phrase_terms: Vec<(usize, Term)>,
         similarity_weight_opt: Option<Bm25Weight>,
+        stats: Arc<PhraseQueryStats>,
     ) -> PhraseWeight {
         let slop = 0;
         let lookup_stats = (0..phrase_terms.len())
@@ -60,6 +65,7 @@ impl PhraseWeight {
             similarity_weight_opt,
             slop,
             preflight_min_terms: DEFAULT_PREFLIGHT_MIN_TERMS,
+            stats,
         }
     }
 
@@ -100,6 +106,7 @@ impl PhraseWeight {
                 self.lookup_stats[term_idx]
                     .misses
                     .fetch_add(1, ATOMIC_ORDERING);
+                self.stats.term_info_missing.fetch_add(1, ATOMIC_ORDERING);
                 return Ok(None);
             };
             found_term_infos.push((term, field, term_info.clone()));
@@ -118,13 +125,23 @@ impl PhraseWeight {
         reader: &SegmentReader,
         term_infos: &[(usize, Field, TermInfo)],
     ) -> crate::Result<PhrasePairPreflight> {
-        if self.slop != 0 || term_infos.len() < self.preflight_min_terms {
+        if self.slop != 0 {
+            self.stats
+                .preflight_skipped_slop
+                .fetch_add(1, ATOMIC_ORDERING);
+            return Ok(PhrasePairPreflight::Skipped);
+        }
+        if term_infos.len() < self.preflight_min_terms {
+            self.stats
+                .preflight_skipped_too_short
+                .fetch_add(1, ATOMIC_ORDERING);
             return Ok(PhrasePairPreflight::Skipped);
         }
 
         let Some((left_idx, right_idx)) = select_cheapest_phrase_pair(term_infos) else {
             return Ok(PhrasePairPreflight::Skipped);
         };
+        self.stats.preflight_attempts.fetch_add(1, ATOMIC_ORDERING);
 
         let (left_offset, left_field, left_term_info) = &term_infos[left_idx];
         let (right_offset, right_field, right_term_info) = &term_infos[right_idx];
@@ -147,6 +164,7 @@ impl PhraseWeight {
             *right_offset as u32,
         );
         if has_candidate {
+            self.stats.preflight_candidate.fetch_add(1, ATOMIC_ORDERING);
             Ok(PhrasePairPreflight::Candidate(PreloadedPhrasePair {
                 left_idx,
                 right_idx,
@@ -154,6 +172,9 @@ impl PhraseWeight {
                 right_postings: Some(right_postings_for_scorer),
             }))
         } else {
+            self.stats
+                .preflight_no_candidate
+                .fetch_add(1, ATOMIC_ORDERING);
             Ok(PhrasePairPreflight::NoCandidate)
         }
     }
@@ -167,6 +188,7 @@ impl PhraseWeight {
             .similarity_weight_opt
             .as_ref()
             .map(|similarity_weight| similarity_weight.boost_by(boost));
+        self.stats.scorer_attempts.fetch_add(1, ATOMIC_ORDERING);
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let Some(term_infos) = self.term_infos(reader)? else {
             return Ok(None);
