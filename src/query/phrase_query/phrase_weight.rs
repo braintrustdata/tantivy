@@ -32,6 +32,18 @@ struct PreloadedPhrasePair {
     right_postings: Option<SegmentPostings>,
 }
 
+#[derive(Default)]
+struct PhrasePairProbeStats {
+    docs_examined: u64,
+    position_reads: u64,
+    position_values: u64,
+}
+
+struct PhrasePairProbeResult {
+    has_candidate: bool,
+    stats: PhrasePairProbeStats,
+}
+
 enum PhrasePairPreflight {
     Skipped,
     NoCandidate,
@@ -145,25 +157,58 @@ impl PhraseWeight {
 
         let (left_offset, left_field, left_term_info) = &term_infos[left_idx];
         let (right_offset, right_field, right_term_info) = &term_infos[right_idx];
+        let preflight_pair_reuses_postings =
+            left_field == right_field && left_term_info == right_term_info;
+        self.stats.preflight_pair_postings_bytes.fetch_add(
+            range_len_as_u64(&left_term_info.postings_range)
+                + if preflight_pair_reuses_postings {
+                    0
+                } else {
+                    range_len_as_u64(&right_term_info.postings_range)
+                },
+            ATOMIC_ORDERING,
+        );
+        self.stats.preflight_pair_positions_bytes.fetch_add(
+            range_len_as_u64(&left_term_info.positions_range)
+                + if preflight_pair_reuses_postings {
+                    0
+                } else {
+                    range_len_as_u64(&right_term_info.positions_range)
+                },
+            ATOMIC_ORDERING,
+        );
         let left_inverted_index = reader.inverted_index(*left_field)?;
-        let right_inverted_index = reader.inverted_index(*right_field)?;
         let left_postings = left_inverted_index.read_postings_from_terminfo(
             left_term_info,
             IndexRecordOption::WithFreqsAndPositions,
         )?;
-        let right_postings = right_inverted_index.read_postings_from_terminfo(
-            right_term_info,
-            IndexRecordOption::WithFreqsAndPositions,
-        )?;
+        let right_postings = if preflight_pair_reuses_postings {
+            left_postings.clone()
+        } else {
+            let right_inverted_index = reader.inverted_index(*right_field)?;
+            right_inverted_index.read_postings_from_terminfo(
+                right_term_info,
+                IndexRecordOption::WithFreqsAndPositions,
+            )?
+        };
         let left_postings_for_scorer = left_postings.clone();
         let right_postings_for_scorer = right_postings.clone();
-        let has_candidate = phrase_pair_has_candidate(
+        let probe_result = phrase_pair_has_candidate(
             left_postings,
             right_postings,
             *left_offset as u32,
             *right_offset as u32,
         );
-        if has_candidate {
+        self.stats
+            .preflight_docs_examined
+            .fetch_add(probe_result.stats.docs_examined, ATOMIC_ORDERING);
+        self.stats
+            .preflight_position_reads
+            .fetch_add(probe_result.stats.position_reads, ATOMIC_ORDERING);
+        self.stats
+            .preflight_position_values
+            .fetch_add(probe_result.stats.position_values, ATOMIC_ORDERING);
+        if probe_result.has_candidate {
             self.stats.preflight_candidate.fetch_add(1, ATOMIC_ORDERING);
             Ok(PhrasePairPreflight::Candidate(PreloadedPhrasePair {
                 left_idx,
@@ -200,27 +245,53 @@ impl PhraseWeight {
         };
 
         let mut term_postings_list = Vec::new();
+        let mut term_postings_cache: Vec<(Field, TermInfo, SegmentPostings)> = Vec::new();
+        let mut scorer_postings_bytes = 0u64;
+        let mut scorer_positions_bytes = 0u64;
         for (idx, (offset, field, term_info)) in term_infos.into_iter().enumerate() {
-            let postings = match preloaded_pair.as_mut() {
-                Some(pair) if idx == pair.left_idx => {
-                    pair.left_postings.take().expect("left postings preloaded")
-                }
-                Some(pair) if idx == pair.right_idx => pair
-                    .right_postings
-                    .take()
-                    .expect("right postings preloaded"),
-                _ => reader.inverted_index(field)?.read_postings_from_terminfo(
-                    &term_info,
-                    IndexRecordOption::WithFreqsAndPositions,
-                )?,
+            let postings = if let Some((_, _, cached_postings)) =
+                term_postings_cache
+                    .iter()
+                    .find(|(cached_field, cached_term_info, _)| {
+                        *cached_field == field && *cached_term_info == term_info
+                    }) {
+                cached_postings.clone()
+            } else {
+                scorer_postings_bytes += range_len_as_u64(&term_info.postings_range);
+                scorer_positions_bytes += range_len_as_u64(&term_info.positions_range);
+                let postings = match preloaded_pair.as_mut() {
+                    Some(pair) if idx == pair.left_idx => {
+                        pair.left_postings.take().expect("left postings preloaded")
+                    }
+                    Some(pair) if idx == pair.right_idx => pair
+                        .right_postings
+                        .take()
+                        .expect("right postings preloaded"),
+                    _ => reader.inverted_index(field)?.read_postings_from_terminfo(
+                        &term_info,
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )?,
+                };
+                term_postings_cache.push((field, term_info, postings.clone()));
+                postings
             };
             term_postings_list.push((offset, postings));
         }
-        let phrase_scorer = PhraseScorer::new(
+        self.stats
+            .scorer_terms_opened
+            .fetch_add(term_postings_cache.len() as u64, ATOMIC_ORDERING);
+        self.stats
+            .scorer_postings_bytes_opened
+            .fetch_add(scorer_postings_bytes, ATOMIC_ORDERING);
+        self.stats
+            .scorer_positions_bytes_opened
+            .fetch_add(scorer_positions_bytes, ATOMIC_ORDERING);
+        let phrase_scorer = PhraseScorer::new_with_stats(
             term_postings_list,
             similarity_weight_opt,
             fieldnorm_reader,
             self.slop,
+            self.stats.clone(),
         );
         if phrase_scorer.doc() == TERMINATED {
             Ok(None)
@@ -292,6 +363,10 @@ fn is_adaptive_lookup_term_from_counts(lookups: u64, misses: u64) -> bool {
             >= lookups.saturating_mul(ADAPTIVE_LOOKUP_MIN_MISS_NUMERATOR)
 }
 
+fn range_len_as_u64(range: &std::ops::Range<usize>) -> u64 {
+    range.len().min(u64::MAX as usize) as u64
+}
+
 fn select_cheapest_phrase_pair(term_infos: &[(usize, Field, TermInfo)]) -> Option<(usize, usize)> {
     let mut best_pair = None;
     let mut best_cost = usize::MAX;
@@ -317,27 +392,40 @@ fn phrase_pair_has_candidate(
     mut right: SegmentPostings,
     left_offset: u32,
     right_offset: u32,
-) -> bool {
+) -> PhrasePairProbeResult {
     let max_offset = left_offset.max(right_offset);
     let left_position_offset = max_offset - left_offset;
     let right_position_offset = max_offset - right_offset;
     let mut left_positions = Vec::new();
     let mut right_positions = Vec::new();
+    let mut stats = PhrasePairProbeStats::default();
     let mut candidate = left.doc().max(right.doc());
     loop {
         if candidate == TERMINATED {
-            return false;
+            return PhrasePairProbeResult {
+                has_candidate: false,
+                stats,
+            };
         }
         let left_doc = left.seek(candidate);
         let right_doc = right.seek(candidate);
         if left_doc == TERMINATED || right_doc == TERMINATED {
-            return false;
+            return PhrasePairProbeResult {
+                has_candidate: false,
+                stats,
+            };
         }
         if left_doc == right_doc {
+            stats.docs_examined += 1;
             left.positions_with_offset(left_position_offset, &mut left_positions);
             right.positions_with_offset(right_position_offset, &mut right_positions);
+            stats.position_reads += 2;
+            stats.position_values += (left_positions.len() + right_positions.len()) as u64;
             if positions_intersect(&left_positions, &right_positions) {
-                return true;
+                return PhrasePairProbeResult {
+                    has_candidate: true,
+                    stats,
+                };
             }
             candidate = left.advance().max(right.doc());
         } else {
