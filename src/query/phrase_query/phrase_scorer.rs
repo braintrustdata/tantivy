@@ -12,6 +12,27 @@ struct PostingsWithOffset<TPostings> {
     postings: TPostings,
 }
 
+#[derive(Clone, Copy, Default)]
+struct PhraseScorerTraceSnapshot {
+    candidate_docs: u64,
+    matches: u64,
+    non_matches: u64,
+    position_reads: u64,
+    position_values: u64,
+}
+
+impl PhraseScorerTraceSnapshot {
+    fn saturating_sub(self, other: PhraseScorerTraceSnapshot) -> PhraseScorerTraceSnapshot {
+        PhraseScorerTraceSnapshot {
+            candidate_docs: self.candidate_docs.saturating_sub(other.candidate_docs),
+            matches: self.matches.saturating_sub(other.matches),
+            non_matches: self.non_matches.saturating_sub(other.non_matches),
+            position_reads: self.position_reads.saturating_sub(other.position_reads),
+            position_values: self.position_values.saturating_sub(other.position_values),
+        }
+    }
+}
+
 impl<TPostings: Postings> PostingsWithOffset<TPostings> {
     pub fn new(segment_postings: TPostings, offset: u32) -> PostingsWithOffset<TPostings> {
         PostingsWithOffset {
@@ -55,6 +76,11 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
     slops_buffer: Vec<u8>,
+    trace_candidate_docs: u64,
+    trace_matches: u64,
+    trace_non_matches: u64,
+    trace_position_reads: u64,
+    trace_position_values: u64,
 }
 
 /// Returns true if and only if the two sorted arrays contain a common element
@@ -368,6 +394,21 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         slop: u32,
         offset: usize,
     ) -> PhraseScorer<TPostings> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Phrase query initialize scorer",
+            span_lineage_metrics = true,
+            phrase_query_terms = term_postings_with_offset.len() as u64,
+            phrase_query_slop = slop as u64,
+            phrase_query_offset = offset as u64,
+            phrase_query_result_doc = tracing::field::Empty,
+            phrase_query_candidate_docs = tracing::field::Empty,
+            phrase_query_matches = tracing::field::Empty,
+            phrase_query_non_matches = tracing::field::Empty,
+            phrase_query_position_reads = tracing::field::Empty,
+            phrase_query_position_values = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let max_offset = term_postings_with_offset
             .iter()
             .map(|&(offset, _)| offset)
@@ -393,10 +434,17 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_slops: Vec::with_capacity(100),
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
+            trace_candidate_docs: 0,
+            trace_matches: 0,
+            trace_non_matches: 0,
+            trace_position_reads: 0,
+            trace_position_values: 0,
         };
+        let before = scorer.trace_snapshot();
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
-            scorer.advance();
+            scorer.advance_inner();
         }
+        scorer.record_trace_delta(&span, before, scorer.doc());
         scorer
     }
 
@@ -410,13 +458,20 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_match(&mut self) -> bool {
-        if self.similarity_weight_opt.is_some() {
+        self.trace_candidate_docs += 1;
+        let matched = if self.similarity_weight_opt.is_some() {
             let count = self.compute_phrase_count();
             self.phrase_count = count;
             count > 0u32
         } else {
             self.phrase_exists()
+        };
+        if matched {
+            self.trace_matches += 1;
+        } else {
+            self.trace_non_matches += 1;
         }
+        matched
     }
 
     fn phrase_exists(&mut self) -> bool {
@@ -463,6 +518,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             self.intersection_docset
                 .docset_mut_specialized(0)
                 .positions(&mut self.left_positions);
+            self.record_position_read(self.left_positions.len());
             if self.has_slop() {
                 self.left_slops.clear();
             }
@@ -472,6 +528,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 self.intersection_docset
                     .docset_mut_specialized(i)
                     .positions(&mut self.right_positions);
+                self.record_position_read(self.right_positions.len());
             }
             if self.has_slop() {
                 if self.num_terms > 2 {
@@ -502,15 +559,44 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         self.intersection_docset
             .docset_mut_specialized(self.num_terms - 1)
             .positions(&mut self.right_positions);
+        self.record_position_read(self.right_positions.len());
     }
 
     fn has_slop(&self) -> bool {
         self.slop > 0
     }
-}
 
-impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
-    fn advance(&mut self) -> DocId {
+    fn trace_snapshot(&self) -> PhraseScorerTraceSnapshot {
+        PhraseScorerTraceSnapshot {
+            candidate_docs: self.trace_candidate_docs,
+            matches: self.trace_matches,
+            non_matches: self.trace_non_matches,
+            position_reads: self.trace_position_reads,
+            position_values: self.trace_position_values,
+        }
+    }
+
+    fn record_position_read(&mut self, num_values: usize) {
+        self.trace_position_reads += 1;
+        self.trace_position_values += num_values as u64;
+    }
+
+    fn record_trace_delta(
+        &self,
+        span: &tracing::Span,
+        before: PhraseScorerTraceSnapshot,
+        result_doc: DocId,
+    ) {
+        let delta = self.trace_snapshot().saturating_sub(before);
+        span.record("phrase_query_result_doc", result_doc as u64);
+        span.record("phrase_query_candidate_docs", delta.candidate_docs);
+        span.record("phrase_query_matches", delta.matches);
+        span.record("phrase_query_non_matches", delta.non_matches);
+        span.record("phrase_query_position_reads", delta.position_reads);
+        span.record("phrase_query_position_values", delta.position_values);
+    }
+
+    fn advance_inner(&mut self) -> DocId {
         loop {
             let doc = self.intersection_docset.advance();
             if doc == TERMINATED || self.phrase_match() {
@@ -518,14 +604,56 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
             }
         }
     }
+}
+
+impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
+    fn advance(&mut self) -> DocId {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Phrase scorer advance",
+            span_lineage_metrics = true,
+            phrase_query_terms = self.num_terms as u64,
+            phrase_query_start_doc = self.doc() as u64,
+            phrase_query_result_doc = tracing::field::Empty,
+            phrase_query_candidate_docs = tracing::field::Empty,
+            phrase_query_matches = tracing::field::Empty,
+            phrase_query_non_matches = tracing::field::Empty,
+            phrase_query_position_reads = tracing::field::Empty,
+            phrase_query_position_values = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let before = self.trace_snapshot();
+        let doc = self.advance_inner();
+        self.record_trace_delta(&span, before, doc);
+        doc
+    }
 
     fn seek(&mut self, target: DocId) -> DocId {
         debug_assert!(target >= self.doc());
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Phrase scorer seek",
+            span_lineage_metrics = true,
+            phrase_query_terms = self.num_terms as u64,
+            phrase_query_start_doc = self.doc() as u64,
+            phrase_query_target_doc = target as u64,
+            phrase_query_result_doc = tracing::field::Empty,
+            phrase_query_candidate_docs = tracing::field::Empty,
+            phrase_query_matches = tracing::field::Empty,
+            phrase_query_non_matches = tracing::field::Empty,
+            phrase_query_position_reads = tracing::field::Empty,
+            phrase_query_position_values = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let before = self.trace_snapshot();
         let doc = self.intersection_docset.seek(target);
-        if doc == TERMINATED || self.phrase_match() {
-            return doc;
-        }
-        self.advance()
+        let doc = if doc == TERMINATED || self.phrase_match() {
+            doc
+        } else {
+            self.advance_inner()
+        };
+        self.record_trace_delta(&span, before, doc);
+        doc
     }
 
     fn doc(&self) -> DocId {
