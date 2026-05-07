@@ -165,8 +165,8 @@ impl InvertedIndexReader {
             if option.has_positions() {
                 let positions_data = self
                     .positions_file_slice
-                    .read_bytes_slice(term_info.positions_range.clone())?;
-                let position_reader = PositionReader::open(positions_data)?;
+                    .slice(term_info.positions_range.clone());
+                let position_reader = PositionReader::open_lazy(positions_data)?;
                 Some(position_reader)
             } else {
                 None
