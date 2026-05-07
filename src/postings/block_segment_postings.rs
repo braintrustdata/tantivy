@@ -100,9 +100,49 @@ impl BlockSegmentPostings {
         mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
-        let bytes = data.read_bytes()?;
-        let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
-        let skip_reader = match skip_data_opt {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Block segment postings open",
+            span_lineage_metrics = true,
+            block_postings_doc_freq = doc_freq as u64,
+            block_postings_input_bytes = data.num_bytes().get_bytes(),
+            block_postings_record_option = ?record_option,
+            block_postings_requested_option = ?requested_option,
+            block_postings_skip_bytes = tracing::field::Empty,
+            block_postings_body_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let bytes = tracing::info_span!(
+            "op",
+            otel.name = "Block segment postings read bytes",
+            span_lineage_metrics = true,
+            block_postings_input_bytes = data.num_bytes().get_bytes(),
+        )
+        .in_scope(|| data.read_bytes())?;
+        let (skip_data_opt, postings_data) = tracing::info_span!(
+            "op",
+            otel.name = "Block segment postings split skips",
+            span_lineage_metrics = true,
+            block_postings_doc_freq = doc_freq as u64,
+            block_postings_input_bytes = bytes.len() as u64,
+        )
+        .in_scope(|| split_into_skips_and_postings(doc_freq, bytes))?;
+        span.record(
+            "block_postings_skip_bytes",
+            skip_data_opt
+                .as_ref()
+                .map(|skip_data| skip_data.len() as u64)
+                .unwrap_or(0u64),
+        );
+        span.record("block_postings_body_bytes", postings_data.len() as u64);
+        let skip_reader = tracing::info_span!(
+            "op",
+            otel.name = "Block segment postings open skip reader",
+            span_lineage_metrics = true,
+            block_postings_doc_freq = doc_freq as u64,
+            block_postings_has_skip = skip_data_opt.is_some(),
+        )
+        .in_scope(|| match skip_data_opt {
             Some(skip_data) => {
                 let block_count = doc_freq as usize / COMPRESSION_BLOCK_SIZE;
                 // 8 is the minimum size of a block with frequency (can be more if pos are stored
@@ -117,7 +157,7 @@ impl BlockSegmentPostings {
                 SkipReader::new(skip_data, doc_freq, record_option)
             }
             None => SkipReader::new(OwnedBytes::empty(), doc_freq, record_option),
-        };
+        });
 
         let freq_reading_option = match (record_option, requested_option) {
             (IndexRecordOption::Basic, _) => FreqReadingOption::NoFreq,
@@ -135,7 +175,13 @@ impl BlockSegmentPostings {
             data: postings_data,
             skip_reader,
         };
-        block_segment_postings.load_block();
+        tracing::info_span!(
+            "op",
+            otel.name = "Block segment postings load first block",
+            span_lineage_metrics = true,
+            block_postings_doc_freq = doc_freq as u64,
+        )
+        .in_scope(|| block_segment_postings.load_block());
         Ok(block_segment_postings)
     }
 

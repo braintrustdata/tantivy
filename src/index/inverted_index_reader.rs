@@ -37,8 +37,25 @@ impl InvertedIndexReader {
         positions_file_slice: FileSlice,
         record_option: IndexRecordOption,
     ) -> io::Result<InvertedIndexReader> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Inverted index reader open",
+            span_lineage_metrics = true,
+            inverted_index_record_option = ?record_option,
+            inverted_index_postings_file_bytes = postings_file_slice.num_bytes().get_bytes(),
+            inverted_index_positions_file_bytes = positions_file_slice.num_bytes().get_bytes(),
+            inverted_index_total_num_tokens = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let (total_num_tokens_slice, postings_body) = postings_file_slice.split(8);
-        let total_num_tokens = u64::deserialize(&mut total_num_tokens_slice.read_bytes()?)?;
+        let total_num_tokens = tracing::info_span!(
+            "op",
+            otel.name = "Inverted index read total num tokens",
+            span_lineage_metrics = true,
+            inverted_index_total_num_tokens_bytes = total_num_tokens_slice.num_bytes().get_bytes(),
+        )
+        .in_scope(|| u64::deserialize(&mut total_num_tokens_slice.read_bytes()?))?;
+        span.record("inverted_index_total_num_tokens", total_num_tokens);
         Ok(InvertedIndexReader {
             termdict,
             postings_file_slice: postings_body,
@@ -62,7 +79,34 @@ impl InvertedIndexReader {
 
     /// Returns the term info associated with the term.
     pub fn get_term_info(&self, term: &Term) -> io::Result<Option<TermInfo>> {
-        self.termdict.get(term.serialized_value_bytes())
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Inverted index get term info",
+            span_lineage_metrics = true,
+            term_field_id = term.field().field_id() as u64,
+            term_bytes = term.serialized_value_bytes().len() as u64,
+            term_info_result = tracing::field::Empty,
+            term_info_doc_freq = tracing::field::Empty,
+            term_info_postings_bytes = tracing::field::Empty,
+            term_info_positions_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let term_info = self.termdict.get(term.serialized_value_bytes())?;
+        if let Some(term_info) = &term_info {
+            span.record("term_info_result", "found");
+            span.record("term_info_doc_freq", term_info.doc_freq as u64);
+            span.record(
+                "term_info_postings_bytes",
+                term_info.postings_range.len() as u64,
+            );
+            span.record(
+                "term_info_positions_bytes",
+                term_info.positions_range.len() as u64,
+            );
+        } else {
+            span.record("term_info_result", "missing");
+        }
+        Ok(term_info)
     }
 
     /// Return the term dictionary datastructure.
@@ -141,12 +185,23 @@ impl InvertedIndexReader {
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
-        BlockSegmentPostings::open(
-            term_info.doc_freq,
-            postings_data,
-            self.record_option,
-            requested_option,
+        tracing::info_span!(
+            "op",
+            otel.name = "Inverted index open block postings",
+            span_lineage_metrics = true,
+            term_info_doc_freq = term_info.doc_freq as u64,
+            term_info_postings_bytes = term_info.postings_range.len() as u64,
+            inverted_index_record_option = ?self.record_option,
+            inverted_index_requested_option = ?requested_option,
         )
+        .in_scope(|| {
+            BlockSegmentPostings::open(
+                term_info.doc_freq,
+                postings_data,
+                self.record_option,
+                requested_option,
+            )
+        })
     }
 
     /// Returns a posting object given a `term_info`.
@@ -156,17 +211,43 @@ impl InvertedIndexReader {
     pub fn read_postings_from_terminfo(
         &self,
         term_info: &TermInfo,
-        option: IndexRecordOption,
+        requested_option: IndexRecordOption,
     ) -> io::Result<SegmentPostings> {
-        let option = option.downgrade(self.record_option);
+        let option = requested_option.downgrade(self.record_option);
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Inverted index read postings from term info",
+            span_lineage_metrics = true,
+            term_info_doc_freq = term_info.doc_freq as u64,
+            term_info_postings_bytes = term_info.postings_range.len() as u64,
+            term_info_positions_bytes = term_info.positions_range.len() as u64,
+            inverted_index_record_option = ?self.record_option,
+            inverted_index_requested_option = ?requested_option,
+            inverted_index_actual_option = ?option,
+            inverted_index_reads_positions = option.has_positions(),
+        );
+        let _guard = span.enter();
 
         let block_postings = self.read_block_postings_from_terminfo(term_info, option)?;
         let position_reader = {
             if option.has_positions() {
-                let positions_data = self
-                    .positions_file_slice
-                    .read_bytes_slice(term_info.positions_range.clone())?;
-                let position_reader = PositionReader::open(positions_data)?;
+                let positions_data = tracing::info_span!(
+                    "op",
+                    otel.name = "Inverted index read positions bytes",
+                    span_lineage_metrics = true,
+                    term_info_positions_bytes = term_info.positions_range.len() as u64,
+                )
+                .in_scope(|| {
+                    self.positions_file_slice
+                        .read_bytes_slice(term_info.positions_range.clone())
+                })?;
+                let position_reader = tracing::info_span!(
+                    "op",
+                    otel.name = "Inverted index open position reader",
+                    span_lineage_metrics = true,
+                    term_info_positions_bytes = positions_data.len() as u64,
+                )
+                .in_scope(|| PositionReader::open(positions_data))?;
                 Some(position_reader)
             } else {
                 None

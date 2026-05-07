@@ -122,34 +122,111 @@ fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {
 
 impl TermInfoStore {
     pub fn open(term_info_store_file: FileSlice) -> io::Result<TermInfoStore> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Term info store open",
+            span_lineage_metrics = true,
+            term_info_store_file_bytes = term_info_store_file.num_bytes().get_bytes(),
+            term_info_store_block_meta_bytes = tracing::field::Empty,
+            term_info_store_values_bytes = tracing::field::Empty,
+            term_info_store_num_terms = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let (len_slice, main_slice) = term_info_store_file.split(16);
-        let mut bytes = len_slice.read_bytes()?;
+        let mut bytes = tracing::info_span!(
+            "op",
+            otel.name = "Term info store read header",
+            span_lineage_metrics = true,
+            term_info_store_header_bytes = len_slice.num_bytes().get_bytes(),
+        )
+        .in_scope(|| len_slice.read_bytes())?;
         let len = u64::deserialize(&mut bytes)? as usize;
         let num_terms = u64::deserialize(&mut bytes)? as usize;
         let (block_meta_file, term_info_file) = main_slice.split(len);
-        let term_info_bytes = term_info_file.read_bytes()?;
+        span.record(
+            "term_info_store_block_meta_bytes",
+            block_meta_file.num_bytes().get_bytes(),
+        );
+        span.record(
+            "term_info_store_values_bytes",
+            term_info_file.num_bytes().get_bytes(),
+        );
+        span.record("term_info_store_num_terms", num_terms as u64);
+        let term_info_bytes = tracing::info_span!(
+            "op",
+            otel.name = "Term info store read values bytes",
+            span_lineage_metrics = true,
+            term_info_store_values_bytes = term_info_file.num_bytes().get_bytes(),
+        )
+        .in_scope(|| term_info_file.read_bytes())?;
+        let block_meta_bytes = tracing::info_span!(
+            "op",
+            otel.name = "Term info store read block meta bytes",
+            span_lineage_metrics = true,
+            term_info_store_block_meta_bytes = block_meta_file.num_bytes().get_bytes(),
+        )
+        .in_scope(|| block_meta_file.read_bytes())?;
         Ok(TermInfoStore {
             num_terms,
-            block_meta_bytes: block_meta_file.read_bytes()?,
+            block_meta_bytes,
             term_info_bytes,
         })
     }
 
     pub fn get(&self, term_ord: TermOrdinal) -> TermInfo {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Term info store get",
+            span_lineage_metrics = true,
+            term_info_store_term_ord = term_ord,
+            term_info_store_block_id = tracing::field::Empty,
+            term_info_store_inner_offset = tracing::field::Empty,
+            term_info_store_block_meta_offset = tracing::field::Empty,
+            term_info_doc_freq = tracing::field::Empty,
+            term_info_postings_bytes = tracing::field::Empty,
+            term_info_positions_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let block_id = (term_ord as usize) / BLOCK_LEN;
+        span.record("term_info_store_block_id", block_id as u64);
         let buffer = self.block_meta_bytes.as_slice();
         let mut block_data: &[u8] = &buffer[block_id * TermInfoBlockMeta::SIZE_IN_BYTES..];
         let term_info_block_data = TermInfoBlockMeta::deserialize(&mut block_data)
             .expect("Failed to deserialize terminfoblockmeta");
         let inner_offset = (term_ord as usize) % BLOCK_LEN;
+        span.record("term_info_store_inner_offset", inner_offset as u64);
+        span.record(
+            "term_info_store_block_meta_offset",
+            term_info_block_data.offset,
+        );
         if inner_offset == 0 {
-            return term_info_block_data.ref_term_info;
+            let term_info = term_info_block_data.ref_term_info;
+            span.record("term_info_doc_freq", term_info.doc_freq as u64);
+            span.record(
+                "term_info_postings_bytes",
+                term_info.postings_range.len() as u64,
+            );
+            span.record(
+                "term_info_positions_bytes",
+                term_info.positions_range.len() as u64,
+            );
+            return term_info;
         }
         let term_info_data = self.term_info_bytes.as_slice();
-        term_info_block_data.deserialize_term_info(
+        let term_info = term_info_block_data.deserialize_term_info(
             &term_info_data[term_info_block_data.offset as usize..],
             inner_offset - 1,
-        )
+        );
+        span.record("term_info_doc_freq", term_info.doc_freq as u64);
+        span.record(
+            "term_info_postings_bytes",
+            term_info.postings_range.len() as u64,
+        );
+        span.record(
+            "term_info_positions_bytes",
+            term_info.positions_range.len() as u64,
+        );
+        term_info
     }
 
     pub fn num_terms(&self) -> usize {

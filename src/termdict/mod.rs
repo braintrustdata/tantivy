@@ -67,9 +67,24 @@ pub struct TermDictionary(InnerTermDict);
 impl TermDictionary {
     /// Opens a `TermDictionary`.
     pub fn open(file: FileSlice) -> io::Result<Self> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Term dictionary open",
+            span_lineage_metrics = true,
+            termdict_file_bytes = file.num_bytes().get_bytes(),
+            termdict_type = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let (main_slice, dict_type) = file.split_from_end(4);
-        let mut dict_type = dict_type.read_bytes()?;
+        let mut dict_type = tracing::info_span!(
+            "op",
+            otel.name = "Term dictionary read type footer",
+            span_lineage_metrics = true,
+            termdict_type_footer_bytes = dict_type.num_bytes().get_bytes(),
+        )
+        .in_scope(|| dict_type.read_bytes())?;
         let dict_type = u32::deserialize(&mut dict_type)?;
+        span.record("termdict_type", dict_type as u64);
 
         if dict_type != CURRENT_TYPE as u32 {
             return Err(io::Error::new(
@@ -81,7 +96,14 @@ impl TermDictionary {
             ));
         }
 
-        InnerTermDict::open(main_slice).map(TermDictionary)
+        tracing::info_span!(
+            "op",
+            otel.name = "Term dictionary open inner",
+            span_lineage_metrics = true,
+            termdict_inner_file_bytes = main_slice.num_bytes().get_bytes(),
+        )
+        .in_scope(|| InnerTermDict::open(main_slice))
+        .map(TermDictionary)
     }
 
     /// Creates an empty term dictionary which contains no terms.
@@ -122,7 +144,34 @@ impl TermDictionary {
 
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermInfo>> {
-        self.0.get(key)
+        let key = key.as_ref();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Term dictionary get",
+            span_lineage_metrics = true,
+            termdict_key_bytes = key.len() as u64,
+            termdict_result = tracing::field::Empty,
+            termdict_doc_freq = tracing::field::Empty,
+            termdict_postings_bytes = tracing::field::Empty,
+            termdict_positions_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let term_info = self.0.get(key)?;
+        if let Some(term_info) = &term_info {
+            span.record("termdict_result", "found");
+            span.record("termdict_doc_freq", term_info.doc_freq as u64);
+            span.record(
+                "termdict_postings_bytes",
+                term_info.postings_range.len() as u64,
+            );
+            span.record(
+                "termdict_positions_bytes",
+                term_info.positions_range.len() as u64,
+            );
+        } else {
+            span.record("termdict_result", "missing");
+        }
+        Ok(term_info)
     }
 
     /// Returns a range builder, to stream all of the terms
@@ -139,7 +188,9 @@ impl TermDictionary {
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
-    where A::State: Clone {
+    where
+        A::State: Clone,
+    {
         self.0.search(automaton)
     }
 

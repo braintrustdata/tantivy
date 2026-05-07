@@ -27,7 +27,8 @@ pub struct TermDictionaryBuilder<W> {
 }
 
 impl<W> TermDictionaryBuilder<W>
-where W: Write
+where
+    W: Write,
 {
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {
@@ -89,12 +90,33 @@ where W: Write
 }
 
 fn open_fst_index(fst_file: FileSlice) -> io::Result<tantivy_fst::Map<OwnedBytes>> {
-    let bytes = fst_file.read_bytes()?;
-    let fst = Fst::new(bytes).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Fst data is corrupted: {:?}", err),
-        )
+    let span = tracing::info_span!(
+        "op",
+        otel.name = "FST term dictionary open fst index",
+        span_lineage_metrics = true,
+        fst_termdict_fst_bytes = fst_file.num_bytes().get_bytes(),
+    );
+    let _guard = span.enter();
+    let bytes = tracing::info_span!(
+        "op",
+        otel.name = "FST term dictionary read fst bytes",
+        span_lineage_metrics = true,
+        fst_termdict_fst_bytes = fst_file.num_bytes().get_bytes(),
+    )
+    .in_scope(|| fst_file.read_bytes())?;
+    let fst = tracing::info_span!(
+        "op",
+        otel.name = "FST term dictionary parse fst bytes",
+        span_lineage_metrics = true,
+        fst_termdict_fst_bytes = bytes.len() as u64,
+    )
+    .in_scope(|| {
+        Fst::new(bytes).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Fst data is corrupted: {:?}", err),
+            )
+        })
     })?;
     Ok(tantivy_fst::Map::from(fst))
 }
@@ -121,8 +143,24 @@ pub struct TermDictionary {
 impl TermDictionary {
     /// Opens a `TermDictionary`.
     pub fn open(file: FileSlice) -> io::Result<Self> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "FST term dictionary open",
+            span_lineage_metrics = true,
+            fst_termdict_file_bytes = file.num_bytes().get_bytes(),
+            fst_termdict_footer_bytes = 12u64,
+            fst_termdict_fst_bytes = tracing::field::Empty,
+            fst_termdict_values_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let (main_slice, footer_len_slice) = file.split_from_end(12);
-        let mut footer_len_bytes = footer_len_slice.read_bytes()?;
+        let mut footer_len_bytes = tracing::info_span!(
+            "op",
+            otel.name = "FST term dictionary read footer",
+            span_lineage_metrics = true,
+            fst_termdict_footer_bytes = footer_len_slice.num_bytes().get_bytes(),
+        )
+        .in_scope(|| footer_len_slice.read_bytes())?;
         let footer_size = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         if version != FST_VERSION {
@@ -133,6 +171,14 @@ impl TermDictionary {
         }
 
         let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
+        span.record(
+            "fst_termdict_fst_bytes",
+            fst_file_slice.num_bytes().get_bytes(),
+        );
+        span.record(
+            "fst_termdict_values_bytes",
+            values_file_slice.num_bytes().get_bytes(),
+        );
         let fst_index = open_fst_index(fst_file_slice)?;
         let term_info_store = TermInfoStore::open(values_file_slice)?;
         Ok(TermDictionary {
@@ -195,9 +241,49 @@ impl TermDictionary {
 
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermInfo>> {
-        Ok(self
-            .term_ord(key)?
-            .map(|term_ord| self.term_info_from_ord(term_ord)))
+        let key = key.as_ref();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "FST term dictionary get",
+            span_lineage_metrics = true,
+            fst_termdict_key_bytes = key.len() as u64,
+            fst_termdict_result = tracing::field::Empty,
+            fst_termdict_term_ord = tracing::field::Empty,
+            fst_termdict_doc_freq = tracing::field::Empty,
+            fst_termdict_postings_bytes = tracing::field::Empty,
+            fst_termdict_positions_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let term_ord = tracing::info_span!(
+            "op",
+            otel.name = "FST term dictionary term ord",
+            span_lineage_metrics = true,
+            fst_termdict_key_bytes = key.len() as u64,
+        )
+        .in_scope(|| self.term_ord(key))?;
+        let Some(term_ord) = term_ord else {
+            span.record("fst_termdict_result", "missing");
+            return Ok(None);
+        };
+        span.record("fst_termdict_term_ord", term_ord);
+        let term_info = tracing::info_span!(
+            "op",
+            otel.name = "FST term dictionary term info from ord",
+            span_lineage_metrics = true,
+            fst_termdict_term_ord = term_ord,
+        )
+        .in_scope(|| self.term_info_from_ord(term_ord));
+        span.record("fst_termdict_result", "found");
+        span.record("fst_termdict_doc_freq", term_info.doc_freq as u64);
+        span.record(
+            "fst_termdict_postings_bytes",
+            term_info.postings_range.len() as u64,
+        );
+        span.record(
+            "fst_termdict_positions_bytes",
+            term_info.positions_range.len() as u64,
+        );
+        Ok(Some(term_info))
     }
 
     /// Returns a range builder, to stream all of the terms

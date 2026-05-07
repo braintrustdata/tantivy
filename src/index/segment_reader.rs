@@ -252,14 +252,30 @@ impl SegmentReader {
     /// Similarly, if the field is marked as indexed but no term has been indexed for the given
     /// index, an empty `InvertedIndexReader` is returned (but no warning is logged).
     pub fn inverted_index(&self, field: Field) -> crate::Result<Arc<InvertedIndexReader>> {
-        if let Some(inv_idx_reader) = self
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Segment reader inverted index",
+            span_lineage_metrics = true,
+            inverted_index_field_id = field.field_id() as u64,
+            inverted_index_cache = tracing::field::Empty,
+            inverted_index_result = tracing::field::Empty,
+            inverted_index_postings_file_bytes = tracing::field::Empty,
+            inverted_index_termdict_file_bytes = tracing::field::Empty,
+            inverted_index_positions_file_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let cached_reader = self
             .inv_idx_reader_cache
             .read()
             .expect("Lock poisoned. This should never happen")
             .get(&field)
-        {
-            return Ok(Arc::clone(inv_idx_reader));
+            .map(Arc::clone);
+        if let Some(inv_idx_reader) = cached_reader {
+            span.record("inverted_index_cache", "hit");
+            span.record("inverted_index_result", "cached");
+            return Ok(inv_idx_reader);
         }
+        span.record("inverted_index_cache", "miss");
         let field_entry = self.schema.get_field_entry(field);
         let field_type = field_entry.field_type();
         let record_option_opt = field_type.get_index_record_option();
@@ -269,6 +285,12 @@ impl SegmentReader {
         }
 
         let postings_file_opt = self.postings_composite.open_read(field);
+        if let Some(postings_file) = &postings_file_opt {
+            span.record(
+                "inverted_index_postings_file_bytes",
+                postings_file.num_bytes().get_bytes(),
+            );
+        }
 
         if postings_file_opt.is_none() || record_option_opt.is_none() {
             // no documents in the segment contained this field.
@@ -276,6 +298,7 @@ impl SegmentReader {
             //
             // Returns an empty inverted index.
             let record_option = record_option_opt.unwrap_or(IndexRecordOption::Basic);
+            span.record("inverted_index_result", "empty");
             return Ok(Arc::new(InvertedIndexReader::empty(record_option)));
         }
 
@@ -290,6 +313,10 @@ impl SegmentReader {
                     field_entry.name()
                 ))
             })?;
+        span.record(
+            "inverted_index_termdict_file_bytes",
+            termdict_file.num_bytes().get_bytes(),
+        );
 
         let positions_file = self.positions_composite.open_read(field).ok_or_else(|| {
             let error_msg = format!(
@@ -299,13 +326,24 @@ impl SegmentReader {
             );
             DataCorruption::comment_only(error_msg)
         })?;
+        span.record(
+            "inverted_index_positions_file_bytes",
+            positions_file.num_bytes().get_bytes(),
+        );
 
         let inv_idx_reader = Arc::new(InvertedIndexReader::new(
-            TermDictionary::open(termdict_file)?,
+            tracing::info_span!(
+                "op",
+                otel.name = "Segment reader open term dictionary",
+                span_lineage_metrics = true,
+                inverted_index_field_id = field.field_id() as u64,
+            )
+            .in_scope(|| TermDictionary::open(termdict_file))?,
             postings_file,
             positions_file,
             record_option,
         )?);
+        span.record("inverted_index_result", "opened");
 
         // by releasing the lock in between, we may end up opening the inverting index
         // twice, but this is fine.

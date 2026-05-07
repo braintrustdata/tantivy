@@ -120,8 +120,39 @@ impl PhraseWeight {
             }
             let field = term.field();
             lookup_steps += 1;
-            let inverted_index = reader.inverted_index(field)?;
-            let term_info = inverted_index.get_term_info(term)?;
+            let term_span = tracing::info_span!(
+                "op",
+                otel.name = "Phrase query term info lookup",
+                span_lineage_metrics = true,
+                phrase_query_term_idx = term_idx as u64,
+                phrase_query_term_offset = *offset as u64,
+                phrase_query_field_id = field.field_id() as u64,
+                phrase_query_term_bytes = term.serialized_value_bytes().len() as u64,
+                phrase_query_result = tracing::field::Empty,
+                phrase_query_doc_freq = tracing::field::Empty,
+                phrase_query_postings_bytes = tracing::field::Empty,
+                phrase_query_positions_bytes = tracing::field::Empty,
+            );
+            let term_info = {
+                let _term_guard = term_span.enter();
+                let inverted_index = reader.inverted_index(field)?;
+                let term_info = inverted_index.get_term_info(term)?;
+                if let Some(term_info) = &term_info {
+                    term_span.record("phrase_query_result", "found");
+                    term_span.record("phrase_query_doc_freq", term_info.doc_freq as u64);
+                    term_span.record(
+                        "phrase_query_postings_bytes",
+                        term_info.postings_range.len() as u64,
+                    );
+                    term_span.record(
+                        "phrase_query_positions_bytes",
+                        term_info.positions_range.len() as u64,
+                    );
+                } else {
+                    term_span.record("phrase_query_result", "missing");
+                }
+                term_info
+            };
             self.lookup_stats[term_idx]
                 .lookups
                 .fetch_add(1, ATOMIC_ORDERING);
@@ -209,14 +240,40 @@ impl PhraseWeight {
         );
         let left_inverted_index = reader.inverted_index(*left_field)?;
         let right_inverted_index = reader.inverted_index(*right_field)?;
-        let left_postings = left_inverted_index.read_postings_from_terminfo(
-            left_term_info,
-            IndexRecordOption::WithFreqsAndPositions,
-        )?;
-        let right_postings = right_inverted_index.read_postings_from_terminfo(
-            right_term_info,
-            IndexRecordOption::WithFreqsAndPositions,
-        )?;
+        let left_postings = tracing::info_span!(
+            "op",
+            otel.name = "Phrase query preflight read term postings",
+            span_lineage_metrics = true,
+            phrase_query_preflight_side = "left",
+            phrase_query_preflight_term_idx = left_idx as u64,
+            phrase_query_preflight_field_id = left_field.field_id() as u64,
+            phrase_query_preflight_doc_freq = left_term_info.doc_freq as u64,
+            phrase_query_preflight_postings_bytes = left_term_info.postings_range.len() as u64,
+            phrase_query_preflight_positions_bytes = left_term_info.positions_range.len() as u64,
+        )
+        .in_scope(|| {
+            left_inverted_index.read_postings_from_terminfo(
+                left_term_info,
+                IndexRecordOption::WithFreqsAndPositions,
+            )
+        })?;
+        let right_postings = tracing::info_span!(
+            "op",
+            otel.name = "Phrase query preflight read term postings",
+            span_lineage_metrics = true,
+            phrase_query_preflight_side = "right",
+            phrase_query_preflight_term_idx = right_idx as u64,
+            phrase_query_preflight_field_id = right_field.field_id() as u64,
+            phrase_query_preflight_doc_freq = right_term_info.doc_freq as u64,
+            phrase_query_preflight_postings_bytes = right_term_info.postings_range.len() as u64,
+            phrase_query_preflight_positions_bytes = right_term_info.positions_range.len() as u64,
+        )
+        .in_scope(|| {
+            right_inverted_index.read_postings_from_terminfo(
+                right_term_info,
+                IndexRecordOption::WithFreqsAndPositions,
+            )
+        })?;
         let left_postings_for_scorer = left_postings.clone();
         let right_postings_for_scorer = right_postings.clone();
         let has_candidate = phrase_pair_has_candidate(
@@ -333,9 +390,24 @@ impl PhraseWeight {
                         terms_opened += 1;
                         fresh_postings_bytes += term_info.postings_range.len() as u64;
                         fresh_positions_bytes += term_info.positions_range.len() as u64;
-                        reader.inverted_index(field)?.read_postings_from_terminfo(
-                            &term_info,
-                            IndexRecordOption::WithFreqsAndPositions,
+                        tracing::info_span!(
+                            "op",
+                            otel.name = "Phrase query open scorer term postings",
+                            span_lineage_metrics = true,
+                            phrase_query_term_idx = idx as u64,
+                            phrase_query_term_offset = offset as u64,
+                            phrase_query_field_id = field.field_id() as u64,
+                            phrase_query_doc_freq = term_info.doc_freq as u64,
+                            phrase_query_postings_bytes = term_info.postings_range.len() as u64,
+                            phrase_query_positions_bytes = term_info.positions_range.len() as u64,
+                        )
+                        .in_scope(
+                            || -> crate::Result<SegmentPostings> {
+                                Ok(reader.inverted_index(field)?.read_postings_from_terminfo(
+                                    &term_info,
+                                    IndexRecordOption::WithFreqsAndPositions,
+                                )?)
+                            },
                         )?
                     }
                 };
