@@ -121,9 +121,17 @@ impl SSTableIndexV3 {
         fst_slice: FileSlice,
         block_addr_store_slice: FileSlice,
     ) -> Result<SSTableIndexV3, SSTableDataCorruption> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable index v3 load lazy",
+            span_lineage_metrics = true,
+            sstable_index_fst_bytes = fst_slice.len() as u64,
+            sstable_index_block_addr_store_bytes = block_addr_store_slice.len() as u64,
+        );
+        let _guard = span.enter();
         let fst_index = LazyFstIndex::open(fst_slice).map_err(|_| SSTableDataCorruption)?;
-        let block_addr_store =
-            BlockAddrStore::open_lazy(block_addr_store_slice).map_err(|_| SSTableDataCorruption)?;
+        let block_addr_store = BlockAddrStore::open_lazy(block_addr_store_slice)
+            .map_err(|_| SSTableDataCorruption)?;
 
         Ok(SSTableIndexV3 {
             fst_index: FstIndex::Lazy(fst_index),
@@ -144,7 +152,28 @@ impl SSTableIndexV3 {
     }
 
     pub(crate) fn locate_with_key_result(&self, key: &[u8]) -> io::Result<Option<u64>> {
-        self.fst_index.lower_bound(key)
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable index v3 locate with key",
+            span_lineage_metrics = true,
+            sstable_key_bytes = key.len() as u64,
+            sstable_block_id = tracing::field::Empty,
+            sstable_result = tracing::field::Empty,
+        );
+        let result = span.in_scope(|| self.fst_index.lower_bound(key));
+        match &result {
+            Ok(Some(block_id)) => {
+                span.record("sstable_result", "found");
+                span.record("sstable_block_id", *block_id);
+            }
+            Ok(None) => {
+                span.record("sstable_result", "missing");
+            }
+            Err(_) => {
+                span.record("sstable_result", "error");
+            }
+        }
+        result
     }
 
     /// Get the [`BlockAddr`] of the block that would contain `key`.
@@ -155,9 +184,33 @@ impl SSTableIndexV3 {
     }
 
     pub(crate) fn get_block_with_key_result(&self, key: &[u8]) -> io::Result<Option<BlockAddr>> {
-        Ok(self
-            .locate_with_key_result(key)?
-            .and_then(|id| self.get_block(id)))
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable index v3 get block with key",
+            span_lineage_metrics = true,
+            sstable_key_bytes = key.len() as u64,
+            sstable_block_id = tracing::field::Empty,
+            sstable_block_first_ordinal = tracing::field::Empty,
+            sstable_block_bytes = tracing::field::Empty,
+            sstable_result = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let block_id = self.locate_with_key_result(key)?;
+        if let Some(block_id) = block_id {
+            span.record("sstable_block_id", block_id);
+            let block_addr = self.get_block(block_id);
+            if let Some(block_addr) = &block_addr {
+                span.record("sstable_result", "found");
+                span.record("sstable_block_first_ordinal", block_addr.first_ordinal);
+                span.record("sstable_block_bytes", block_addr.byte_range.len() as u64);
+            } else {
+                span.record("sstable_result", "missing_block_addr");
+            }
+            Ok(block_addr)
+        } else {
+            span.record("sstable_result", "missing");
+            Ok(None)
+        }
     }
 
     pub(crate) fn locate_with_ord(&self, ord: TermOrdinal) -> u64 {
@@ -537,6 +590,14 @@ impl BlockAddrStore {
     }
 
     fn open_lazy(block_addr_store_file: FileSlice) -> io::Result<BlockAddrStore> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Block addr store open lazy",
+            span_lineage_metrics = true,
+            block_addr_store_file_bytes = block_addr_store_file.len() as u64,
+            block_addr_store_meta_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         if block_addr_store_file.len() < 8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -545,6 +606,7 @@ impl BlockAddrStore {
         }
         let mut len_slice = block_addr_store_file.read_bytes_slice(0..8)?;
         let block_meta_len = u64::deserialize(&mut len_slice)? as usize;
+        span.record("block_addr_store_meta_bytes", block_meta_len as u64);
         if 8 + block_meta_len > block_addr_store_file.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -581,9 +643,16 @@ impl BlockAddrStore {
                 block_addr_store_file,
                 ..
             } => {
-                block_meta_bytes = block_addr_store_file
-                    .read_bytes_slice(8 + offset..8 + end)
-                    .ok()?;
+                block_meta_bytes = tracing::info_span!(
+                    "op",
+                    otel.name = "Block addr store read metadata",
+                    span_lineage_metrics = true,
+                    block_addr_store_block_id = store_block_id as u64,
+                    block_addr_store_metadata_bytes =
+                        BlockAddrBlockMetadata::SIZE_IN_BYTES as u64,
+                )
+                .in_scope(|| block_addr_store_file.read_bytes_slice(8 + offset..8 + end))
+                .ok()?;
                 block_meta_bytes.as_slice()
             }
         };
@@ -616,20 +685,61 @@ impl BlockAddrStore {
                 if end > block_addr_store_file.len() {
                     return None;
                 }
-                block_addr_store_file.read_bytes_slice(start..end).ok()
+                tracing::info_span!(
+                    "op",
+                    otel.name = "Block addr store read addr data",
+                    span_lineage_metrics = true,
+                    block_addr_store_addr_bytes = len as u64,
+                    block_addr_store_offset = block_addr_block_data.offset,
+                )
+                .in_scope(|| block_addr_store_file.read_bytes_slice(start..end))
+                .ok()
             }
         }
     }
 
     fn get(&self, block_id: u64) -> Option<BlockAddr> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Block addr store get",
+            span_lineage_metrics = true,
+            sstable_block_id = block_id,
+            block_addr_store_block_id = tracing::field::Empty,
+            block_addr_store_inner_offset = tracing::field::Empty,
+            sstable_block_first_ordinal = tracing::field::Empty,
+            sstable_block_bytes = tracing::field::Empty,
+            sstable_result = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let store_block_id = (block_id as usize) / STORE_BLOCK_LEN;
         let inner_offset = (block_id as usize) % STORE_BLOCK_LEN;
+        span.record("block_addr_store_block_id", store_block_id as u64);
+        span.record("block_addr_store_inner_offset", inner_offset as u64);
         let block_addr_block_data = self.get_block_meta(store_block_id)?;
         let addr_bytes = self.block_addr_data(&block_addr_block_data)?;
-        block_addr_block_data.deserialize_block_addr(addr_bytes.as_slice(), inner_offset)
+        let block_addr =
+            block_addr_block_data.deserialize_block_addr(addr_bytes.as_slice(), inner_offset);
+        if let Some(block_addr) = &block_addr {
+            span.record("sstable_result", "found");
+            span.record("sstable_block_first_ordinal", block_addr.first_ordinal);
+            span.record("sstable_block_bytes", block_addr.byte_range.len() as u64);
+        } else {
+            span.record("sstable_result", "missing");
+        }
+        block_addr
     }
 
     fn binary_search_ord(&self, ord: TermOrdinal) -> (u64, BlockAddr) {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Block addr store binary search ord",
+            span_lineage_metrics = true,
+            sstable_term_ord = ord,
+            sstable_block_id = tracing::field::Empty,
+            sstable_block_first_ordinal = tracing::field::Empty,
+            sstable_block_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let max_block = (self.block_meta_len() / BlockAddrBlockMetadata::SIZE_IN_BYTES) as u64;
         let get_first_ordinal = |block_id| {
             // we can unwrap because block_id < max_block
@@ -643,7 +753,11 @@ impl BlockAddrStore {
             Ok(store_block_id) => {
                 let block_id = store_block_id * STORE_BLOCK_LEN as u64;
                 // we can unwrap because store_block_id < max_block
-                return (block_id, self.get(block_id).unwrap());
+                let block_addr = self.get(block_id).unwrap();
+                span.record("sstable_block_id", block_id);
+                span.record("sstable_block_first_ordinal", block_addr.first_ordinal);
+                span.record("sstable_block_bytes", block_addr.byte_range.len() as u64);
+                return (block_id, block_addr);
             }
             Err(store_block_id) => store_block_id - 1,
         };
@@ -653,10 +767,11 @@ impl BlockAddrStore {
         let addr_bytes = self.block_addr_data(&block_addr_block_data).unwrap();
         let (inner_offset, block_addr) =
             block_addr_block_data.bisect_for_ord(addr_bytes.as_slice(), ord);
-        (
-            store_block_id * STORE_BLOCK_LEN as u64 + inner_offset,
-            block_addr,
-        )
+        let block_id = store_block_id * STORE_BLOCK_LEN as u64 + inner_offset;
+        span.record("sstable_block_id", block_id);
+        span.record("sstable_block_first_ordinal", block_addr.first_ordinal);
+        span.record("sstable_block_bytes", block_addr.byte_range.len() as u64);
+        (block_id, block_addr)
     }
 }
 

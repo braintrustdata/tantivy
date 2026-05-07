@@ -52,15 +52,31 @@ impl ValueReader for TermInfoValueReader {
     }
 
     fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable term info value reader load",
+            span_lineage_metrics = true,
+            term_info_block_bytes = data.len() as u64,
+            term_info_block_terms = tracing::field::Empty,
+            term_info_block_postings_bytes = tracing::field::Empty,
+            term_info_block_positions_bytes = tracing::field::Empty,
+            term_info_block_consumed_bytes = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let len_before = data.len();
         self.term_infos.clear();
         let num_els = VInt::deserialize_u64(&mut data)?;
+        span.record("term_info_block_terms", num_els);
         let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
         let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
+        let mut postings_bytes_total = 0u64;
+        let mut positions_bytes_total = 0u64;
         for _ in 0..num_els {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
+            postings_bytes_total += postings_num_bytes;
+            positions_bytes_total += positions_num_bytes;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
             let term_info = TermInfo {
@@ -73,6 +89,9 @@ impl ValueReader for TermInfoValueReader {
             positions_start = positions_end;
         }
         let consumed_len = len_before - data.len();
+        span.record("term_info_block_postings_bytes", postings_bytes_total);
+        span.record("term_info_block_positions_bytes", positions_bytes_total);
+        span.record("term_info_block_consumed_bytes", consumed_len as u64);
         Ok(consumed_len)
     }
 }

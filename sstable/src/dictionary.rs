@@ -65,7 +65,15 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<Reader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        let byte_range = block_addr.byte_range.clone();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary read reader block",
+            span_lineage_metrics = true,
+            sstable_block_first_ordinal = block_addr.first_ordinal,
+            sstable_block_bytes = byte_range.len() as u64,
+        );
+        let data = span.in_scope(|| self.sstable_slice.read_bytes_slice(byte_range))?;
         Ok(TSSTable::reader(data))
     }
 
@@ -93,7 +101,15 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        let byte_range = block_addr.byte_range.clone();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary read delta block",
+            span_lineage_metrics = true,
+            sstable_block_first_ordinal = block_addr.first_ordinal,
+            sstable_block_bytes = byte_range.len() as u64,
+        );
+        let data = span.in_scope(|| self.sstable_slice.read_bytes_slice(byte_range))?;
         Ok(TSSTable::delta_reader(data))
     }
 
@@ -101,9 +117,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+        let byte_range = block_addr.byte_range.clone();
         let data = self
             .sstable_slice
-            .read_bytes_slice_async(block_addr.byte_range)
+            .read_bytes_slice_async(byte_range)
             .await?;
         Ok(TSSTable::delta_reader(data))
     }
@@ -181,12 +198,33 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary open",
+            span_lineage_metrics = true,
+            sstable_dictionary_file_bytes = term_dictionary_file.len() as u64,
+            sstable_dictionary_index_offset = tracing::field::Empty,
+            sstable_dictionary_index_bytes = tracing::field::Empty,
+            sstable_dictionary_num_terms = tracing::field::Empty,
+            sstable_dictionary_version = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
-        let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
+        let mut footer_len_bytes: OwnedBytes = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary read footer",
+            span_lineage_metrics = true,
+            sstable_dictionary_footer_bytes = footer_len_slice.len() as u64,
+        )
+        .in_scope(|| footer_len_slice.read_bytes())?;
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
+        span.record("sstable_dictionary_index_offset", index_offset);
+        span.record("sstable_dictionary_index_bytes", index_slice.len() as u64);
+        span.record("sstable_dictionary_num_terms", num_terms);
+        span.record("sstable_dictionary_version", version);
 
         let sstable_index = match version {
             2 => SSTableIndex::V2(
@@ -267,15 +305,30 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         key: K,
         sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
     ) -> io::Result<Option<TermOrdinal>> {
-        let mut term_ord = 0;
         let key_bytes = key.as_ref();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary decode up to key",
+            span_lineage_metrics = true,
+            sstable_key_bytes = key_bytes.len() as u64,
+            sstable_decode_result = tracing::field::Empty,
+            sstable_decode_terms_traversed = tracing::field::Empty,
+            sstable_decode_term_ord = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let mut term_ord = 0;
         let mut ok_bytes = 0;
-        while sstable_delta_reader.advance()? {
+        let mut terms_traversed = 0u64;
+        let result = 'decode: loop {
+            if !sstable_delta_reader.advance()? {
+                break Ok(None);
+            }
+            terms_traversed += 1;
             let prefix_len = sstable_delta_reader.common_prefix_len();
             let suffix = sstable_delta_reader.suffix();
 
             match prefix_len.cmp(&ok_bytes) {
-                Ordering::Less => return Ok(None), // popped bytes already matched => too far
+                Ordering::Less => break Ok(None), // popped bytes already matched => too far
                 Ordering::Equal => (),
                 Ordering::Greater => {
                     // the ok prefix is less than current entry prefix => continue to next elem
@@ -289,23 +342,35 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 match suffix_byte.cmp(key_byte) {
                     Ordering::Less => break,              // byte too small
                     Ordering::Equal => ok_bytes += 1,     // new matching byte
-                    Ordering::Greater => return Ok(None), // too far
+                    Ordering::Greater => break 'decode Ok(None), // too far
                 }
             }
 
             if ok_bytes == key_bytes.len() {
                 if prefix_len + suffix.len() == ok_bytes {
-                    return Ok(Some(term_ord));
+                    break Ok(Some(term_ord));
                 } else {
                     // current key is a prefix of current element, not a match
-                    return Ok(None);
+                    break Ok(None);
                 }
             }
 
             term_ord += 1;
+        };
+        span.record("sstable_decode_terms_traversed", terms_traversed);
+        match &result {
+            Ok(Some(ord)) => {
+                span.record("sstable_decode_result", "found");
+                span.record("sstable_decode_term_ord", *ord);
+            }
+            Ok(None) => {
+                span.record("sstable_decode_result", "missing");
+            }
+            Err(_) => {
+                span.record("sstable_decode_result", "error");
+            }
         }
-
-        Ok(None)
+        result
     }
 
     /// Returns the ordinal associated with a given term.
@@ -350,26 +415,60 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Returns the number of terms in the dictionary.
     pub fn term_info_from_ord(&self, term_ord: TermOrdinal) -> io::Result<Option<TSSTable::Value>> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary term info from ord",
+            span_lineage_metrics = true,
+            sstable_term_ord = term_ord,
+            sstable_block_first_ordinal = tracing::field::Empty,
+            sstable_block_bytes = tracing::field::Empty,
+            sstable_result = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         // find block in which the term would be
         let block_addr = self.sstable_index.get_block_with_ord(term_ord);
         let first_ordinal = block_addr.first_ordinal;
+        span.record("sstable_block_first_ordinal", first_ordinal);
+        span.record("sstable_block_bytes", block_addr.byte_range.len() as u64);
 
         // then search inside that block only
         let mut sstable_reader = self.sstable_reader_block(block_addr)?;
         for _ in first_ordinal..=term_ord {
             if !sstable_reader.advance()? {
+                span.record("sstable_result", "missing");
                 return Ok(None);
             }
         }
+        span.record("sstable_result", "found");
         Ok(Some(sstable_reader.value().clone()))
     }
 
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
-        if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
+        let key_bytes = key.as_ref();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "SSTable dictionary get",
+            span_lineage_metrics = true,
+            sstable_key_bytes = key_bytes.len() as u64,
+            sstable_block_first_ordinal = tracing::field::Empty,
+            sstable_block_bytes = tracing::field::Empty,
+            sstable_result = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        if let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes) {
+            span.record("sstable_block_first_ordinal", block_addr.first_ordinal);
+            span.record("sstable_block_bytes", block_addr.byte_range.len() as u64);
             let sstable_reader = self.sstable_delta_reader_block(block_addr)?;
-            return self.do_get(key, sstable_reader);
+            let result = self.do_get(key_bytes, sstable_reader);
+            match &result {
+                Ok(Some(_)) => span.record("sstable_result", "found"),
+                Ok(None) => span.record("sstable_result", "missing"),
+                Err(_) => span.record("sstable_result", "error"),
+            };
+            return result;
         }
+        span.record("sstable_result", "missing_no_block");
         Ok(None)
     }
 

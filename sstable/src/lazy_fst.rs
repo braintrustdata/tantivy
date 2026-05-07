@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use common::file_slice::FileSlice;
@@ -22,6 +23,7 @@ pub(crate) struct LazyFstIndex {
     fst_file: FileSlice,
     meta: LazyFstMeta,
     pages: Arc<Mutex<PageCache>>,
+    stats: Arc<LazyFstStats>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,22 +37,83 @@ struct PageCache {
     pages: HashMap<usize, OwnedBytes>,
 }
 
+#[derive(Debug, Default)]
+struct LazyFstStats {
+    page_requests: AtomicU64,
+    page_cache_hits: AtomicU64,
+    page_cache_misses: AtomicU64,
+    page_bytes_read: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LazyFstStatsSnapshot {
+    page_requests: u64,
+    page_cache_hits: u64,
+    page_cache_misses: u64,
+    page_bytes_read: u64,
+}
+
+impl LazyFstStats {
+    fn snapshot(&self) -> LazyFstStatsSnapshot {
+        LazyFstStatsSnapshot {
+            page_requests: self.page_requests.load(AtomicOrdering::Relaxed),
+            page_cache_hits: self.page_cache_hits.load(AtomicOrdering::Relaxed),
+            page_cache_misses: self.page_cache_misses.load(AtomicOrdering::Relaxed),
+            page_bytes_read: self.page_bytes_read.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+impl LazyFstStatsSnapshot {
+    fn delta(self, before: LazyFstStatsSnapshot) -> LazyFstStatsSnapshot {
+        LazyFstStatsSnapshot {
+            page_requests: self.page_requests.saturating_sub(before.page_requests),
+            page_cache_hits: self.page_cache_hits.saturating_sub(before.page_cache_hits),
+            page_cache_misses: self.page_cache_misses.saturating_sub(before.page_cache_misses),
+            page_bytes_read: self.page_bytes_read.saturating_sub(before.page_bytes_read),
+        }
+    }
+}
+
 impl LazyFstIndex {
     pub(crate) fn open(fst_file: FileSlice) -> io::Result<Self> {
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Lazy FST open",
+            span_lineage_metrics = true,
+            lazy_fst_file_bytes = fst_file.len() as u64,
+            lazy_fst_root_addr = tracing::field::Empty,
+            lazy_fst_version = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         if fst_file.len() < 32 {
             return Err(corruption_error());
         }
 
-        let mut header = fst_file.read_bytes_slice(0..16)?;
+        let mut header = tracing::info_span!(
+            "op",
+            otel.name = "Lazy FST read header",
+            span_lineage_metrics = true,
+            lazy_fst_header_bytes = 16u64,
+        )
+        .in_scope(|| fst_file.read_bytes_slice(0..16))?;
         let version = u64::deserialize(&mut header)?;
+        span.record("lazy_fst_version", version);
         if version == 0 || version > FST_VERSION {
             return Err(corruption_error());
         }
 
-        let mut footer = fst_file.read_bytes_slice(fst_file.len() - 16..fst_file.len())?;
+        let mut footer = tracing::info_span!(
+            "op",
+            otel.name = "Lazy FST read footer",
+            span_lineage_metrics = true,
+            lazy_fst_footer_bytes = 16u64,
+        )
+        .in_scope(|| fst_file.read_bytes_slice(fst_file.len() - 16..fst_file.len()))?;
         let _len = u64::deserialize(&mut footer)?;
         let root_addr = usize::try_from(u64::deserialize(&mut footer)?)
             .map_err(|_| corruption_error())?;
+        span.record("lazy_fst_root_addr", root_addr as u64);
 
         if (root_addr == EMPTY_ADDRESS && fst_file.len() != 32)
             || (root_addr != EMPTY_ADDRESS && root_addr + 17 != fst_file.len())
@@ -64,10 +127,47 @@ impl LazyFstIndex {
             pages: Arc::new(Mutex::new(PageCache {
                 pages: HashMap::new(),
             })),
+            stats: Arc::new(LazyFstStats::default()),
         })
     }
 
     pub(crate) fn lower_bound(&self, key: &[u8]) -> io::Result<Option<u64>> {
+        let before = self.stats.snapshot();
+        let span = tracing::info_span!(
+            "op",
+            otel.name = "Lazy FST lower bound",
+            span_lineage_metrics = true,
+            lazy_fst_key_bytes = key.len() as u64,
+            lazy_fst_result = tracing::field::Empty,
+            lazy_fst_output_ord = tracing::field::Empty,
+            lazy_fst_page_requests = tracing::field::Empty,
+            lazy_fst_page_cache_hits = tracing::field::Empty,
+            lazy_fst_page_cache_misses = tracing::field::Empty,
+            lazy_fst_page_bytes_read = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+        let result = self.lower_bound_inner(key);
+        let delta = self.stats.snapshot().delta(before);
+        span.record("lazy_fst_page_requests", delta.page_requests);
+        span.record("lazy_fst_page_cache_hits", delta.page_cache_hits);
+        span.record("lazy_fst_page_cache_misses", delta.page_cache_misses);
+        span.record("lazy_fst_page_bytes_read", delta.page_bytes_read);
+        match &result {
+            Ok(Some(ord)) => {
+                span.record("lazy_fst_result", "found");
+                span.record("lazy_fst_output_ord", *ord);
+            }
+            Ok(None) => {
+                span.record("lazy_fst_result", "missing");
+            }
+            Err(_) => {
+                span.record("lazy_fst_result", "error");
+            }
+        }
+        result
+    }
+
+    fn lower_bound_inner(&self, key: &[u8]) -> io::Result<Option<u64>> {
         let mut node = self.node(self.meta.root_addr)?;
         let mut out = 0u64;
         let mut frames = Vec::with_capacity(key.len());
@@ -255,16 +355,36 @@ impl LazyFstIndex {
     }
 
     fn page(&self, page_id: usize) -> io::Result<OwnedBytes> {
+        self.stats
+            .page_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let mut cache = self
             .pages
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "FST page cache poisoned"))?;
         if let Some(page) = cache.pages.get(&page_id) {
+            self.stats
+                .page_cache_hits
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(page.clone());
         }
+        self.stats
+            .page_cache_misses
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let start = page_id * PAGE_SIZE;
         let end = (start + PAGE_SIZE).min(self.fst_file.len());
-        let page = self.fst_file.read_bytes_slice(start..end)?;
+        let page = tracing::info_span!(
+            "op",
+            otel.name = "Lazy FST read page",
+            span_lineage_metrics = true,
+            lazy_fst_page_id = page_id as u64,
+            lazy_fst_page_bytes = (end - start) as u64,
+            lazy_fst_cache_entries = cache.pages.len() as u64,
+        )
+        .in_scope(|| self.fst_file.read_bytes_slice(start..end))?;
+        self.stats
+            .page_bytes_read
+            .fetch_add(page.len() as u64, AtomicOrdering::Relaxed);
         cache.pages.insert(page_id, page.clone());
         Ok(page)
     }
