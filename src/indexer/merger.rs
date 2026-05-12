@@ -356,7 +356,7 @@ impl IndexMerger {
         doc_id_mapping: SegmentDocIdMapping,
     ) -> crate::Result<()> {
         debug_time!("write-fast-fields");
-        let fast_fields_span = tracing::info_span!(
+        let fast_fields_span = tracing::debug_span!(
             "write_fast_fields",
             num_readers = self.readers.len(),
             doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
@@ -578,7 +578,7 @@ impl IndexMerger {
         // It is only used as a parameter in the BM25 formula.
         let total_num_tokens: u64 = estimate_total_num_tokens(&self.readers, indexed_field)?;
         let scratch_temp_root = self.scratch_temp_root();
-        let postings_for_field_span = tracing::info_span!(
+        let postings_for_field_span = tracing::debug_span!(
             "write_postings_for_field",
             field = %field_name,
             num_readers = self.readers.len(),
@@ -830,7 +830,7 @@ impl IndexMerger {
     ) -> crate::Result<()> {
         debug_time!("write-storable-fields");
         debug!("write-storable-field");
-        let store_span = tracing::info_span!(
+        let store_span = tracing::debug_span!(
             "write_storable_fields",
             doc_id_mapping_is_trivial = doc_id_mapping.is_trivial(),
             stacked_segments = tracing::field::Empty,
@@ -928,7 +928,7 @@ impl IndexMerger {
             } => {
                 debug!("write-storagefields");
                 self.write_storable_fields(&mut store_writer, &doc_id_mapping)?;
-                tracing::info_span!("close_store_writer").in_scope(|| store_writer.close())?;
+                tracing::debug_span!("close_store_writer").in_scope(|| store_writer.close())?;
                 Ok(MergeWriteTaskOutput::StorableFields)
             }
             MergeWriteTask::FastFields {
@@ -937,7 +937,7 @@ impl IndexMerger {
             } => {
                 debug!("write-fastfields");
                 self.write_fast_fields(&mut fast_field_write, doc_id_mapping)?;
-                tracing::info_span!("close_fast_fields_writer")
+                tracing::debug_span!("close_fast_fields_writer")
                     .in_scope(|| fast_field_write.terminate())?;
                 Ok(MergeWriteTaskOutput::FastFields)
             }
@@ -967,7 +967,7 @@ impl IndexMerger {
         } else {
             self.get_doc_id_from_concatenated_data()?
         };
-        let write_span = tracing::info_span!(
+        let write_span = tracing::debug_span!(
             "index_merger_write",
             num_readers = self.readers.len(),
             max_doc = self.max_doc,
@@ -989,11 +989,11 @@ impl IndexMerger {
         let _enter = write_span.enter();
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
-            tracing::info_span!("write_fieldnorms")
+            tracing::debug_span!("write_fieldnorms")
                 .in_scope(|| self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping))?;
         }
         debug!("write-postings");
-        let fieldnorm_readers = tracing::info_span!("open_fieldnorm_readers").in_scope(
+        let fieldnorm_readers = tracing::debug_span!("open_fieldnorm_readers").in_scope(
             || -> crate::Result<FieldNormReaders> {
                 let fieldnorm_data = serializer
                     .segment()
@@ -1066,7 +1066,7 @@ impl IndexMerger {
                     .write_serialized_field(field_result.field, field_result.serialized_field)?;
             }
         }
-        tracing::info_span!("close_postings_serializer")
+        tracing::debug_span!("close_postings_serializer")
             .in_scope(|| postings_serializer.close())?;
         tracing::Span::current().record(
             "total_serialized_postings_output_bytes",
@@ -1087,7 +1087,7 @@ impl IndexMerger {
         }
 
         debug!("close-serializer");
-        tracing::info_span!("close_serializer").in_scope(|| -> crate::Result<()> {
+        tracing::debug_span!("close_serializer").in_scope(|| -> crate::Result<()> {
             if let Some(fieldnorms_serializer) = fieldnorms_serializer {
                 fieldnorms_serializer.close()?;
             }
