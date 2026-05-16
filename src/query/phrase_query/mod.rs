@@ -2,7 +2,8 @@ mod phrase_query;
 mod phrase_scorer;
 mod phrase_weight;
 
-pub use self::phrase_query::PhraseQuery;
+pub(crate) use self::phrase_query::PhraseQueryStats;
+pub use self::phrase_query::{PhraseQuery, PhraseQueryStatsSnapshot};
 pub(crate) use self::phrase_scorer::intersection_count;
 pub use self::phrase_scorer::PhraseScorer;
 pub use self::phrase_weight::PhraseWeight;
