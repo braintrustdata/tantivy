@@ -139,4 +139,14 @@ impl StoreWriter {
         self.block_compressor.close()?;
         Ok(())
     }
+
+    /// Finalizes the store writer and appends opaque extension data after the skip index.
+    ///
+    /// The extension bytes are not interpreted by Tantivy. Readers can retrieve them with
+    /// [`StoreReader::extension_data`].
+    pub fn close_with_extension(mut self, extension_data: &[u8]) -> io::Result<()> {
+        self.send_current_block_to_compressor()?;
+        self.block_compressor.close_with_extension(extension_data)?;
+        Ok(())
+    }
 }

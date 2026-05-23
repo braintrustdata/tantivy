@@ -74,6 +74,18 @@ impl BlockCompressor {
             }
         }
     }
+
+    pub fn close_with_extension(self, extension_data: &[u8]) -> io::Result<()> {
+        let imp = self.0;
+        match imp {
+            BlockCompressorVariants::SameThread(block_compressor) => {
+                block_compressor.close_with_extension(extension_data)
+            }
+            BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
+                different_thread_block_compressor.close_with_extension(extension_data.to_vec())
+            }
+        }
+    }
 }
 
 struct BlockCompressorImpl {
@@ -149,6 +161,20 @@ impl BlockCompressorImpl {
         docstore_footer.serialize(&mut self.writer)?;
         self.writer.terminate()
     }
+
+    fn close_with_extension(mut self, extension_data: &[u8]) -> io::Result<()> {
+        let header_offset: u64 = self.writer.written_bytes();
+        self.offset_index_writer.serialize_into(&mut self.writer)?;
+        let extension_offset: u64 = self.writer.written_bytes();
+        self.writer.write_all(extension_data)?;
+        let docstore_footer = DocStoreFooter::with_extension_offset(
+            header_offset,
+            Decompressor::from(self.compressor),
+            extension_offset,
+        );
+        docstore_footer.serialize(&mut self.writer)?;
+        self.writer.terminate()
+    }
 }
 
 // ---------------------------------
@@ -158,6 +184,7 @@ enum BlockCompressorMessage {
         num_docs_in_block: u32,
     },
     Stack(StoreReader),
+    CloseWithExtension(Vec<u8>),
 }
 
 struct DedicatedThreadBlockCompressorImpl {
@@ -187,6 +214,10 @@ impl DedicatedThreadBlockCompressorImpl {
                         }
                         BlockCompressorMessage::Stack(store_reader) => {
                             block_compressor.stack(store_reader)?;
+                        }
+                        BlockCompressorMessage::CloseWithExtension(extension_data) => {
+                            block_compressor.close_with_extension(&extension_data)?;
+                            return Ok(());
                         }
                     }
                 }
@@ -219,6 +250,12 @@ impl DedicatedThreadBlockCompressorImpl {
     }
 
     fn close(self) -> io::Result<()> {
+        drop(self.tx);
+        harvest_thread_result(self.join_handle)
+    }
+
+    fn close_with_extension(mut self, extension_data: Vec<u8>) -> io::Result<()> {
+        self.send(BlockCompressorMessage::CloseWithExtension(extension_data))?;
         drop(self.tx);
         harvest_thread_result(self.join_handle)
     }

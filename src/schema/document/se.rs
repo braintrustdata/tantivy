@@ -77,13 +77,13 @@ impl<'se, W> BinaryValueSerializer<'se, W>
 where W: Write
 {
     /// Creates a new serializer with a provided writer.
-    pub(crate) fn new(writer: &'se mut W) -> Self {
+    pub fn new(writer: &'se mut W) -> Self {
         Self { writer }
     }
 
     /// Attempts to serialize a given value and write the output
     /// to the writer.
-    pub(crate) fn serialize_value<'a, V>(
+    pub fn serialize_value<'a, V>(
         &mut self,
         value: ReferenceValue<'a, V>,
     ) -> io::Result<()>

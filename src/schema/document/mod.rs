@@ -165,12 +165,14 @@ use std::mem;
 
 pub(crate) use self::de::BinaryDocumentDeserializer;
 pub use self::de::{
-    ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
-    ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
+    ArrayAccess, BinaryValueDeserializer, DeserializeError, DocumentDeserialize,
+    DocumentDeserializer, ObjectAccess, ValueDeserialize, ValueDeserializer, ValueType,
+    ValueVisitor,
 };
 pub use self::default_document::{DocParsingError, TantivyDocument};
 pub use self::owned_value::OwnedValue;
 pub(crate) use self::se::BinaryDocumentSerializer;
+pub use self::se::BinaryValueSerializer;
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
 use super::*;
 

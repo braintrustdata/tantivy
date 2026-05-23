@@ -350,7 +350,7 @@ impl<'de, R> BinaryValueDeserializer<'de, R>
 where R: Read
 {
     /// Attempts to create a new value deserializer from a given reader.
-    fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
+    pub fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
         let type_code = <u8 as BinarySerializable>::deserialize(reader)?;
 
         let value_type = match type_code {
