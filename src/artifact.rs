@@ -1,9 +1,15 @@
 //! Extension points for segment-owned files written outside Tantivy's core codecs.
 
+use std::io::{self, Read, Write};
+
+use common::{BinarySerializable, OwnedBytes};
+
 use crate::directory::WritePtr;
 use crate::index::Segment;
 pub use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
 use crate::DocId;
+
+const STORE_EXTENSION_MAGIC: &[u8; 8] = b"TVSTX001";
 
 /// Per-document artifact payload routed to a registered segment artifact provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,4 +82,78 @@ pub struct SegmentArtifactMergeContext<'a> {
     pub doc_id_mapping: &'a SegmentDocIdMapping,
     /// Number of documents in the merged segment.
     pub max_doc: DocId,
+}
+
+/// Provider for opaque data appended to Tantivy's doc store.
+pub trait SegmentStoreExtensionProvider: Send + Sync {
+    /// Stable provider identifier used by document store extension payloads.
+    fn id(&self) -> &str;
+
+    /// Creates a writer for a new segment.
+    fn make_writer(&self) -> Box<dyn SegmentStoreExtensionWriter>;
+}
+
+/// Writer for one provider's doc store extension data within a new segment.
+pub trait SegmentStoreExtensionWriter: Send {
+    /// Records provider-specific bytes for a document.
+    fn record(&mut self, doc_id: DocId, payload: &[u8]) -> crate::Result<()>;
+
+    /// Returns whether the writer has any payloads to serialize.
+    fn has_payloads(&self) -> bool;
+
+    /// Estimated heap usage for the writer.
+    fn mem_usage(&self) -> usize {
+        0
+    }
+
+    /// Serializes this provider's store extension payload.
+    fn serialize(
+        &mut self,
+        doc_id_map: Option<&DocIdMapping>,
+        max_doc: DocId,
+    ) -> crate::Result<Vec<u8>>;
+}
+
+/// Serializes provider payloads into a single doc store extension blob.
+pub fn serialize_segment_store_extensions<'a, I>(entries: I) -> io::Result<Vec<u8>>
+where
+    I: IntoIterator<Item = (&'a str, Vec<u8>)>,
+{
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let mut output = Vec::new();
+    output.write_all(STORE_EXTENSION_MAGIC)?;
+    (entries.len() as u64).serialize(&mut output)?;
+    for (provider_id, payload) in entries {
+        provider_id.to_string().serialize(&mut output)?;
+        (payload.len() as u64).serialize(&mut output)?;
+        output.write_all(&payload)?;
+    }
+    Ok(output)
+}
+
+/// Returns one provider payload from a doc store extension blob.
+pub fn segment_store_extension_payload(
+    mut extension_data: &[u8],
+    provider_id: &str,
+) -> io::Result<Option<OwnedBytes>> {
+    if extension_data.len() < STORE_EXTENSION_MAGIC.len() {
+        return Ok(None);
+    }
+    let mut magic = [0u8; 8];
+    extension_data.read_exact(&mut magic)?;
+    if &magic != STORE_EXTENSION_MAGIC {
+        return Ok(None);
+    }
+
+    let num_entries = <u64 as BinarySerializable>::deserialize(&mut extension_data)? as usize;
+    for _ in 0..num_entries {
+        let entry_provider_id = <String as BinarySerializable>::deserialize(&mut extension_data)?;
+        let payload_len = <u64 as BinarySerializable>::deserialize(&mut extension_data)? as usize;
+        let mut payload = vec![0; payload_len];
+        extension_data.read_exact(&mut payload)?;
+        if entry_provider_id == provider_id {
+            return Ok(Some(OwnedBytes::new(payload)));
+        }
+    }
+    Ok(None)
 }

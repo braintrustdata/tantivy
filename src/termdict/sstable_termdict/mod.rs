@@ -61,11 +61,14 @@ impl ValueReader for TermInfoValueReader {
             let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
             let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
+            let repeated_postings_start_offset = VInt::deserialize_u64(&mut data)? as usize;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
+            let repeated_postings_start = postings_start + repeated_postings_start_offset;
             let term_info = TermInfo {
                 doc_freq,
                 postings_range: postings_start..postings_end,
+                repeated_postings_range: repeated_postings_start..postings_end,
                 positions_range: positions_start..positions_end,
             };
             self.term_infos.push(term_info);
@@ -100,6 +103,8 @@ impl ValueWriter for TermInfoValueWriter {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
+            VInt((term_info.repeated_postings_range.start - term_info.postings_range.start) as u64)
+                .serialize_into_vec(buffer);
         }
     }
 
@@ -121,16 +126,19 @@ mod tests {
         term_info_writer.write(&TermInfo {
             doc_freq: 120u32,
             postings_range: 17..45,
+            repeated_postings_range: 45..45,
             positions_range: 10..122,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 10u32,
             postings_range: 45..450,
+            repeated_postings_range: 450..450,
             positions_range: 122..1100,
         });
         term_info_writer.write(&TermInfo {
             doc_freq: 17u32,
             postings_range: 450..462,
+            repeated_postings_range: 462..462,
             positions_range: 1100..1302,
         });
         let mut buffer = Vec::new();
@@ -142,6 +150,7 @@ mod tests {
             &TermInfo {
                 doc_freq: 120u32,
                 postings_range: 17..45,
+                repeated_postings_range: 45..45,
                 positions_range: 10..122
             }
         );

@@ -156,6 +156,11 @@ impl SegmentReader {
         StoreReader::open(self.store_file.clone(), cache_num_blocks)
     }
 
+    /// Returns opaque extension data appended to the segment's doc store.
+    pub fn store_extension_data(&self) -> io::Result<Option<crate::directory::OwnedBytes>> {
+        StoreReader::extension_data(self.store_file.clone())
+    }
+
     /// Open a new segment for reading.
     pub fn open(segment: &Segment) -> crate::Result<SegmentReader> {
         Self::open_with_custom_alive_set(segment, None)

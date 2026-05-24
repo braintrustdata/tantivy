@@ -216,6 +216,7 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
     postings_serializer: PostingsSerializer<&'a mut CountingWriter<W>>,
     positions_serializer_opt: Option<PositionSerializer<&'a mut CountingWriter<W>>>,
     current_term_info: TermInfo,
+    repeated_postings_payload: Vec<u8>,
     term_open: bool,
 }
 
@@ -254,6 +255,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             postings_serializer,
             positions_serializer_opt,
             current_term_info: TermInfo::default(),
+            repeated_postings_payload: Vec::new(),
             term_open: false,
         })
     }
@@ -269,6 +271,7 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         TermInfo {
             doc_freq: 0,
             postings_range: addr..addr,
+            repeated_postings_range: addr..addr,
             positions_range: positions_start..positions_start,
         }
     }
@@ -314,6 +317,11 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         }
     }
 
+    /// Appends codec extension bytes to the current term's postings payload.
+    pub fn write_repeated_postings_payload(&mut self, payload: &[u8]) {
+        self.repeated_postings_payload.extend_from_slice(payload);
+    }
+
     /// Finish the serialization for this term postings.
     ///
     /// If the current block is incomplete, it needs to be encoded
@@ -325,8 +333,14 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         if self.term_open {
             self.postings_serializer
                 .close_term(self.current_term_info.doc_freq)?;
-            self.current_term_info.postings_range.end =
-                self.postings_serializer.written_bytes() as usize;
+            let repeated_start = self.postings_serializer.written_bytes() as usize;
+            self.current_term_info.repeated_postings_range.start = repeated_start;
+            self.postings_serializer
+                .write_repeated_postings_payload(&self.repeated_postings_payload)?;
+            let postings_end = self.postings_serializer.written_bytes() as usize;
+            self.current_term_info.postings_range.end = postings_end;
+            self.current_term_info.repeated_postings_range.end = postings_end;
+            self.repeated_postings_payload.clear();
 
             if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
                 positions_serializer.close_term()?;
@@ -568,6 +582,10 @@ impl<W: Write> PostingsSerializer<W> {
         self.postings_write.clear();
         self.bm25_weight = None;
         Ok(())
+    }
+
+    pub fn write_repeated_postings_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.output_write.write_all(payload)
     }
 
     /// Returns the number of bytes written in the postings write object

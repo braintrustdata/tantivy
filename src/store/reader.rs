@@ -5,7 +5,7 @@ use std::ops::{AddAssign, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use lru::LruCache;
 
 use super::footer::DocStoreFooter;
@@ -137,6 +137,28 @@ impl StoreReader {
             skip_index: Arc::new(skip_index),
             space_usage,
         })
+    }
+
+    /// Returns opaque extension data appended with [`StoreWriter::close_with_extension`].
+    pub fn extension_data(store_file: FileSlice) -> io::Result<Option<OwnedBytes>> {
+        let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
+        let Some(extension_offset) = footer.extension_offset else {
+            return Ok(None);
+        };
+        if extension_offset < footer.offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "doc store extension offset is before the skip index",
+            ));
+        }
+        let extension_start = extension_offset as usize;
+        if extension_start > data_and_offset.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "doc store extension offset is outside the store body",
+            ));
+        }
+        Ok(Some(data_and_offset.slice(extension_start..).read_bytes()?))
     }
 
     pub(crate) fn block_checkpoints(&self) -> impl Iterator<Item = Checkpoint> + '_ {
@@ -386,9 +408,9 @@ mod tests {
     use super::*;
     use crate::directory::RamDirectory;
     use crate::schema::document::Value;
-    use crate::schema::{Field, TantivyDocument};
+    use crate::schema::{Field, Schema, TantivyDocument, STORED};
     use crate::store::tests::write_lorem_ipsum_store;
-    use crate::store::Compressor;
+    use crate::store::{Compressor, StoreWriter};
     use crate::Directory;
 
     const BLOCK_SIZE: usize = 16_384;
@@ -437,6 +459,33 @@ mod tests {
         assert_eq!(store.cache_stats().cache_misses, 2);
 
         assert_eq!(store.cache.peek_lru(), Some(11207));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_extension_data_round_trip() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let path = Path::new("store-with-extension");
+        let writer = directory.open_write(path)?;
+
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", STORED);
+        let schema = schema_builder.build();
+
+        let mut store_writer = StoreWriter::new(writer, Compressor::None, BLOCK_SIZE, false)?;
+        let mut doc = TantivyDocument::new();
+        doc.add_text(title, "hello");
+        store_writer.store(&doc, &schema)?;
+        store_writer.close_with_extension(b"opaque extension")?;
+
+        let store_file = directory.open_read(path)?;
+        let extension_data = StoreReader::extension_data(store_file.clone())?.unwrap();
+        assert_eq!(extension_data.as_slice(), b"opaque extension");
+
+        let store_reader = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+        let stored_doc: TantivyDocument = store_reader.get(0)?;
+        assert_eq!(get_text_field(&stored_doc, &title), Some("hello"));
 
         Ok(())
     }

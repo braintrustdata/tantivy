@@ -36,7 +36,9 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
         self.segment_writer.add_document(AddOperation {
             opstamp,
             document,
+            stored_document: None,
             artifacts: Vec::new(),
+            store_extensions: Vec::new(),
         })
     }
 

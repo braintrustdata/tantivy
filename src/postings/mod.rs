@@ -25,8 +25,8 @@ pub(crate) use self::per_field_postings_writer::PerFieldPostingsWriter;
 pub use self::postings::Postings;
 pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, PostingsWriter};
 pub use self::segment_postings::SegmentPostings;
-pub(crate) use self::serializer::{SerializedFieldData, TempFieldWrite};
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
+pub(crate) use self::serializer::{SerializedFieldData, TempFieldWrite};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
 pub use self::term_info::TermInfo;
 
@@ -43,15 +43,17 @@ pub mod tests {
     use std::mem;
 
     use super::{InvertedIndexSerializer, Postings};
+    use crate::directory::CompositeFile;
     use crate::docset::{DocSet, TERMINATED};
     use crate::fieldnorm::FieldNormReader;
-    use crate::index::{Index, SegmentComponent, SegmentReader};
+    use crate::index::{Index, InvertedIndexReader, SegmentComponent, SegmentReader};
     use crate::indexer::operation::AddOperation;
     use crate::indexer::SegmentWriter;
     use crate::query::Scorer;
     use crate::schema::{
         Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, INDEXED, TEXT,
     };
+    use crate::termdict::TermDictionary;
     use crate::tokenizer::{SimpleTokenizer, MAX_TOKEN_LEN};
     use crate::{DocId, HasLen, IndexWriter, Score};
 
@@ -74,6 +76,55 @@ pub mod tests {
         posting_serializer.close()?;
         let read = segment.open_read(SegmentComponent::Positions)?;
         assert_eq!(read.len(), 207);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_repeated_postings_payload_write_read() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut segment = index.new_segment();
+        let mut posting_serializer = InvertedIndexSerializer::open(&mut segment)?;
+        let mut field_serializer = posting_serializer.new_field(text_field, 1, None)?;
+        let payload = b"semantic repeated payload";
+        field_serializer.new_term("abc".as_bytes(), 1u32, true)?;
+        field_serializer.write_doc(0u32, 1, &[1]);
+        field_serializer.write_repeated_postings_payload(payload);
+        field_serializer.close()?;
+        posting_serializer.close()?;
+
+        let termdict_file = segment.open_read(SegmentComponent::Terms)?;
+        let postings_file = segment.open_read(SegmentComponent::Postings)?;
+        let positions_file = segment.open_read(SegmentComponent::Positions)?;
+        let termdict_composite = CompositeFile::open(&termdict_file)?;
+        let postings_composite = CompositeFile::open(&postings_file)?;
+        let positions_composite = CompositeFile::open(&positions_file)?;
+        let inverted_index = InvertedIndexReader::new(
+            TermDictionary::open(termdict_composite.open_read(text_field).unwrap())?,
+            postings_composite.open_read(text_field).unwrap(),
+            positions_composite.open_read(text_field).unwrap(),
+            IndexRecordOption::WithFreqsAndPositions,
+        )?;
+
+        let term = Term::from_field_text(text_field, "abc");
+        let term_info = inverted_index.get_term_info(&term)?.unwrap();
+        assert_eq!(
+            inverted_index
+                .read_repeated_postings_payload_from_terminfo(&term_info)?
+                .as_slice(),
+            payload
+        );
+        let mut postings = inverted_index
+            .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)?
+            .unwrap();
+        assert_eq!(postings.doc(), 0);
+        assert_eq!(postings.term_freq(), 1);
+        let mut positions = Vec::new();
+        postings.positions(&mut positions);
+        assert_eq!(&positions[..], &[1]);
+        assert_eq!(postings.advance(), TERMINATED);
         Ok(())
     }
 
@@ -235,7 +286,9 @@ pub mod tests {
                        text_field => "a b a c a d a a.",
                        text_field => "d d d d a"
                     ),
+                    stored_document: None,
                     artifacts: Vec::new(),
+                    store_extensions: Vec::new(),
                 };
                 segment_writer.add_document(op)?;
             }
@@ -243,7 +296,9 @@ pub mod tests {
                 let op = AddOperation {
                     opstamp: 1u64,
                     document: doc!(text_field => "b a"),
+                    stored_document: None,
                     artifacts: Vec::new(),
+                    store_extensions: Vec::new(),
                 };
                 segment_writer.add_document(op).unwrap();
             }
@@ -253,7 +308,9 @@ pub mod tests {
                 let op = AddOperation {
                     opstamp: 2u64,
                     document: doc!(text_field => text),
+                    stored_document: None,
                     artifacts: Vec::new(),
+                    store_extensions: Vec::new(),
                 };
                 segment_writer.add_document(op).unwrap();
             }
