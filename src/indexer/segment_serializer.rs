@@ -117,13 +117,26 @@ impl SegmentSerializer {
     }
 
     /// Finalize the segment serialization.
-    pub fn close(mut self) -> crate::Result<()> {
+    pub fn close(self) -> crate::Result<()> {
+        self.close_with_store_extension(None)
+    }
+
+    /// Finalize the segment serialization with opaque doc store extension data.
+    pub fn close_with_store_extension(
+        mut self,
+        store_extension_data: Option<&[u8]>,
+    ) -> crate::Result<()> {
         if let Some(fieldnorms_serializer) = self.extract_fieldnorms_serializer() {
             fieldnorms_serializer.close()?;
         }
         self.fast_field_write.terminate()?;
         self.postings_serializer.close()?;
-        self.store_writer.close()?;
+        if let Some(store_extension_data) = store_extension_data {
+            self.store_writer
+                .close_with_extension(store_extension_data)?;
+        } else {
+            self.store_writer.close()?;
+        }
         Ok(())
     }
 }

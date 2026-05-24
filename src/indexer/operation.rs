@@ -17,8 +17,12 @@ pub struct AddOperation<D: Document = TantivyDocument> {
     pub opstamp: Opstamp,
     /// Document to add.
     pub document: D,
+    /// Optional document to write to the doc store instead of `document`.
+    pub stored_document: Option<D>,
     /// Per-document artifact payloads.
     pub artifacts: Vec<DocumentArtifact>,
+    /// Per-document doc store extension payloads.
+    pub store_extensions: Vec<DocumentArtifact>,
 }
 
 /// UserOperation is an enum type that encapsulates other operation types.
@@ -32,6 +36,17 @@ pub enum UserOperation<D: Document = TantivyDocument> {
         document: D,
         /// Per-document artifact payloads.
         artifacts: Vec<DocumentArtifact>,
+    },
+    /// Add operation with separate stored document and store extension payloads.
+    AddWithStoreExtensions {
+        /// Document to index.
+        document: D,
+        /// Optional document to store.
+        stored_document: Option<D>,
+        /// Per-document artifact payloads.
+        artifacts: Vec<DocumentArtifact>,
+        /// Per-document doc store extension payloads.
+        store_extensions: Vec<DocumentArtifact>,
     },
     /// Delete operation
     Delete(Term),

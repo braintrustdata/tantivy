@@ -12,6 +12,7 @@ fn make_term_info(term_ord: u64) -> TermInfo {
     TermInfo {
         doc_freq: term_ord as u32,
         postings_range: offset(term_ord)..offset(term_ord + 1),
+        repeated_postings_range: offset(term_ord + 1)..offset(term_ord + 1),
         positions_range: offset(term_ord) * 2..offset(term_ord + 1) * 2,
     }
 }

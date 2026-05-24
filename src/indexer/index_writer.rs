@@ -764,7 +764,9 @@ impl<D: Document> IndexWriter<D> {
         self.send_add_documents_batch(smallvec![AddOperation {
             opstamp,
             document,
-            artifacts: Vec::new()
+            stored_document: None,
+            artifacts: Vec::new(),
+            store_extensions: Vec::new(),
         }])?;
         Ok(opstamp)
     }
@@ -828,7 +830,9 @@ impl<D: Document> IndexWriter<D> {
                     let add_operation = AddOperation {
                         opstamp,
                         document,
+                        stored_document: None,
                         artifacts: Vec::new(),
+                        store_extensions: Vec::new(),
                     };
                     adds.push(add_operation);
                 }
@@ -839,7 +843,24 @@ impl<D: Document> IndexWriter<D> {
                     let add_operation = AddOperation {
                         opstamp,
                         document,
+                        stored_document: None,
                         artifacts,
+                        store_extensions: Vec::new(),
+                    };
+                    adds.push(add_operation);
+                }
+                UserOperation::AddWithStoreExtensions {
+                    document,
+                    stored_document,
+                    artifacts,
+                    store_extensions,
+                } => {
+                    let add_operation = AddOperation {
+                        opstamp,
+                        document,
+                        stored_document,
+                        artifacts,
+                        store_extensions,
                     };
                     adds.push(add_operation);
                 }
@@ -872,12 +893,17 @@ impl<D: Document> Drop for IndexWriter<D> {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::Ipv6Addr;
+    use std::sync::Arc;
 
     use columnar::{Cardinality, Column, MonotonicallyMappableToU128};
     use itertools::Itertools;
     use proptest::prop_oneof;
 
     use super::super::operation::UserOperation;
+    use crate::artifact::{
+        segment_store_extension_payload, DocumentArtifact, SegmentStoreExtensionProvider,
+        SegmentStoreExtensionWriter,
+    };
     use crate::collector::TopDocs;
     use crate::directory::error::LockError;
     use crate::error::*;
@@ -903,6 +929,42 @@ mod tests {
                          sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt \
                          mollit anim id est laborum.";
 
+    struct TestStoreExtensionProvider;
+
+    impl SegmentStoreExtensionProvider for TestStoreExtensionProvider {
+        fn id(&self) -> &str {
+            "test-store-extension"
+        }
+
+        fn make_writer(&self) -> Box<dyn SegmentStoreExtensionWriter> {
+            Box::<TestStoreExtensionWriter>::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct TestStoreExtensionWriter {
+        payloads: Vec<Vec<u8>>,
+    }
+
+    impl SegmentStoreExtensionWriter for TestStoreExtensionWriter {
+        fn record(&mut self, _doc_id: crate::DocId, payload: &[u8]) -> crate::Result<()> {
+            self.payloads.push(payload.to_vec());
+            Ok(())
+        }
+
+        fn has_payloads(&self) -> bool {
+            !self.payloads.is_empty()
+        }
+
+        fn serialize(
+            &mut self,
+            _doc_id_map: Option<&crate::artifact::DocIdMapping>,
+            _max_doc: crate::DocId,
+        ) -> crate::Result<Vec<u8>> {
+            Ok(self.payloads.concat())
+        }
+    }
+
     #[test]
     fn test_operations_group() {
         // an operations group with 2 items should cause 3 opstamps 0, 1, and 2.
@@ -916,6 +978,49 @@ mod tests {
         ];
         let batch_opstamp1 = index_writer.run(operations).unwrap();
         assert_eq!(batch_opstamp1, 2u64);
+    }
+
+    #[test]
+    fn test_add_with_store_extensions_indexes_and_stores_distinct_docs() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        index.add_segment_store_extension_provider(Arc::new(TestStoreExtensionProvider));
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.run(vec![UserOperation::AddWithStoreExtensions {
+            document: doc!(text_field => "indexed"),
+            stored_document: Some(doc!(text_field => "stored")),
+            artifacts: Vec::new(),
+            store_extensions: vec![DocumentArtifact::new(
+                "test-store-extension",
+                b"payload".to_vec(),
+            )],
+        }])?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let query = QueryParser::for_index(&index, vec![text_field]).parse_query("indexed")?;
+        let hits = searcher.search(&query, &TopDocs::with_limit(1))?;
+        assert_eq!(hits.len(), 1);
+        let doc_address = hits[0].1;
+        let stored_doc: TantivyDocument = searcher.doc(doc_address)?;
+        assert_eq!(
+            stored_doc
+                .get_first(text_field)
+                .and_then(|value| value.as_str()),
+            Some("stored")
+        );
+
+        let extension_data = searcher
+            .segment_reader(doc_address.segment_ord)
+            .store_extension_data()?
+            .unwrap();
+        let payload =
+            segment_store_extension_payload(extension_data.as_slice(), "test-store-extension")?
+                .unwrap();
+        assert_eq!(payload.as_slice(), b"payload");
+        Ok(())
     }
 
     #[test]

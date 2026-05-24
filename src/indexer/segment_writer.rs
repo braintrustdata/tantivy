@@ -6,7 +6,10 @@ use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
-use crate::artifact::{SegmentArtifactProvider, SegmentArtifactWriter};
+use crate::artifact::{
+    serialize_segment_store_extensions, SegmentArtifactProvider, SegmentArtifactWriter,
+    SegmentStoreExtensionProvider, SegmentStoreExtensionWriter,
+};
 use crate::core::json_utils::index_json_values;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
@@ -73,6 +76,8 @@ pub struct SegmentWriter {
     pub(crate) doc_opstamps: Vec<Opstamp>,
     artifact_providers: Vec<std::sync::Arc<dyn SegmentArtifactProvider>>,
     artifact_writers: HashMap<String, Box<dyn SegmentArtifactWriter>>,
+    store_extension_providers: Vec<std::sync::Arc<dyn SegmentStoreExtensionProvider>>,
+    store_extension_writers: HashMap<String, Box<dyn SegmentStoreExtensionWriter>>,
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: Term,
     schema: Schema,
@@ -93,6 +98,7 @@ impl SegmentWriter {
         let tokenizer_manager = segment.index().tokenizers().clone();
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let artifact_providers = segment.index().segment_artifact_providers();
+        let store_extension_providers = segment.index().segment_store_extension_providers();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
@@ -135,6 +141,11 @@ impl SegmentWriter {
                 .map(|provider| (provider.id().to_string(), provider.make_writer()))
                 .collect(),
             artifact_providers,
+            store_extension_writers: store_extension_providers
+                .iter()
+                .map(|provider| (provider.id().to_string(), provider.make_writer()))
+                .collect(),
+            store_extension_providers,
             per_field_text_analyzers,
             term_buffer: Term::with_capacity(16),
             schema,
@@ -164,6 +175,8 @@ impl SegmentWriter {
             &self.fieldnorms_writer,
             self.artifact_providers,
             self.artifact_writers,
+            self.store_extension_providers,
+            self.store_extension_writers,
             self.segment_serializer,
             mapping.as_ref(),
             self.max_doc,
@@ -180,6 +193,11 @@ impl SegmentWriter {
             + self.fast_field_writers.mem_usage()
             + self
                 .artifact_writers
+                .values()
+                .map(|writer| writer.mem_usage())
+                .sum::<usize>()
+            + self
+                .store_extension_writers
                 .values()
                 .map(|writer| writer.mem_usage())
                 .sum::<usize>()
@@ -413,6 +431,8 @@ impl SegmentWriter {
             document,
             opstamp,
             artifacts,
+            stored_document,
+            store_extensions,
         } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
@@ -422,8 +442,20 @@ impl SegmentWriter {
                 writer.record(self.max_doc, &artifact.payload)?;
             }
         }
+        for store_extension in store_extensions {
+            if let Some(writer) = self
+                .store_extension_writers
+                .get_mut(&store_extension.provider_id)
+            {
+                writer.record(self.max_doc, &store_extension.payload)?;
+            }
+        }
         let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&document, &self.schema)?;
+        if let Some(stored_document) = stored_document.as_ref() {
+            doc_writer.store(stored_document, &self.schema)?;
+        } else {
+            doc_writer.store(&document, &self.schema)?;
+        }
         self.max_doc += 1;
         Ok(())
     }
@@ -462,6 +494,8 @@ fn remap_and_write(
     fieldnorms_writer: &FieldNormsWriter,
     artifact_providers: Vec<std::sync::Arc<dyn SegmentArtifactProvider>>,
     mut artifact_writers: HashMap<String, Box<dyn SegmentArtifactWriter>>,
+    store_extension_providers: Vec<std::sync::Arc<dyn SegmentStoreExtensionProvider>>,
+    mut store_extension_writers: HashMap<String, Box<dyn SegmentStoreExtensionWriter>>,
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
     max_doc: DocId,
@@ -526,8 +560,28 @@ fn remap_and_write(
         }
     }
 
+    let store_extension_entries = store_extension_providers
+        .iter()
+        .filter_map(|provider| {
+            let writer = store_extension_writers.get_mut(provider.id())?;
+            if !writer.has_payloads() {
+                return None;
+            }
+            Some(
+                writer
+                    .serialize(doc_id_map, max_doc)
+                    .map(|payload| (provider.id(), payload)),
+            )
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let store_extension_data = if store_extension_entries.is_empty() {
+        None
+    } else {
+        Some(serialize_segment_store_extensions(store_extension_entries)?)
+    };
+
     debug!("serializer-close");
-    serializer.close()?;
+    serializer.close_with_store_extension(store_extension_data.as_deref())?;
 
     Ok(())
 }
@@ -831,6 +885,7 @@ mod tests {
             TermInfo {
                 doc_freq: 1,
                 postings_range: 2..4,
+                repeated_postings_range: 4..4,
                 positions_range: 2..5
             }
         );
@@ -875,6 +930,7 @@ mod tests {
             TermInfo {
                 doc_freq: 1,
                 postings_range: 0..1,
+                repeated_postings_range: 1..1,
                 positions_range: 0..0
             }
         );

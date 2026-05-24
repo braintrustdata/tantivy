@@ -3,7 +3,7 @@ use std::io;
 use common::BinarySerializable;
 use fnv::FnvHashSet;
 
-use crate::directory::FileSlice;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::positions::PositionReader;
 use crate::postings::{BlockSegmentPostings, SegmentPostings, TermInfo};
 use crate::schema::{IndexRecordOption, Term, Type, JSON_END_OF_PATH};
@@ -109,7 +109,7 @@ impl InvertedIndexReader {
     ) -> io::Result<()> {
         let postings_slice = self
             .postings_file_slice
-            .slice(term_info.postings_range.clone());
+            .slice(term_info.normal_postings_range());
         let postings_bytes = postings_slice.read_bytes()?;
         block_postings.reset(term_info.doc_freq, postings_bytes)?;
         Ok(())
@@ -140,13 +140,22 @@ impl InvertedIndexReader {
     ) -> io::Result<BlockSegmentPostings> {
         let postings_data = self
             .postings_file_slice
-            .slice(term_info.postings_range.clone());
+            .slice(term_info.normal_postings_range());
         BlockSegmentPostings::open(
             term_info.doc_freq,
             postings_data,
             self.record_option,
             requested_option,
         )
+    }
+
+    /// Reads codec extension bytes stored at the tail of a term's postings.
+    pub fn read_repeated_postings_payload_from_terminfo(
+        &self,
+        term_info: &TermInfo,
+    ) -> io::Result<OwnedBytes> {
+        self.postings_file_slice
+            .read_bytes_slice(term_info.repeated_postings_range.clone())
     }
 
     /// Returns a posting object given a `term_info`.

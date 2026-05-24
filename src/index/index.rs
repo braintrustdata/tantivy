@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
 use super::{FieldMetadata, IndexSettings};
-use crate::artifact::SegmentArtifactProvider;
+use crate::artifact::{SegmentArtifactProvider, SegmentStoreExtensionProvider};
 use crate::core::{Executor, META_FILEPATH};
 use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
@@ -291,6 +291,7 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     segment_artifact_providers: Arc<RwLock<Vec<Arc<dyn SegmentArtifactProvider>>>>,
+    segment_store_extension_providers: Arc<RwLock<Vec<Arc<dyn SegmentStoreExtensionProvider>>>>,
 }
 
 impl Index {
@@ -415,6 +416,7 @@ impl Index {
             executor: Arc::new(Executor::single_thread()),
             inventory,
             segment_artifact_providers: Arc::new(RwLock::new(Vec::new())),
+            segment_store_extension_providers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -498,6 +500,27 @@ impl Index {
         self.segment_artifact_providers
             .read()
             .expect("segment artifact provider lock should not be poisoned")
+            .clone()
+    }
+
+    /// Registers a provider for per-segment doc store extension data.
+    pub fn add_segment_store_extension_provider(
+        &self,
+        provider: Arc<dyn SegmentStoreExtensionProvider>,
+    ) {
+        let mut providers = self
+            .segment_store_extension_providers
+            .write()
+            .expect("segment store extension provider lock should not be poisoned");
+        providers.retain(|existing| existing.id() != provider.id());
+        providers.push(provider);
+    }
+
+    /// Returns the currently registered segment doc store extension providers.
+    pub fn segment_store_extension_providers(&self) -> Vec<Arc<dyn SegmentStoreExtensionProvider>> {
+        self.segment_store_extension_providers
+            .read()
+            .expect("segment store extension provider lock should not be poisoned")
             .clone()
     }
 
