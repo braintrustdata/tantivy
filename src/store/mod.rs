@@ -33,6 +33,7 @@ mod compressors;
 mod decompressors;
 mod footer;
 mod index;
+mod io_trace;
 mod reader;
 mod writer;
 pub use self::compressors::{Compressor, ZstdCompressor};

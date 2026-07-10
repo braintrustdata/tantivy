@@ -17,6 +17,7 @@ use crate::fastfield::AliveBitSet;
 use crate::schema::document::{BinaryDocumentDeserializer, Document, DocumentDeserialize};
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
+use crate::store::io_trace::{self, StoreIoOperation};
 use crate::DocId;
 
 pub(crate) const DOCSTORE_CACHE_CAPACITY: usize = 100;
@@ -122,6 +123,11 @@ impl StoreReader {
 
         let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
         let index_data = offset_index_file.read_bytes()?;
+        io_trace::record(
+            StoreIoOperation::Read,
+            footer.offset as usize,
+            index_data.as_ref(),
+        )?;
         let space_usage =
             StoreSpaceUsage::new(data_file.num_bytes(), offset_index_file.num_bytes());
         let skip_index = SkipIndex::open(index_data);
@@ -163,11 +169,22 @@ impl StoreReader {
     }
 
     pub(crate) fn block_data(&self) -> io::Result<OwnedBytes> {
-        self.data.read_bytes()
+        let block_data = self.data.read_bytes()?;
+        io_trace::record(StoreIoOperation::Read, 0, block_data.as_ref())?;
+        Ok(block_data)
     }
 
     fn get_compressed_block(&self, checkpoint: &Checkpoint) -> io::Result<OwnedBytes> {
-        self.data.slice(checkpoint.byte_range.clone()).read_bytes()
+        let compressed_block = self
+            .data
+            .slice(checkpoint.byte_range.clone())
+            .read_bytes()?;
+        io_trace::record(
+            StoreIoOperation::Read,
+            checkpoint.byte_range.start,
+            compressed_block.as_ref(),
+        )?;
+        Ok(compressed_block)
     }
 
     /// Loads and decompresses a block.

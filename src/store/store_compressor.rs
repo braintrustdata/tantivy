@@ -8,6 +8,7 @@ use common::{BinarySerializable, CountingWriter, TerminatingWrite};
 use crate::directory::WritePtr;
 use crate::store::footer::DocStoreFooter;
 use crate::store::index::{Checkpoint, SkipIndexBuilder};
+use crate::store::io_trace::{self, StoreIoOperation};
 use crate::store::{Compressor, Decompressor, StoreReader};
 use crate::DocId;
 
@@ -104,6 +105,11 @@ impl BlockCompressorImpl {
         let start_offset = self.writer.written_bytes() as usize;
         self.writer.write_all(&self.intermediary_buffer)?;
         let end_offset = self.writer.written_bytes() as usize;
+        io_trace::record(
+            StoreIoOperation::Write,
+            start_offset,
+            &self.intermediary_buffer,
+        )?;
 
         self.register_checkpoint(Checkpoint {
             doc_range: self.first_doc_in_block..self.first_doc_in_block + num_docs_in_block,
@@ -126,8 +132,9 @@ impl BlockCompressorImpl {
         let start_shift = self.writer.written_bytes() as usize;
 
         // just bulk write all of the block of the given reader.
-        self.writer
-            .write_all(store_reader.block_data()?.as_slice())?;
+        let block_data = store_reader.block_data()?;
+        self.writer.write_all(block_data.as_slice())?;
+        io_trace::record(StoreIoOperation::Write, start_shift, block_data.as_slice())?;
 
         // concatenate the index of the `store_reader`, after translating
         // its start doc id and its start file offset.
@@ -145,8 +152,23 @@ impl BlockCompressorImpl {
         let header_offset: u64 = self.writer.written_bytes();
         let docstore_footer =
             DocStoreFooter::new(header_offset, Decompressor::from(self.compressor));
-        self.offset_index_writer.serialize_into(&mut self.writer)?;
-        docstore_footer.serialize(&mut self.writer)?;
+
+        let mut offset_index_bytes = Vec::new();
+        self.offset_index_writer
+            .serialize_into(&mut offset_index_bytes)?;
+        let offset_index_offset = self.writer.written_bytes() as usize;
+        self.writer.write_all(&offset_index_bytes)?;
+        io_trace::record(
+            StoreIoOperation::Write,
+            offset_index_offset,
+            &offset_index_bytes,
+        )?;
+
+        let mut footer_bytes = Vec::new();
+        docstore_footer.serialize(&mut footer_bytes)?;
+        let footer_offset = self.writer.written_bytes() as usize;
+        self.writer.write_all(&footer_bytes)?;
+        io_trace::record(StoreIoOperation::Write, footer_offset, &footer_bytes)?;
         self.writer.terminate()
     }
 }

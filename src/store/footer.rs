@@ -4,6 +4,7 @@ use common::{BinarySerializable, FixedSize, HasLen};
 
 use super::{Decompressor, DOC_STORE_VERSION};
 use crate::directory::FileSlice;
+use crate::store::io_trace::{self, StoreIoOperation};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocStoreFooter {
@@ -64,6 +65,7 @@ impl DocStoreFooter {
         }
         let (body, footer_slice) = file.split_from_end(DocStoreFooter::SIZE_IN_BYTES);
         let mut footer_bytes = footer_slice.read_bytes()?;
+        io_trace::record(StoreIoOperation::Read, body.len(), footer_bytes.as_ref())?;
         let footer = DocStoreFooter::deserialize(&mut footer_bytes)?;
         Ok((footer, body))
     }
