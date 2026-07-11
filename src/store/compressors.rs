@@ -156,11 +156,15 @@ impl Compressor {
         compressed: &mut Vec<u8>,
     ) -> io::Result<()> {
         match self {
-            Self::None | Self::Dedup => {
+            Self::None => {
                 compressed.clear();
                 compressed.extend_from_slice(uncompressed);
                 Ok(())
             }
+            Self::Dedup => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Dedup compressor is not implemented",
+            )),
             #[cfg(feature = "lz4-compression")]
             Self::Lz4 => super::compression_lz4_block::compress(uncompressed, compressed),
             #[cfg(feature = "zstd-compression")]
