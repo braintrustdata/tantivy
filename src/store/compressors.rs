@@ -10,6 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub enum Compressor {
     /// No compression
     None,
+    /// Experimental dedup compressor.
+    Dedup,
     /// Use the lz4 compressor (block format)
     #[cfg(feature = "lz4-compression")]
     Lz4,
@@ -23,6 +25,7 @@ impl Serialize for Compressor {
     where S: serde::Serializer {
         match *self {
             Compressor::None => serializer.serialize_str("none"),
+            Compressor::Dedup => serializer.serialize_str("dedup"),
             #[cfg(feature = "lz4-compression")]
             Compressor::Lz4 => serializer.serialize_str("lz4"),
             #[cfg(feature = "zstd-compression")]
@@ -37,6 +40,7 @@ impl<'de> Deserialize<'de> for Compressor {
         let buf = String::deserialize(deserializer)?;
         let compressor = match buf.as_str() {
             "none" => Compressor::None,
+            "dedup" => Compressor::Dedup,
             #[cfg(feature = "lz4-compression")]
             "lz4" => Compressor::Lz4,
             #[cfg(not(feature = "lz4-compression"))]
@@ -61,6 +65,7 @@ impl<'de> Deserialize<'de> for Compressor {
                     &buf,
                     &[
                         "none",
+                        "dedup",
                         #[cfg(feature = "lz4-compression")]
                         "lz4",
                         #[cfg(feature = "zstd-compression")]
@@ -151,7 +156,7 @@ impl Compressor {
         compressed: &mut Vec<u8>,
     ) -> io::Result<()> {
         match self {
-            Self::None => {
+            Self::None | Self::Dedup => {
                 compressed.clear();
                 compressed.extend_from_slice(uncompressed);
                 Ok(())

@@ -9,6 +9,8 @@ use super::Compressor;
 pub enum Decompressor {
     /// No compression
     None,
+    /// Experimental dedup decompressor.
+    Dedup,
     /// Use the lz4 decompressor (block format)
     #[cfg(feature = "lz4-compression")]
     Lz4,
@@ -21,6 +23,7 @@ impl From<Compressor> for Decompressor {
     fn from(compressor: Compressor) -> Self {
         match compressor {
             Compressor::None => Decompressor::None,
+            Compressor::Dedup => Decompressor::Dedup,
             #[cfg(feature = "lz4-compression")]
             Compressor::Lz4 => Decompressor::Lz4,
             #[cfg(feature = "zstd-compression")]
@@ -37,6 +40,7 @@ impl Decompressor {
             1 => Decompressor::Lz4,
             #[cfg(feature = "zstd-compression")]
             4 => Decompressor::Zstd,
+            5 => Decompressor::Dedup,
             _ => panic!("unknown compressor id {id:?}"),
         }
     }
@@ -48,6 +52,7 @@ impl Decompressor {
             Self::Lz4 => 1,
             #[cfg(feature = "zstd-compression")]
             Self::Zstd => 4,
+            Self::Dedup => 5,
         }
     }
 
@@ -64,7 +69,7 @@ impl Decompressor {
         decompressed: &mut Vec<u8>,
     ) -> io::Result<()> {
         match self {
-            Self::None => {
+            Self::None | Self::Dedup => {
                 decompressed.clear();
                 decompressed.extend_from_slice(compressed);
                 Ok(())
@@ -84,6 +89,7 @@ mod tests {
     #[test]
     fn compressor_decompressor_id_test() {
         assert_eq!(Decompressor::from(Compressor::None), Decompressor::None);
+        assert_eq!(Decompressor::from(Compressor::Dedup), Decompressor::Dedup);
         #[cfg(feature = "lz4-compression")]
         assert_eq!(Decompressor::from(Compressor::Lz4), Decompressor::Lz4);
         #[cfg(feature = "zstd-compression")]
