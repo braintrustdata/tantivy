@@ -1,8 +1,12 @@
 use std::io;
+#[cfg(feature = "zstd-compression")]
+use std::sync::Arc;
 
 use common::BinarySerializable;
 
 use super::compressors::Compressor;
+#[cfg(feature = "zstd-compression")]
+use super::compression_dedup_block::SharedDedupDictionary;
 use super::StoreReader;
 use crate::directory::WritePtr;
 use crate::schema::document::{BinaryDocumentSerializer, Document};
@@ -37,7 +41,26 @@ impl StoreWriter {
         block_size: usize,
         dedicated_thread: bool,
     ) -> io::Result<StoreWriter> {
-        let block_compressor = BlockCompressor::new(compressor, writer, dedicated_thread)?;
+        Self::new_with_dedup_dictionary(writer, compressor, block_size, dedicated_thread, None)
+    }
+
+    pub(crate) fn new_with_dedup_dictionary(
+        writer: WritePtr,
+        compressor: Compressor,
+        block_size: usize,
+        dedicated_thread: bool,
+        #[cfg(feature = "zstd-compression")] dedup_dictionary: Option<Arc<SharedDedupDictionary>>,
+        #[cfg(not(feature = "zstd-compression"))] _dedup_dictionary: Option<()>,
+    ) -> io::Result<StoreWriter> {
+        let block_compressor = BlockCompressor::new(
+            compressor,
+            writer,
+            dedicated_thread,
+            #[cfg(feature = "zstd-compression")]
+            dedup_dictionary,
+            #[cfg(not(feature = "zstd-compression"))]
+            None,
+        )?;
         Ok(StoreWriter {
             compressor,
             block_size,

@@ -23,6 +23,8 @@ use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema};
+#[cfg(feature = "zstd-compression")]
+use crate::store::compression_dedup_block::SharedDedupDictionary;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
 use crate::SegmentReader;
 
@@ -291,6 +293,8 @@ pub struct Index {
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
     segment_artifact_providers: Arc<RwLock<Vec<Arc<dyn SegmentArtifactProvider>>>>,
+    #[cfg(feature = "zstd-compression")]
+    dedup_dictionary: Arc<SharedDedupDictionary>,
 }
 
 impl Index {
@@ -406,6 +410,10 @@ impl Index {
         inventory: SegmentMetaInventory,
     ) -> Index {
         let schema = metas.schema.clone();
+        #[cfg(feature = "zstd-compression")]
+        let dedup_dictionary = Arc::new(
+            SharedDedupDictionary::open(directory.clone()).expect("dedup dictionary should open"),
+        );
         Index {
             settings: metas.index_settings.clone(),
             directory,
@@ -415,6 +423,8 @@ impl Index {
             executor: Arc::new(Executor::single_thread()),
             inventory,
             segment_artifact_providers: Arc::new(RwLock::new(Vec::new())),
+            #[cfg(feature = "zstd-compression")]
+            dedup_dictionary,
         }
     }
 
@@ -682,6 +692,11 @@ impl Index {
     /// Accessor to the index settings
     pub fn settings_mut(&mut self) -> &mut IndexSettings {
         &mut self.settings
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    pub(crate) fn dedup_dictionary(&self) -> Arc<SharedDedupDictionary> {
+        Arc::clone(&self.dedup_dictionary)
     }
 
     /// Accessor to the index schema

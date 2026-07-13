@@ -48,11 +48,15 @@ impl SegmentSerializer {
             )?
         } else {
             let store_write = segment.open_write(SegmentComponent::Store)?;
-            StoreWriter::new(
+            StoreWriter::new_with_dedup_dictionary(
                 store_write,
                 settings.docstore_compression,
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
+                #[cfg(feature = "zstd-compression")]
+                Some(segment.index().dedup_dictionary()),
+                #[cfg(not(feature = "zstd-compression"))]
+                None,
             )?
         };
 

@@ -505,11 +505,15 @@ fn remap_and_write(
             .segment_mut()
             .open_write(SegmentComponent::Store)?;
         let settings = serializer.segment().index().settings();
-        let store_writer = StoreWriter::new(
+        let store_writer = StoreWriter::new_with_dedup_dictionary(
             store_write,
             settings.docstore_compression,
             settings.docstore_blocksize,
             settings.docstore_compress_dedicated_thread,
+            #[cfg(feature = "zstd-compression")]
+            Some(serializer.segment().index().dedup_dictionary()),
+            #[cfg(not(feature = "zstd-compression"))]
+            None,
         )?;
         let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
         old_store_writer.close()?;

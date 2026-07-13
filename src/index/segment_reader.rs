@@ -14,6 +14,8 @@ use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
+#[cfg(feature = "zstd-compression")]
+use crate::store::compression_dedup_block::DedupDecompressor;
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
 use crate::{DocId, Executor, Opstamp};
@@ -45,6 +47,8 @@ pub struct SegmentReader {
     fieldnorm_readers: FieldNormReaders,
 
     store_file: FileSlice,
+    #[cfg(feature = "zstd-compression")]
+    dedup_decompressor: Option<Arc<DedupDecompressor>>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -153,7 +157,14 @@ impl SegmentReader {
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
     /// The size of blocks is configurable, this should be reflexted in the
     pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
-        StoreReader::open(self.store_file.clone(), cache_num_blocks)
+        StoreReader::open_with_dedup_decompressor(
+            self.store_file.clone(),
+            cache_num_blocks,
+            #[cfg(feature = "zstd-compression")]
+            self.dedup_decompressor.clone(),
+            #[cfg(not(feature = "zstd-compression"))]
+            None,
+        )
     }
 
     /// Open a new segment for reading.
@@ -170,6 +181,13 @@ impl SegmentReader {
         let termdict_composite = CompositeFile::open(&termdict_file)?;
 
         let store_file = segment.open_read(SegmentComponent::Store)?;
+        #[cfg(feature = "zstd-compression")]
+        let dedup_decompressor =
+            if segment.index().settings().docstore_compression == crate::store::Compressor::Dedup {
+                Some(DedupDecompressor::open_from_directory(segment.index().directory())?)
+            } else {
+                None
+            };
 
         crate::fail_point!("SegmentReader::open#middle");
 
@@ -218,6 +236,8 @@ impl SegmentReader {
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
+            #[cfg(feature = "zstd-compression")]
+            dedup_decompressor,
             alive_bitset_opt,
             positions_composite,
             schema,

@@ -1,11 +1,15 @@
 use std::io;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use rustc_hash::FxHashMap;
 
-use super::footer::CompressionDictionaryFooter;
+use crate::directory::error::OpenReadError;
+use crate::directory::{Directory, ManagedDirectory};
 
 const BLOCK_MAGIC: &[u8; 4] = b"TDD1";
 const DICTIONARY_MAGIC: &[u8; 8] = b"TDDICT1\0";
+const DICTIONARY_FILE: &str = ".tantivy-dedup-dictionary";
 const VERSION: u32 = 1;
 const CHUNK_SIZE: usize = 1024;
 const MIN_CHUNK_SIZE: usize = 64;
@@ -13,23 +17,30 @@ const TAG_LITERAL: u8 = 0;
 const TAG_REF: u8 = 1;
 
 pub(crate) struct DedupCompressor {
-    dictionary: Vec<Vec<u8>>,
-    dictionary_index: FxHashMap<u64, Vec<u32>>,
+    dictionary: Arc<SharedDedupDictionary>,
     frame_buffer: Vec<u8>,
-    dictionary_buffer: Vec<u8>,
 }
 
 pub(crate) struct DedupDecompressor {
     dictionary: Vec<Vec<u8>>,
 }
 
+pub(crate) struct SharedDedupDictionary {
+    directory: ManagedDirectory,
+    state: Mutex<DedupDictionaryState>,
+}
+
+struct DedupDictionaryState {
+    dictionary: Vec<Vec<u8>>,
+    dictionary_index: FxHashMap<u64, Vec<u32>>,
+    dictionary_buffer: Vec<u8>,
+}
+
 impl DedupCompressor {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(dictionary: Arc<SharedDedupDictionary>) -> Self {
         Self {
-            dictionary: Vec::new(),
-            dictionary_index: FxHashMap::default(),
+            dictionary,
             frame_buffer: Vec::new(),
-            dictionary_buffer: Vec::new(),
         }
     }
 
@@ -49,7 +60,7 @@ impl DedupCompressor {
         let mut op_count = 0u32;
         for chunk in uncompressed.chunks(CHUNK_SIZE) {
             if chunk.len() >= MIN_CHUNK_SIZE {
-                let dict_id = self.intern(chunk)?;
+                let dict_id = self.dictionary.intern(chunk)?;
                 self.frame_buffer.push(TAG_REF);
                 write_u32(&mut self.frame_buffer, dict_id);
             } else {
@@ -65,8 +76,76 @@ impl DedupCompressor {
 
         super::compression_zstd_block::compress(&self.frame_buffer, compressed, None)
     }
+}
 
-    pub(crate) fn serialize_dictionary(&mut self) -> io::Result<Vec<u8>> {
+impl SharedDedupDictionary {
+    pub(crate) fn open(directory: ManagedDirectory) -> crate::Result<Self> {
+        let dictionary = match directory.atomic_read(dictionary_path()) {
+            Ok(compressed_dictionary) => deserialize_dictionary(&compressed_dictionary)?,
+            Err(OpenReadError::FileDoesNotExist(_)) => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        Ok(Self {
+            directory,
+            state: Mutex::new(DedupDictionaryState::new(dictionary)),
+        })
+    }
+
+    fn intern(&self, bytes: &[u8]) -> io::Result<u32> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "dedup dictionary lock poisoned"))?;
+        if let Some(id) = state.lookup(bytes) {
+            return Ok(id);
+        }
+
+        let id = state.insert(bytes)?;
+        let dictionary_bytes = state.serialize_dictionary()?;
+        self.directory.atomic_write(dictionary_path(), &dictionary_bytes)?;
+        Ok(id)
+    }
+}
+
+impl DedupDictionaryState {
+    fn new(dictionary: Vec<Vec<u8>>) -> Self {
+        let mut dictionary_index: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
+        for (id, entry) in dictionary.iter().enumerate() {
+            dictionary_index
+                .entry(dictionary_key(entry))
+                .or_default()
+                .push(id as u32);
+        }
+        Self {
+            dictionary,
+            dictionary_index,
+            dictionary_buffer: Vec::new(),
+        }
+    }
+
+    fn lookup(&self, bytes: &[u8]) -> Option<u32> {
+        let key = dictionary_key(bytes);
+        if let Some(candidate_ids) = self.dictionary_index.get(&key) {
+            for &candidate_id in candidate_ids {
+                if self.dictionary[candidate_id as usize] == bytes {
+                    return Some(candidate_id);
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, bytes: &[u8]) -> io::Result<u32> {
+        let id = checked_u32(self.dictionary.len())?;
+        self.dictionary.push(bytes.to_vec());
+        self.dictionary_index
+            .entry(dictionary_key(bytes))
+            .or_default()
+            .push(id);
+        Ok(id)
+    }
+
+    fn serialize_dictionary(&mut self) -> io::Result<Vec<u8>> {
         self.dictionary_buffer.clear();
         self.dictionary_buffer.extend_from_slice(DICTIONARY_MAGIC);
         write_u32(&mut self.dictionary_buffer, VERSION);
@@ -83,50 +162,18 @@ impl DedupCompressor {
         super::compression_zstd_block::compress(&self.dictionary_buffer, &mut compressed, None)?;
         Ok(compressed)
     }
-
-    fn intern(&mut self, bytes: &[u8]) -> io::Result<u32> {
-        let key = dictionary_key(bytes);
-        if let Some(candidate_ids) = self.dictionary_index.get(&key) {
-            for &candidate_id in candidate_ids {
-                if self.dictionary[candidate_id as usize] == bytes {
-                    return Ok(candidate_id);
-                }
-            }
-        }
-
-        let id = checked_u32(self.dictionary.len())?;
-        self.dictionary.push(bytes.to_vec());
-        self.dictionary_index.entry(key).or_default().push(id);
-        Ok(id)
-    }
 }
 
 impl DedupDecompressor {
+    pub(crate) fn open_from_directory(directory: &dyn Directory) -> crate::Result<Arc<Self>> {
+        let compressed_dictionary = directory.atomic_read(dictionary_path())?;
+        Ok(Arc::new(Self::open(&compressed_dictionary)?))
+    }
+
     pub(crate) fn open(compressed_dictionary: &[u8]) -> io::Result<Self> {
-        let mut dictionary_bytes = Vec::new();
-        super::compression_zstd_block::decompress(compressed_dictionary, &mut dictionary_bytes)?;
-        let mut input = dictionary_bytes.as_slice();
-        read_exact(&mut input, DICTIONARY_MAGIC)?;
-        let version = read_u32(&mut input)?;
-        if version != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported dedup dictionary version {version}"),
-            ));
-        }
-        let num_entries = read_u32(&mut input)? as usize;
-        let mut dictionary = Vec::with_capacity(num_entries);
-        for _ in 0..num_entries {
-            let len = read_u32(&mut input)? as usize;
-            dictionary.push(read_bytes(&mut input, len)?.to_vec());
-        }
-        if !input.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trailing bytes in dedup dictionary",
-            ));
-        }
-        Ok(Self { dictionary })
+        Ok(Self {
+            dictionary: deserialize_dictionary(compressed_dictionary)?,
+        })
     }
 
     pub(crate) fn decompress_block(
@@ -192,14 +239,35 @@ impl DedupDecompressor {
     }
 }
 
-pub(crate) fn dictionary_footer(
-    offset: usize,
-    bytes: &[u8],
-) -> io::Result<CompressionDictionaryFooter> {
-    Ok(CompressionDictionaryFooter {
-        offset: offset as u64,
-        length: checked_u32(bytes.len())?,
-    })
+fn dictionary_path() -> &'static Path {
+    Path::new(DICTIONARY_FILE)
+}
+
+fn deserialize_dictionary(compressed_dictionary: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    let mut dictionary_bytes = Vec::new();
+    super::compression_zstd_block::decompress(compressed_dictionary, &mut dictionary_bytes)?;
+    let mut input = dictionary_bytes.as_slice();
+    read_exact(&mut input, DICTIONARY_MAGIC)?;
+    let version = read_u32(&mut input)?;
+    if version != VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported dedup dictionary version {version}"),
+        ));
+    }
+    let num_entries = read_u32(&mut input)? as usize;
+    let mut dictionary = Vec::with_capacity(num_entries);
+    for _ in 0..num_entries {
+        let len = read_u32(&mut input)? as usize;
+        dictionary.push(read_bytes(&mut input, len)?.to_vec());
+    }
+    if !input.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in dedup dictionary",
+        ));
+    }
+    Ok(dictionary)
 }
 
 fn dictionary_key(bytes: &[u8]) -> u64 {

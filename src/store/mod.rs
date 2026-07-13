@@ -53,7 +53,7 @@ mod compression_lz4_block;
 mod compression_zstd_block;
 
 #[cfg(feature = "zstd-compression")]
-mod compression_dedup_block;
+pub(crate) mod compression_dedup_block;
 
 #[cfg(test)]
 pub mod tests {

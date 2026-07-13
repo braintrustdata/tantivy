@@ -31,7 +31,7 @@ type Block = OwnedBytes;
 pub struct StoreReader {
     decompressor: Decompressor,
     #[cfg(feature = "zstd-compression")]
-    dedup_decompressor: Option<DedupDecompressor>,
+    dedup_decompressor: Option<Arc<DedupDecompressor>>,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
     space_usage: StoreSpaceUsage,
@@ -124,31 +124,31 @@ impl StoreReader {
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
     /// The size of blocks is configurable, this should be reflexted in the
     pub fn open(store_file: FileSlice, cache_num_blocks: usize) -> io::Result<StoreReader> {
+        Self::open_with_dedup_decompressor(
+            store_file,
+            cache_num_blocks,
+            #[cfg(feature = "zstd-compression")]
+            None,
+            #[cfg(not(feature = "zstd-compression"))]
+            None,
+        )
+    }
+
+    pub(crate) fn open_with_dedup_decompressor(
+        store_file: FileSlice,
+        cache_num_blocks: usize,
+        #[cfg(feature = "zstd-compression")] dedup_decompressor: Option<Arc<DedupDecompressor>>,
+        #[cfg(not(feature = "zstd-compression"))] _dedup_decompressor: Option<()>,
+    ) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
 
         #[cfg(feature = "zstd-compression")]
-        let dedup_decompressor = if footer.decompressor == Decompressor::Dedup {
-            let dictionary_footer = footer.compression_dictionary.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "dedup-compressed doc store is missing its dictionary",
-                )
-            })?;
-            let dictionary_data = data_and_offset
-                .slice(
-                    dictionary_footer.offset as usize
-                        ..dictionary_footer.offset as usize + dictionary_footer.length as usize,
-                )
-                .read_bytes()?;
-            io_trace::record(
-                StoreIoOperation::Read,
-                dictionary_footer.offset as usize,
-                dictionary_data.as_ref(),
-            )?;
-            Some(DedupDecompressor::open(dictionary_data.as_ref())?)
-        } else {
-            None
-        };
+        if footer.decompressor == Decompressor::Dedup && dedup_decompressor.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dedup-compressed doc store is missing its shared dictionary",
+            ));
+        }
         #[cfg(not(feature = "zstd-compression"))]
         if footer.decompressor == Decompressor::Dedup {
             return Err(io::Error::new(
@@ -157,11 +157,7 @@ impl StoreReader {
             ));
         }
 
-        let data_end = footer
-            .compression_dictionary
-            .map(|dictionary| dictionary.offset as usize)
-            .unwrap_or(footer.offset as usize);
-        let data_file = data_and_offset.slice(..data_end);
+        let data_file = data_and_offset.slice(..footer.offset as usize);
         let offset_index_file = data_and_offset.slice(footer.offset as usize..);
         let index_data = offset_index_file.read_bytes()?;
         io_trace::record(
