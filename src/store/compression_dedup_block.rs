@@ -9,7 +9,7 @@ use crate::directory::{Directory, ManagedDirectory};
 
 const BLOCK_MAGIC: &[u8; 4] = b"TDD1";
 const DICTIONARY_MAGIC: &[u8; 8] = b"TDDICT1\0";
-const DICTIONARY_FILE: &str = ".tantivy-dedup-dictionary";
+const DICTIONARY_FILE: &str = "tantivy-dedup-dictionary";
 const VERSION: u32 = 1;
 const CHUNK_SIZE: usize = 1024;
 const MIN_CHUNK_SIZE: usize = 64;
@@ -239,7 +239,7 @@ impl DedupDecompressor {
     }
 }
 
-fn dictionary_path() -> &'static Path {
+pub(crate) fn dictionary_path() -> &'static Path {
     Path::new(DICTIONARY_FILE)
 }
 

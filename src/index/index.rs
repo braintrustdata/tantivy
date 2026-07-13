@@ -294,7 +294,7 @@ pub struct Index {
     inventory: SegmentMetaInventory,
     segment_artifact_providers: Arc<RwLock<Vec<Arc<dyn SegmentArtifactProvider>>>>,
     #[cfg(feature = "zstd-compression")]
-    dedup_dictionary: Arc<SharedDedupDictionary>,
+    dedup_dictionary: Option<Arc<SharedDedupDictionary>>,
 }
 
 impl Index {
@@ -411,9 +411,13 @@ impl Index {
     ) -> Index {
         let schema = metas.schema.clone();
         #[cfg(feature = "zstd-compression")]
-        let dedup_dictionary = Arc::new(
-            SharedDedupDictionary::open(directory.clone()).expect("dedup dictionary should open"),
-        );
+        let dedup_dictionary = if metas.index_settings.docstore_compression == crate::store::Compressor::Dedup {
+            Some(Arc::new(
+                SharedDedupDictionary::open(directory.clone()).expect("dedup dictionary should open"),
+            ))
+        } else {
+            None
+        };
         Index {
             settings: metas.index_settings.clone(),
             directory,
@@ -695,8 +699,8 @@ impl Index {
     }
 
     #[cfg(feature = "zstd-compression")]
-    pub(crate) fn dedup_dictionary(&self) -> Arc<SharedDedupDictionary> {
-        Arc::clone(&self.dedup_dictionary)
+    pub(crate) fn dedup_dictionary(&self) -> Option<Arc<SharedDedupDictionary>> {
+        self.dedup_dictionary.as_ref().map(Arc::clone)
     }
 
     /// Accessor to the index schema

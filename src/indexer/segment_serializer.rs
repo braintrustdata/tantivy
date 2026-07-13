@@ -54,7 +54,7 @@ impl SegmentSerializer {
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
                 #[cfg(feature = "zstd-compression")]
-                Some(segment.index().dedup_dictionary()),
+                segment.index().dedup_dictionary(),
                 #[cfg(not(feature = "zstd-compression"))]
                 None,
             )?

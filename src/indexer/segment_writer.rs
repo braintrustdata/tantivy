@@ -511,7 +511,7 @@ fn remap_and_write(
             settings.docstore_blocksize,
             settings.docstore_compress_dedicated_thread,
             #[cfg(feature = "zstd-compression")]
-            Some(serializer.segment().index().dedup_dictionary()),
+            serializer.segment().index().dedup_dictionary(),
             #[cfg(not(feature = "zstd-compression"))]
             None,
         )?;

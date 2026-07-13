@@ -23,6 +23,8 @@ use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
     SegmentSerializer,
 };
+#[cfg(feature = "zstd-compression")]
+use crate::store::compression_dedup_block::dictionary_path as dedup_dictionary_path;
 use crate::{FutureResult, Opstamp};
 
 pub(crate) const DEFAULT_NUM_MERGE_THREADS: usize = 4;
@@ -465,6 +467,10 @@ impl SegmentUpdater {
             .into_iter()
             .flat_map(|segment_meta| self.index.list_segment_files(&segment_meta))
             .collect();
+        #[cfg(feature = "zstd-compression")]
+        if self.index.settings().docstore_compression == crate::store::Compressor::Dedup {
+            files.insert(dedup_dictionary_path().to_path_buf());
+        }
         files.insert(META_FILEPATH.to_path_buf());
         files
     }

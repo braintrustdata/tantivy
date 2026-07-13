@@ -115,7 +115,11 @@ impl BlockCompressorImpl {
     ) -> Self {
         Self {
             #[cfg(feature = "zstd-compression")]
-            dedup_compressor: dedup_dictionary.map(DedupCompressor::new),
+            dedup_compressor: if compressor == Compressor::Dedup {
+                dedup_dictionary.map(DedupCompressor::new)
+            } else {
+                None
+            },
             compressor,
             first_doc_in_block: 0,
             offset_index_writer: SkipIndexBuilder::new(),
