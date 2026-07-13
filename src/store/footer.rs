@@ -10,6 +10,13 @@ use crate::store::io_trace::{self, StoreIoOperation};
 pub struct DocStoreFooter {
     pub offset: u64,
     pub decompressor: Decompressor,
+    pub compression_dictionary: Option<CompressionDictionaryFooter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompressionDictionaryFooter {
+    pub offset: u64,
+    pub length: u32,
 }
 
 /// Serialises the footer to a byte-array
@@ -21,7 +28,13 @@ impl BinarySerializable for DocStoreFooter {
         BinarySerializable::serialize(&DOC_STORE_VERSION, writer)?;
         BinarySerializable::serialize(&self.offset, writer)?;
         BinarySerializable::serialize(&self.decompressor.get_id(), writer)?;
-        writer.write_all(&[0; 15])?;
+        if let Some(compression_dictionary) = self.compression_dictionary {
+            BinarySerializable::serialize(&compression_dictionary.offset, writer)?;
+            BinarySerializable::serialize(&compression_dictionary.length, writer)?;
+            writer.write_all(&[0; 3])?;
+        } else {
+            writer.write_all(&[0; 15])?;
+        }
         Ok(())
     }
 
@@ -32,11 +45,19 @@ impl BinarySerializable for DocStoreFooter {
         }
         let offset = u64::deserialize(reader)?;
         let compressor_id = u8::deserialize(reader)?;
-        let mut skip_buf = [0; 15];
+        let dictionary_offset = u64::deserialize(reader)?;
+        let dictionary_length = u32::deserialize(reader)?;
+        let mut skip_buf = [0; 3];
         reader.read_exact(&mut skip_buf)?;
+        let compression_dictionary =
+            (dictionary_length > 0).then_some(CompressionDictionaryFooter {
+                offset: dictionary_offset,
+                length: dictionary_length,
+            });
         Ok(DocStoreFooter {
             offset,
             decompressor: Decompressor::from_id(compressor_id),
+            compression_dictionary,
         })
     }
 }
@@ -46,10 +67,15 @@ impl FixedSize for DocStoreFooter {
 }
 
 impl DocStoreFooter {
-    pub fn new(offset: u64, decompressor: Decompressor) -> Self {
+    pub fn new(
+        offset: u64,
+        decompressor: Decompressor,
+        compression_dictionary: Option<CompressionDictionaryFooter>,
+    ) -> Self {
         DocStoreFooter {
             offset,
             decompressor,
+            compression_dictionary,
         }
     }
 
@@ -76,5 +102,5 @@ fn doc_store_footer_test() {
     // This test is just to safe guard changes on the footer.
     // When the doc store footer is updated, make sure to update also the serialize/deserialize
     // methods
-    assert_eq!(core::mem::size_of::<DocStoreFooter>(), 16);
+    assert_eq!(core::mem::size_of::<DocStoreFooter>(), 32);
 }

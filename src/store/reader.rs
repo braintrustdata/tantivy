@@ -20,6 +20,9 @@ use crate::store::index::Checkpoint;
 use crate::store::io_trace::{self, StoreIoOperation};
 use crate::DocId;
 
+#[cfg(feature = "zstd-compression")]
+use crate::store::compression_dedup_block::DedupDecompressor;
+
 pub(crate) const DOCSTORE_CACHE_CAPACITY: usize = 100;
 
 type Block = OwnedBytes;
@@ -27,6 +30,8 @@ type Block = OwnedBytes;
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
     decompressor: Decompressor,
+    #[cfg(feature = "zstd-compression")]
+    dedup_decompressor: Option<DedupDecompressor>,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
     space_usage: StoreSpaceUsage,
@@ -121,7 +126,43 @@ impl StoreReader {
     pub fn open(store_file: FileSlice, cache_num_blocks: usize) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
 
-        let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
+        #[cfg(feature = "zstd-compression")]
+        let dedup_decompressor = if footer.decompressor == Decompressor::Dedup {
+            let dictionary_footer = footer.compression_dictionary.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dedup-compressed doc store is missing its dictionary",
+                )
+            })?;
+            let dictionary_data = data_and_offset
+                .slice(
+                    dictionary_footer.offset as usize
+                        ..dictionary_footer.offset as usize + dictionary_footer.length as usize,
+                )
+                .read_bytes()?;
+            io_trace::record(
+                StoreIoOperation::Read,
+                dictionary_footer.offset as usize,
+                dictionary_data.as_ref(),
+            )?;
+            Some(DedupDecompressor::open(dictionary_data.as_ref())?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "zstd-compression"))]
+        if footer.decompressor == Decompressor::Dedup {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "dedup decompression requires Tantivy's zstd-compression feature",
+            ));
+        }
+
+        let data_end = footer
+            .compression_dictionary
+            .map(|dictionary| dictionary.offset as usize)
+            .unwrap_or(footer.offset as usize);
+        let data_file = data_and_offset.slice(..data_end);
+        let offset_index_file = data_and_offset.slice(footer.offset as usize..);
         let index_data = offset_index_file.read_bytes()?;
         io_trace::record(
             StoreIoOperation::Read,
@@ -133,6 +174,8 @@ impl StoreReader {
         let skip_index = SkipIndex::open(index_data);
         Ok(StoreReader {
             decompressor: footer.decompressor,
+            #[cfg(feature = "zstd-compression")]
+            dedup_decompressor,
             data: data_file,
             cache: BlockCache {
                 cache: NonZeroUsize::new(cache_num_blocks)
@@ -197,13 +240,22 @@ impl StoreReader {
         }
 
         let compressed_block = self.get_compressed_block(checkpoint)?;
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        let decompressed_block = OwnedBytes::new(self.decompress_block(compressed_block.as_ref())?);
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
 
         Ok(decompressed_block)
+    }
+
+    fn decompress_block(&self, compressed_block: &[u8]) -> io::Result<Vec<u8>> {
+        #[cfg(feature = "zstd-compression")]
+        if let Some(dedup_decompressor) = &self.dedup_decompressor {
+            let mut decompressed_block = Vec::new();
+            dedup_decompressor.decompress_block(compressed_block, &mut decompressed_block)?;
+            return Ok(decompressed_block);
+        }
+        self.decompressor.decompress(compressed_block)
     }
 
     /// Reads a given document.
@@ -370,8 +422,7 @@ impl StoreReader {
             .read_bytes_async()
             .await?;
 
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        let decompressed_block = OwnedBytes::new(self.decompress_block(compressed_block.as_ref())?);
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
@@ -454,6 +505,26 @@ mod tests {
         assert_eq!(store.cache_stats().cache_misses, 2);
 
         assert_eq!(store.cache.peek_lru(), Some(11207));
+
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_doc_store_dedup_compression() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let path = Path::new("store");
+        let writer = directory.open_write(path)?;
+        let schema = write_lorem_ipsum_store(writer, 500, Compressor::Dedup, BLOCK_SIZE, false);
+        let title = schema.get_field("title").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+
+        for doc_id in [0u32, 1, 257, 499] {
+            let doc = store.get::<TantivyDocument>(doc_id)?;
+            let expected_title = format!("Doc {doc_id}");
+            assert_eq!(get_text_field(&doc, &title), Some(expected_title.as_str()));
+        }
 
         Ok(())
     }

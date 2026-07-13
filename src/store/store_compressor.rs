@@ -12,6 +12,9 @@ use crate::store::io_trace::{self, StoreIoOperation};
 use crate::store::{Compressor, Decompressor, StoreReader};
 use crate::DocId;
 
+#[cfg(feature = "zstd-compression")]
+use crate::store::compression_dedup_block::{dictionary_footer, DedupCompressor};
+
 pub struct BlockCompressor(BlockCompressorVariants);
 
 // The struct wrapping an enum is just here to keep the
@@ -79,6 +82,8 @@ impl BlockCompressor {
 
 struct BlockCompressorImpl {
     compressor: Compressor,
+    #[cfg(feature = "zstd-compression")]
+    dedup_compressor: Option<DedupCompressor>,
     first_doc_in_block: DocId,
     offset_index_writer: SkipIndexBuilder,
     intermediary_buffer: Vec<u8>,
@@ -88,6 +93,8 @@ struct BlockCompressorImpl {
 impl BlockCompressorImpl {
     fn new(compressor: Compressor, writer: WritePtr) -> Self {
         Self {
+            #[cfg(feature = "zstd-compression")]
+            dedup_compressor: (compressor == Compressor::Dedup).then(DedupCompressor::new),
             compressor,
             first_doc_in_block: 0,
             offset_index_writer: SkipIndexBuilder::new(),
@@ -99,6 +106,14 @@ impl BlockCompressorImpl {
     fn compress_block_and_write(&mut self, data: &[u8], num_docs_in_block: u32) -> io::Result<()> {
         assert!(num_docs_in_block > 0);
         self.intermediary_buffer.clear();
+        #[cfg(feature = "zstd-compression")]
+        if let Some(dedup_compressor) = &mut self.dedup_compressor {
+            dedup_compressor.compress_block(data, &mut self.intermediary_buffer)?;
+        } else {
+            self.compressor
+                .compress_into(data, &mut self.intermediary_buffer)?;
+        }
+        #[cfg(not(feature = "zstd-compression"))]
         self.compressor
             .compress_into(data, &mut self.intermediary_buffer)?;
 
@@ -128,6 +143,15 @@ impl BlockCompressorImpl {
     /// in the store and adding them one by one, as the store's data will
     /// not be decompressed and then recompressed.
     fn stack(&mut self, store_reader: StoreReader) -> io::Result<()> {
+        if self.compressor == Compressor::Dedup
+            || store_reader.decompressor() == Decompressor::Dedup
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stacking dedup-compressed doc stores is not implemented",
+            ));
+        }
+
         let doc_shift = self.first_doc_in_block;
         let start_shift = self.writer.written_bytes() as usize;
 
@@ -149,9 +173,13 @@ impl BlockCompressorImpl {
     }
 
     fn close(mut self) -> io::Result<()> {
+        let compression_dictionary = self.serialize_compression_dictionary()?;
         let header_offset: u64 = self.writer.written_bytes();
-        let docstore_footer =
-            DocStoreFooter::new(header_offset, Decompressor::from(self.compressor));
+        let docstore_footer = DocStoreFooter::new(
+            header_offset,
+            Decompressor::from(self.compressor),
+            compression_dictionary,
+        );
 
         let mut offset_index_bytes = Vec::new();
         self.offset_index_writer
@@ -170,6 +198,34 @@ impl BlockCompressorImpl {
         self.writer.write_all(&footer_bytes)?;
         io_trace::record(StoreIoOperation::Write, footer_offset, &footer_bytes)?;
         self.writer.terminate()
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    fn serialize_compression_dictionary(
+        &mut self,
+    ) -> io::Result<Option<crate::store::footer::CompressionDictionaryFooter>> {
+        if let Some(dedup_compressor) = &mut self.dedup_compressor {
+            let dictionary_offset = self.writer.written_bytes() as usize;
+            let dictionary_bytes = dedup_compressor.serialize_dictionary()?;
+            self.writer.write_all(&dictionary_bytes)?;
+            io_trace::record(
+                StoreIoOperation::Write,
+                dictionary_offset,
+                &dictionary_bytes,
+            )?;
+            return Ok(Some(dictionary_footer(
+                dictionary_offset,
+                &dictionary_bytes,
+            )?));
+        }
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "zstd-compression"))]
+    fn serialize_compression_dictionary(
+        &mut self,
+    ) -> io::Result<Option<crate::store::footer::CompressionDictionaryFooter>> {
+        Ok(None)
     }
 }
 
