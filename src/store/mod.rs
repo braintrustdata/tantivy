@@ -31,12 +31,16 @@
 
 mod compressors;
 mod decompressors;
+#[cfg(feature = "zstd-compression")]
+mod dedup;
 mod footer;
 mod index;
 mod io_trace;
 mod reader;
 mod writer;
 pub use self::compressors::{Compressor, ZstdCompressor};
+#[cfg(feature = "zstd-compression")]
+pub use self::dedup::DedupDictionary;
 pub use self::decompressors::Decompressor;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
