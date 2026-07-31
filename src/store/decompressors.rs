@@ -51,9 +51,13 @@ impl Decompressor {
         }
     }
 
-    pub(crate) fn decompress(&self, compressed_block: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn decompress(
+        &self,
+        compressed_block: &[u8],
+        dictionary: Option<&[u8]>,
+    ) -> io::Result<Vec<u8>> {
         let mut decompressed_block = vec![];
-        self.decompress_into(compressed_block, &mut decompressed_block)?;
+        self.decompress_into(compressed_block, &mut decompressed_block, dictionary)?;
         Ok(decompressed_block)
     }
 
@@ -62,6 +66,7 @@ impl Decompressor {
         &self,
         compressed: &[u8],
         decompressed: &mut Vec<u8>,
+        dictionary: Option<&[u8]>,
     ) -> io::Result<()> {
         match self {
             Self::None => {
@@ -72,7 +77,9 @@ impl Decompressor {
             #[cfg(feature = "lz4-compression")]
             Self::Lz4 => super::compression_lz4_block::decompress(compressed, decompressed),
             #[cfg(feature = "zstd-compression")]
-            Self::Zstd => super::compression_zstd_block::decompress(compressed, decompressed),
+            Self::Zstd => {
+                super::compression_zstd_block::decompress(compressed, decompressed, dictionary)
+            }
         }
     }
 }

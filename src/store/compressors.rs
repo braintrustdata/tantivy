@@ -1,3 +1,4 @@
+use std::hash::Hasher as _;
 use std::io;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -77,10 +78,35 @@ impl<'de> Deserialize<'de> for Compressor {
 }
 
 #[derive(Clone, Default, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// The Zstd compressor, with optional compression level.
+/// A small, self-describing reference to the zstd dictionary a doc store was compressed with.
+/// The dictionary's raw bytes are not part of this descriptor (and are not part of `meta.json`
+/// at all) -- callers resolve the actual bytes out-of-band from `content_hash`.
+pub struct ZstdDictionaryDescriptor {
+    /// Content hash of the dictionary bytes, used both to look up the dictionary out-of-band
+    /// and to detect a mismatched/missing dictionary at read time.
+    pub content_hash: u64,
+}
+
+impl ZstdDictionaryDescriptor {
+    /// Computes the content hash used to identify a zstd dictionary's bytes. This is the single
+    /// source of truth for how the hash is derived -- callers resolving a dictionary by hash
+    /// (e.g. from content-addressed storage) and the doc store footer's write-time integrity
+    /// check (see `store::footer`) must agree on this function.
+    pub fn hash_bytes(bytes: &[u8]) -> u64 {
+        let mut hasher = fnv::FnvHasher::default();
+        hasher.write(bytes);
+        hasher.finish()
+    }
+}
+
+#[derive(Clone, Default, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The Zstd compressor, with optional compression level and dictionary.
 pub struct ZstdCompressor {
     /// The compression level, if unset defaults to zstd::DEFAULT_COMPRESSION_LEVEL = 3
     pub compression_level: Option<i32>,
+    /// If set, the doc store was (and must continue to be) compressed against this dictionary.
+    #[serde(default)]
+    pub dictionary: Option<ZstdDictionaryDescriptor>,
 }
 
 #[cfg(feature = "zstd-compression")]
@@ -96,7 +122,7 @@ impl ZstdCompressor {
 
         let mut compressor = ZstdCompressor::default();
         for option in options.split(',') {
-            let (opt_name, value) = options
+            let (opt_name, value) = option
                 .split_once('=')
                 .ok_or_else(|| format!("no '=' found in option {option:?}"))?;
 
@@ -114,6 +140,12 @@ impl ZstdCompressor {
                     }
                     compressor.compression_level = Some(value);
                 }
+                "dictionary_hash" => {
+                    let content_hash = u64::from_str_radix(value, 16).map_err(|err| {
+                        format!("Could not parse value {value} of option {opt_name}, e: {err}")
+                    })?;
+                    compressor.dictionary = Some(ZstdDictionaryDescriptor { content_hash });
+                }
                 _ => {
                     return Err(format!("unknown zstd option {opt_name:?}"));
                 }
@@ -122,10 +154,17 @@ impl ZstdCompressor {
         Ok(compressor)
     }
     fn ser_to_string(&self) -> String {
+        let mut opts = Vec::new();
         if let Some(compression_level) = self.compression_level {
-            format!("zstd(compression_level={compression_level})")
-        } else {
+            opts.push(format!("compression_level={compression_level}"));
+        }
+        if let Some(dictionary) = &self.dictionary {
+            opts.push(format!("dictionary_hash={:x}", dictionary.content_hash));
+        }
+        if opts.is_empty() {
             "zstd".to_string()
+        } else {
+            format!("zstd({})", opts.join(","))
         }
     }
 }
@@ -149,6 +188,7 @@ impl Compressor {
         &self,
         uncompressed: &[u8],
         compressed: &mut Vec<u8>,
+        dictionary: Option<&[u8]>,
     ) -> io::Result<()> {
         match self {
             Self::None => {
@@ -163,6 +203,7 @@ impl Compressor {
                 uncompressed,
                 compressed,
                 _zstd_compressor.compression_level,
+                dictionary,
             ),
         }
     }
@@ -176,6 +217,7 @@ mod tests {
     fn zstd_serde_roundtrip() {
         let compressor = ZstdCompressor {
             compression_level: Some(15),
+            dictionary: None,
         };
 
         assert_eq!(
@@ -186,6 +228,26 @@ mod tests {
         assert_eq!(
             ZstdCompressor::deser_from_str(&ZstdCompressor::default().ser_to_string()).unwrap(),
             ZstdCompressor::default()
+        );
+
+        let compressor_with_dict = ZstdCompressor {
+            compression_level: Some(15),
+            dictionary: Some(ZstdDictionaryDescriptor {
+                content_hash: 0xdeadbeef,
+            }),
+        };
+        assert_eq!(
+            ZstdCompressor::deser_from_str(&compressor_with_dict.ser_to_string()).unwrap(),
+            compressor_with_dict
+        );
+
+        let dict_only = ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor { content_hash: 42 }),
+        };
+        assert_eq!(
+            ZstdCompressor::deser_from_str(&dict_only.ser_to_string()).unwrap(),
+            dict_only
         );
     }
 
@@ -201,7 +263,23 @@ mod tests {
         assert_eq!(
             ZstdCompressor::deser_from_str("zstd(compression_level=15)").unwrap(),
             ZstdCompressor {
-                compression_level: Some(15)
+                compression_level: Some(15),
+                dictionary: None,
+            }
+        );
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(dictionary_hash=2a)").unwrap(),
+            ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionaryDescriptor { content_hash: 42 }),
+            }
+        );
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(compression_level=15,dictionary_hash=2a)")
+                .unwrap(),
+            ZstdCompressor {
+                compression_level: Some(15),
+                dictionary: Some(ZstdDictionaryDescriptor { content_hash: 42 }),
             }
         );
         assert_eq!(

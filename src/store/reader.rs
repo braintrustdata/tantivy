@@ -26,6 +26,7 @@ type Block = OwnedBytes;
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
     decompressor: Decompressor,
+    dictionary: Option<Arc<[u8]>>,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
     space_usage: StoreSpaceUsage,
@@ -117,8 +118,33 @@ impl StoreReader {
     ///
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
     /// The size of blocks is configurable, this should be reflexted in the
-    pub fn open(store_file: FileSlice, cache_num_blocks: usize) -> io::Result<StoreReader> {
+    pub fn open(
+        store_file: FileSlice,
+        cache_num_blocks: usize,
+        dictionary: Option<Arc<[u8]>>,
+    ) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
+
+        if footer.dictionary_content_hash != 0 {
+            let supplied_hash = dictionary
+                .as_deref()
+                .map(super::compressors::ZstdDictionaryDescriptor::hash_bytes);
+            if supplied_hash != Some(footer.dictionary_content_hash) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "doc store was compressed with zstd dictionary (hash {:x}), but the \
+                         directory supplied {}; refusing to decompress with a mismatched \
+                         dictionary",
+                        footer.dictionary_content_hash,
+                        match supplied_hash {
+                            Some(hash) => format!("a different dictionary (hash {hash:x})"),
+                            None => "no dictionary".to_string(),
+                        }
+                    ),
+                ));
+            }
+        }
 
         let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
         let index_data = offset_index_file.read_bytes()?;
@@ -127,6 +153,7 @@ impl StoreReader {
         let skip_index = SkipIndex::open(index_data);
         Ok(StoreReader {
             decompressor: footer.decompressor,
+            dictionary,
             data: data_file,
             cache: BlockCache {
                 cache: NonZeroUsize::new(cache_num_blocks)
@@ -180,8 +207,10 @@ impl StoreReader {
         }
 
         let compressed_block = self.get_compressed_block(checkpoint)?;
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        let decompressed_block = OwnedBytes::new(
+            self.decompressor
+                .decompress(compressed_block.as_ref(), self.dictionary.as_deref())?,
+        );
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
@@ -353,8 +382,10 @@ impl StoreReader {
             .read_bytes_async()
             .await?;
 
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        let decompressed_block = OwnedBytes::new(
+            self.decompressor
+                .decompress(compressed_block.as_ref(), self.dictionary.as_deref())?,
+        );
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
@@ -405,7 +436,7 @@ mod tests {
         let schema = write_lorem_ipsum_store(writer, 500, Compressor::default(), BLOCK_SIZE, true);
         let title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
-        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY, None)?;
 
         assert_eq!(store.cache.len(), 0);
         assert_eq!(store.cache_stats().cache_hits, 0);

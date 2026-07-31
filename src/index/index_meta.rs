@@ -504,9 +504,11 @@ mod tests {
                 }),
                 docstore_compression: crate::store::Compressor::Zstd(ZstdCompressor {
                     compression_level: Some(4),
+                    dictionary: None,
                 }),
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
+                merge_postings_parallelism: super::default_merge_postings_parallelism(),
             },
             segments: Vec::new(),
             schema,

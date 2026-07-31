@@ -35,7 +35,7 @@ mod footer;
 mod index;
 mod reader;
 mod writer;
-pub use self::compressors::{Compressor, ZstdCompressor};
+pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionaryDescriptor};
 pub use self::decompressors::Decompressor;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
@@ -55,6 +55,7 @@ mod compression_zstd_block;
 pub mod tests {
 
     use std::path::Path;
+    use std::sync::Arc;
 
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
@@ -82,6 +83,24 @@ pub mod tests {
         blocksize: usize,
         separate_thread: bool,
     ) -> Schema {
+        write_lorem_ipsum_store_with_dictionary(
+            writer,
+            num_docs,
+            compressor,
+            blocksize,
+            separate_thread,
+            None,
+        )
+    }
+
+    pub fn write_lorem_ipsum_store_with_dictionary(
+        writer: WritePtr,
+        num_docs: usize,
+        compressor: Compressor,
+        blocksize: usize,
+        separate_thread: bool,
+        dictionary: Option<std::sync::Arc<[u8]>>,
+    ) -> Schema {
         let mut schema_builder = Schema::builder();
         let field_body = schema_builder.add_text_field("body", TextOptions::default().set_stored());
         let field_title =
@@ -89,7 +108,8 @@ pub mod tests {
         let schema = schema_builder.build();
         {
             let mut store_writer =
-                StoreWriter::new(writer, compressor, blocksize, separate_thread).unwrap();
+                StoreWriter::new(writer, compressor, blocksize, separate_thread, dictionary)
+                    .unwrap();
             for i in 0..num_docs {
                 let mut doc = TantivyDocument::default();
                 doc.add_field_value(field_body, LOREM.to_string());
@@ -116,7 +136,7 @@ pub mod tests {
             write_lorem_ipsum_store(store_wrt, NUM_DOCS, Compressor::Lz4, BLOCK_SIZE, true);
         let field_title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
-        let store = StoreReader::open(store_file, 10)?;
+        let store = StoreReader::open(store_file, 10, None)?;
         for i in 0..NUM_DOCS as u32 {
             assert_eq!(
                 *store
@@ -161,7 +181,7 @@ pub mod tests {
             write_lorem_ipsum_store(store_wrt, NUM_DOCS, compressor, blocksize, separate_thread);
         let field_title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
-        let store = StoreReader::open(store_file, 10)?;
+        let store = StoreReader::open(store_file, 10, None)?;
         for i in 0..NUM_DOCS as u32 {
             assert_eq!(
                 *store
@@ -206,6 +226,98 @@ pub mod tests {
             BLOCK_SIZE,
             true,
         )
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_store_zstd_with_dictionary() -> crate::Result<()> {
+        let dictionary: Arc<[u8]> = LOREM.as_bytes().to_vec().into();
+        let path = Path::new("store");
+        let directory = RamDirectory::create();
+        let store_wrt = directory.open_write(path)?;
+        let schema = write_lorem_ipsum_store_with_dictionary(
+            store_wrt,
+            NUM_DOCS,
+            Compressor::Zstd(ZstdCompressor::default()),
+            BLOCK_SIZE,
+            true,
+            Some(dictionary.clone()),
+        );
+        let field_title = schema.get_field("title").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, 10, Some(dictionary))?;
+        for i in 0..NUM_DOCS as u32 {
+            assert_eq!(
+                *store
+                    .get::<TantivyDocument>(i)?
+                    .get_first(field_title)
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                format!("Doc {i}")
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_store_zstd_dictionary_mismatch_errors() -> crate::Result<()> {
+        let dictionary: Arc<[u8]> = LOREM.as_bytes().to_vec().into();
+        let wrong_dictionary: Arc<[u8]> = b"not the right dictionary bytes at all"
+            .to_vec()
+            .into();
+        let path = Path::new("store");
+        let directory = RamDirectory::create();
+        let store_wrt = directory.open_write(path)?;
+        write_lorem_ipsum_store_with_dictionary(
+            store_wrt,
+            10,
+            Compressor::Zstd(ZstdCompressor::default()),
+            BLOCK_SIZE,
+            true,
+            Some(dictionary),
+        );
+        let store_file = directory.open_read(path)?;
+
+        // A reader that isn't told about the dictionary at all must not silently decompress.
+        assert!(StoreReader::open(store_file.clone(), 10, None).is_err());
+        // Nor should a reader supplied with the wrong dictionary bytes.
+        assert!(StoreReader::open(store_file, 10, Some(wrong_dictionary)).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_store_reader_without_dictionary_footer_ignores_supplied_dictionary() -> crate::Result<()>
+    {
+        // A store written *without* a dictionary (footer hash == 0) must open and read fine
+        // even if a directory happens to supply one -- the footer's own hash is the source of
+        // truth for whether a dictionary check is required at all.
+        let unused_dictionary: Arc<[u8]> = LOREM.as_bytes().to_vec().into();
+        let path = Path::new("store");
+        let directory = RamDirectory::create();
+        let store_wrt = directory.open_write(path)?;
+        let schema = write_lorem_ipsum_store(
+            store_wrt,
+            10,
+            Compressor::Zstd(ZstdCompressor::default()),
+            BLOCK_SIZE,
+            true,
+        );
+        let field_title = schema.get_field("title").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, 10, Some(unused_dictionary))?;
+        assert_eq!(
+            store
+                .get::<TantivyDocument>(0)?
+                .get_first(field_title)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "Doc 0"
+        );
+        Ok(())
     }
 
     #[test]
@@ -392,7 +504,7 @@ mod bench {
             true,
         );
         let store_file = directory.open_read(path).unwrap();
-        let store = StoreReader::open(store_file, 10).unwrap();
+        let store = StoreReader::open(store_file, 10, None).unwrap();
         b.iter(|| store.iter::<TantivyDocument>(None).collect::<Vec<_>>());
     }
 }

@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{io, thread};
 
@@ -21,8 +22,13 @@ enum BlockCompressorVariants {
 }
 
 impl BlockCompressor {
-    pub fn new(compressor: Compressor, wrt: WritePtr, dedicated_thread: bool) -> io::Result<Self> {
-        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt);
+    pub fn new(
+        compressor: Compressor,
+        wrt: WritePtr,
+        dedicated_thread: bool,
+        dictionary: Option<Arc<[u8]>>,
+    ) -> io::Result<Self> {
+        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt, dictionary);
         if dedicated_thread {
             let dedicated_thread_compressor =
                 DedicatedThreadBlockCompressorImpl::new(block_compressor_impl)?;
@@ -78,6 +84,7 @@ impl BlockCompressor {
 
 struct BlockCompressorImpl {
     compressor: Compressor,
+    dictionary: Option<Arc<[u8]>>,
     first_doc_in_block: DocId,
     offset_index_writer: SkipIndexBuilder,
     intermediary_buffer: Vec<u8>,
@@ -85,9 +92,10 @@ struct BlockCompressorImpl {
 }
 
 impl BlockCompressorImpl {
-    fn new(compressor: Compressor, writer: WritePtr) -> Self {
+    fn new(compressor: Compressor, writer: WritePtr, dictionary: Option<Arc<[u8]>>) -> Self {
         Self {
             compressor,
+            dictionary,
             first_doc_in_block: 0,
             offset_index_writer: SkipIndexBuilder::new(),
             intermediary_buffer: Vec::new(),
@@ -98,8 +106,11 @@ impl BlockCompressorImpl {
     fn compress_block_and_write(&mut self, data: &[u8], num_docs_in_block: u32) -> io::Result<()> {
         assert!(num_docs_in_block > 0);
         self.intermediary_buffer.clear();
-        self.compressor
-            .compress_into(data, &mut self.intermediary_buffer)?;
+        self.compressor.compress_into(
+            data,
+            &mut self.intermediary_buffer,
+            self.dictionary.as_deref(),
+        )?;
 
         let start_offset = self.writer.written_bytes() as usize;
         self.writer.write_all(&self.intermediary_buffer)?;
@@ -143,8 +154,16 @@ impl BlockCompressorImpl {
 
     fn close(mut self) -> io::Result<()> {
         let header_offset: u64 = self.writer.written_bytes();
-        let docstore_footer =
-            DocStoreFooter::new(header_offset, Decompressor::from(self.compressor));
+        let dictionary_content_hash = self
+            .dictionary
+            .as_deref()
+            .map(super::compressors::ZstdDictionaryDescriptor::hash_bytes)
+            .unwrap_or(0);
+        let docstore_footer = DocStoreFooter::new(
+            header_offset,
+            Decompressor::from(self.compressor),
+            dictionary_content_hash,
+        );
         self.offset_index_writer.serialize_into(&mut self.writer)?;
         docstore_footer.serialize(&mut self.writer)?;
         self.writer.terminate()
@@ -260,8 +279,8 @@ mod tests {
         let path2 = Path::new("path2");
         let wrt1 = ram_directory.open_write(path1).unwrap();
         let wrt2 = ram_directory.open_write(path2).unwrap();
-        let block_compressor1 = BlockCompressor::new(Compressor::None, wrt1, true).unwrap();
-        let block_compressor2 = BlockCompressor::new(Compressor::None, wrt2, false).unwrap();
+        let block_compressor1 = BlockCompressor::new(Compressor::None, wrt1, true, None).unwrap();
+        let block_compressor2 = BlockCompressor::new(Compressor::None, wrt2, false, None).unwrap();
         populate_block_compressor(block_compressor1).unwrap();
         populate_block_compressor(block_compressor2).unwrap();
         let data1 = ram_directory.open_read(path1).unwrap();

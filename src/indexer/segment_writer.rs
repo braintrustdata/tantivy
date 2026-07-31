@@ -8,6 +8,7 @@ use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::artifact::{SegmentArtifactProvider, SegmentArtifactWriter};
 use crate::core::json_utils::index_json_values;
+use crate::directory::Directory;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::Segment;
@@ -505,11 +506,13 @@ fn remap_and_write(
             .segment_mut()
             .open_write(SegmentComponent::Store)?;
         let settings = serializer.segment().index().settings();
+        let dictionary = serializer.segment().index().directory().docstore_dictionary();
         let store_writer = StoreWriter::new(
             store_write,
             settings.docstore_compression,
             settings.docstore_blocksize,
             settings.docstore_compress_dedicated_thread,
+            dictionary,
         )?;
         let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
         old_store_writer.close()?;
@@ -519,6 +522,7 @@ fn remap_and_write(
                 .open_read(SegmentComponent::TempStore)?,
             1, /* The docstore is configured to have one doc per block, and each doc is accessed
                 * only once: we don't need caching. */
+            None, // TempStore is always written with Compressor::None, no dictionary.
         )?;
         for old_doc_id in doc_id_map.iter_old_doc_ids() {
             let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
@@ -593,11 +597,12 @@ mod tests {
         let directory = RamDirectory::create();
         let store_wrt = directory.open_write(path).unwrap();
 
-        let mut store_writer = StoreWriter::new(store_wrt, Compressor::None, 0, false).unwrap();
+        let mut store_writer =
+            StoreWriter::new(store_wrt, Compressor::None, 0, false, None).unwrap();
         store_writer.store(&doc, &schema).unwrap();
         store_writer.close().unwrap();
 
-        let reader = StoreReader::open(directory.open_read(path).unwrap(), 0).unwrap();
+        let reader = StoreReader::open(directory.open_read(path).unwrap(), 0, None).unwrap();
         let doc = reader.get::<TantivyDocument>(0).unwrap();
 
         assert_eq!(doc.field_values().len(), 2);

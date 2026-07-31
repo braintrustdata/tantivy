@@ -1,6 +1,6 @@
 use common::TerminatingWrite;
 
-use crate::directory::WritePtr;
+use crate::directory::{Directory, WritePtr};
 use crate::fieldnorm::FieldNormsSerializer;
 use crate::index::{Segment, SegmentComponent};
 use crate::postings::InvertedIndexSerializer;
@@ -45,6 +45,7 @@ impl SegmentSerializer {
                 // therefore will be relatively slow.
                 16000,
                 settings.docstore_compress_dedicated_thread,
+                None,
             )?
         } else {
             let store_write = segment.open_write(SegmentComponent::Store)?;
@@ -53,6 +54,7 @@ impl SegmentSerializer {
                 settings.docstore_compression,
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
+                segment.index().directory().docstore_dictionary(),
             )?
         };
 

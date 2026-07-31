@@ -888,6 +888,9 @@ impl IndexMerger {
                     //
                     // take 7 in order to not walk over all checkpoints.
                     || store_reader.block_checkpoints().take(7).count() < 6
+                    // `Decompressor` can't see zstd dictionaries; byte-for-byte stacking below is
+                    // only safe because one `Directory` (and thus one dictionary) backs this
+                    // whole merge, per the fixed-for-index-life dictionary invariant.
                     || store_reader.decompressor() != store_writer.compressor().into()
                 {
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {

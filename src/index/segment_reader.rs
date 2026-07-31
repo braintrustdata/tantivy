@@ -6,7 +6,7 @@ use std::{fmt, io};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 
-use crate::directory::{CompositeFile, FileSlice};
+use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
@@ -45,6 +45,7 @@ pub struct SegmentReader {
     fieldnorm_readers: FieldNormReaders,
 
     store_file: FileSlice,
+    store_dictionary: Option<Arc<[u8]>>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -153,7 +154,11 @@ impl SegmentReader {
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
     /// The size of blocks is configurable, this should be reflexted in the
     pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
-        StoreReader::open(self.store_file.clone(), cache_num_blocks)
+        StoreReader::open(
+            self.store_file.clone(),
+            cache_num_blocks,
+            self.store_dictionary.clone(),
+        )
     }
 
     /// Open a new segment for reading.
@@ -218,6 +223,7 @@ impl SegmentReader {
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
+            store_dictionary: segment.index().directory().docstore_dictionary(),
             alive_bitset_opt,
             positions_composite,
             schema,

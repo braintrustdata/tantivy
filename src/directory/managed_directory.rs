@@ -327,6 +327,10 @@ impl Directory for ManagedDirectory {
     fn scratch_temp_root(&self) -> Option<PathBuf> {
         self.directory.scratch_temp_root()
     }
+
+    fn docstore_dictionary(&self) -> Option<Arc<[u8]>> {
+        self.directory.docstore_dictionary()
+    }
 }
 
 impl Clone for ManagedDirectory {
