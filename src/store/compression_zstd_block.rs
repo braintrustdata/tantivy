@@ -18,8 +18,13 @@ pub fn compress(
 
     let level = compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
     let compressed_size = if let Some(dict) = dictionary {
-        Compressor::with_dictionary(level, dict)?
-            .compress_to_buffer(uncompressed, &mut compressed[count_size..])?
+        // Blocks compressed against a dictionary carry a zstd frame checksum. It's verified
+        // automatically by the decompressor (a few bytes + a fast XXH64 pass per block) and is
+        // what catches decompressing with a missing/mismatched/corrupted dictionary -- cheaper
+        // than separately hashing the (multi-megabyte) dictionary itself on every doc store open.
+        let mut compressor = Compressor::with_dictionary(level, dict)?;
+        compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+        compressor.compress_to_buffer(uncompressed, &mut compressed[count_size..])?
     } else {
         compress_to_buffer(uncompressed, &mut compressed[count_size..], level)?
     };
@@ -28,6 +33,18 @@ pub fn compress(
     compressed.resize(compressed_size + count_size, 0);
 
     Ok(())
+}
+
+/// Compresses a whole (small-ish, memory-resident) blob for standalone storage -- used for the
+/// docstore dictionary file itself, not the block format above (no length-prefix framing, since
+/// there's no skip-index seeking into this file, just one atomic_read/atomic_write).
+pub fn compress_whole(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::stream::encode_all(bytes, DEFAULT_COMPRESSION_LEVEL)
+}
+
+/// Inverse of [`compress_whole`].
+pub fn decompress_whole(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::stream::decode_all(bytes)
 }
 
 #[inline]

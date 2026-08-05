@@ -506,10 +506,12 @@ fn remap_and_write(
             .segment_mut()
             .open_write(SegmentComponent::Store)?;
         let settings = serializer.segment().index().settings();
-        let dictionary = serializer.segment().index().directory().docstore_dictionary();
+        let dictionary = settings
+            .docstore_compression
+            .resolve_dictionary(serializer.segment().index().directory())?;
         let store_writer = StoreWriter::new(
             store_write,
-            settings.docstore_compression,
+            settings.docstore_compression.clone(),
             settings.docstore_blocksize,
             settings.docstore_compress_dedicated_thread,
             dictionary,

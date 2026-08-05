@@ -1,4 +1,3 @@
-use std::hash::Hasher as _;
 use std::io;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -7,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// the compressor used to compress the doc store.
 ///
 /// The default is Lz4Block, but also depends on the enabled feature flags.
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Compressor {
     /// No compression
     None,
@@ -22,7 +21,7 @@ pub enum Compressor {
 impl Serialize for Compressor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
-        match *self {
+        match self {
             Compressor::None => serializer.serialize_str("none"),
             #[cfg(feature = "lz4-compression")]
             Compressor::Lz4 => serializer.serialize_str("lz4"),
@@ -77,29 +76,22 @@ impl<'de> Deserialize<'de> for Compressor {
     }
 }
 
-#[derive(Clone, Default, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// A small, self-describing reference to the zstd dictionary a doc store was compressed with.
 /// The dictionary's raw bytes are not part of this descriptor (and are not part of `meta.json`
-/// at all) -- callers resolve the actual bytes out-of-band from `content_hash`.
+/// at all) -- `path` is a `Directory`-relative path (from the index root) that callers resolve
+/// via `Directory::atomic_read`. There is deliberately no content hash here: a dictionary can be
+/// multiple megabytes, and hashing it on every doc store open (i.e. every segment, every reader
+/// reload) would be wasted work. Integrity/mismatch detection instead relies on zstd's own frame
+/// checksum (see `compression_zstd_block`), which is verified as a side effect of decompression
+/// at effectively no extra cost.
 pub struct ZstdDictionaryDescriptor {
-    /// Content hash of the dictionary bytes, used both to look up the dictionary out-of-band
-    /// and to detect a mismatched/missing dictionary at read time.
-    pub content_hash: u64,
+    /// Path (relative to the index's own directory) of the file holding this dictionary's bytes,
+    /// stored zstd-compressed on disk.
+    pub path: String,
 }
 
-impl ZstdDictionaryDescriptor {
-    /// Computes the content hash used to identify a zstd dictionary's bytes. This is the single
-    /// source of truth for how the hash is derived -- callers resolving a dictionary by hash
-    /// (e.g. from content-addressed storage) and the doc store footer's write-time integrity
-    /// check (see `store::footer`) must agree on this function.
-    pub fn hash_bytes(bytes: &[u8]) -> u64 {
-        let mut hasher = fnv::FnvHasher::default();
-        hasher.write(bytes);
-        hasher.finish()
-    }
-}
-
-#[derive(Clone, Default, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// The Zstd compressor, with optional compression level and dictionary.
 pub struct ZstdCompressor {
     /// The compression level, if unset defaults to zstd::DEFAULT_COMPRESSION_LEVEL = 3
@@ -140,11 +132,10 @@ impl ZstdCompressor {
                     }
                     compressor.compression_level = Some(value);
                 }
-                "dictionary_hash" => {
-                    let content_hash = u64::from_str_radix(value, 16).map_err(|err| {
-                        format!("Could not parse value {value} of option {opt_name}, e: {err}")
-                    })?;
-                    compressor.dictionary = Some(ZstdDictionaryDescriptor { content_hash });
+                "dictionary_path" => {
+                    compressor.dictionary = Some(ZstdDictionaryDescriptor {
+                        path: value.to_string(),
+                    });
                 }
                 _ => {
                     return Err(format!("unknown zstd option {opt_name:?}"));
@@ -159,7 +150,7 @@ impl ZstdCompressor {
             opts.push(format!("compression_level={compression_level}"));
         }
         if let Some(dictionary) = &self.dictionary {
-            opts.push(format!("dictionary_hash={:x}", dictionary.content_hash));
+            opts.push(format!("dictionary_path={}", dictionary.path));
         }
         if opts.is_empty() {
             "zstd".to_string()
@@ -207,6 +198,31 @@ impl Compressor {
             ),
         }
     }
+
+    /// If this compressor names a zstd dictionary, fetches it from `directory` at the path
+    /// recorded in the descriptor (stored zstd-compressed on disk) and decompresses it. Returns
+    /// `Ok(None)` if this compressor doesn't use a dictionary.
+    pub fn resolve_dictionary(
+        &self,
+        directory: &dyn crate::Directory,
+    ) -> io::Result<Option<std::sync::Arc<[u8]>>> {
+        match self {
+            Self::None => Ok(None),
+            #[cfg(feature = "lz4-compression")]
+            Self::Lz4 => Ok(None),
+            #[cfg(feature = "zstd-compression")]
+            Self::Zstd(zstd_compressor) => {
+                let Some(descriptor) = &zstd_compressor.dictionary else {
+                    return Ok(None);
+                };
+                let compressed = directory
+                    .atomic_read(std::path::Path::new(&descriptor.path))
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                let bytes = super::compression_zstd_block::decompress_whole(&compressed)?;
+                Ok(Some(std::sync::Arc::from(bytes)))
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "zstd-compression", test))]
@@ -233,7 +249,7 @@ mod tests {
         let compressor_with_dict = ZstdCompressor {
             compression_level: Some(15),
             dictionary: Some(ZstdDictionaryDescriptor {
-                content_hash: 0xdeadbeef,
+                path: "dict.bin.zst".to_string(),
             }),
         };
         assert_eq!(
@@ -243,7 +259,9 @@ mod tests {
 
         let dict_only = ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor { content_hash: 42 }),
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "dict.bin.zst".to_string(),
+            }),
         };
         assert_eq!(
             ZstdCompressor::deser_from_str(&dict_only.ser_to_string()).unwrap(),
@@ -268,18 +286,22 @@ mod tests {
             }
         );
         assert_eq!(
-            ZstdCompressor::deser_from_str("zstd(dictionary_hash=2a)").unwrap(),
+            ZstdCompressor::deser_from_str("zstd(dictionary_path=dict.bin.zst)").unwrap(),
             ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor { content_hash: 42 }),
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: "dict.bin.zst".to_string(),
+                }),
             }
         );
         assert_eq!(
-            ZstdCompressor::deser_from_str("zstd(compression_level=15,dictionary_hash=2a)")
+            ZstdCompressor::deser_from_str("zstd(compression_level=15,dictionary_path=dict.bin.zst)")
                 .unwrap(),
             ZstdCompressor {
                 compression_level: Some(15),
-                dictionary: Some(ZstdDictionaryDescriptor { content_hash: 42 }),
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: "dict.bin.zst".to_string(),
+                }),
             }
         );
         assert_eq!(
@@ -295,5 +317,36 @@ mod tests {
             "Could not parse value over9000 of option compression_level, e: invalid digit found \
              in string"
         );
+    }
+
+    #[test]
+    fn resolve_dictionary_reads_and_decompresses_from_path() {
+        use crate::directory::{Directory, RamDirectory};
+
+        let directory = RamDirectory::create();
+        let raw_dict = b"a dictionary's worth of bytes, stored zstd-compressed on disk".to_vec();
+        let compressed = super::super::compression_zstd_block::compress_whole(&raw_dict).unwrap();
+        directory
+            .atomic_write(std::path::Path::new("dict.bin.zst"), &compressed)
+            .unwrap();
+
+        let compressor = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "dict.bin.zst".to_string(),
+            }),
+        });
+        let resolved = compressor.resolve_dictionary(&directory).unwrap();
+        assert_eq!(resolved.as_deref(), Some(raw_dict.as_slice()));
+    }
+
+    #[test]
+    fn resolve_dictionary_is_none_without_a_dictionary() {
+        use crate::directory::RamDirectory;
+
+        let directory = RamDirectory::create();
+        let compressor = Compressor::Zstd(ZstdCompressor::default());
+        assert!(compressor.resolve_dictionary(&directory).unwrap().is_none());
+        assert!(Compressor::None.resolve_dictionary(&directory).unwrap().is_none());
     }
 }

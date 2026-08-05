@@ -212,6 +212,12 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
+        let store_dictionary = segment
+            .index()
+            .settings()
+            .docstore_compression
+            .resolve_dictionary(segment.index().directory())?;
+
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
@@ -223,7 +229,7 @@ impl SegmentReader {
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
-            store_dictionary: segment.index().directory().docstore_dictionary(),
+            store_dictionary,
             alive_bitset_opt,
             positions_composite,
             schema,

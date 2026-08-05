@@ -39,7 +39,8 @@ impl StoreWriter {
         dedicated_thread: bool,
         dictionary: Option<Arc<[u8]>>,
     ) -> io::Result<StoreWriter> {
-        let block_compressor = BlockCompressor::new(compressor, writer, dedicated_thread, dictionary)?;
+        let block_compressor =
+            BlockCompressor::new(compressor.clone(), writer, dedicated_thread, dictionary)?;
         Ok(StoreWriter {
             compressor,
             block_size,
@@ -51,7 +52,7 @@ impl StoreWriter {
     }
 
     pub(crate) fn compressor(&self) -> Compressor {
-        self.compressor
+        self.compressor.clone()
     }
 
     /// The memory used (inclusive childs)

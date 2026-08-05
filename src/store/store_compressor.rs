@@ -154,16 +154,7 @@ impl BlockCompressorImpl {
 
     fn close(mut self) -> io::Result<()> {
         let header_offset: u64 = self.writer.written_bytes();
-        let dictionary_content_hash = self
-            .dictionary
-            .as_deref()
-            .map(super::compressors::ZstdDictionaryDescriptor::hash_bytes)
-            .unwrap_or(0);
-        let docstore_footer = DocStoreFooter::new(
-            header_offset,
-            Decompressor::from(self.compressor),
-            dictionary_content_hash,
-        );
+        let docstore_footer = DocStoreFooter::new(header_offset, Decompressor::from(self.compressor));
         self.offset_index_writer.serialize_into(&mut self.writer)?;
         docstore_footer.serialize(&mut self.writer)?;
         self.writer.terminate()

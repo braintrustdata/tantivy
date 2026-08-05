@@ -50,6 +50,8 @@ mod compression_lz4_block;
 
 #[cfg(feature = "zstd-compression")]
 mod compression_zstd_block;
+#[cfg(feature = "zstd-compression")]
+pub use self::compression_zstd_block::{compress_whole, decompress_whole};
 
 #[cfg(test)]
 pub mod tests {
@@ -280,10 +282,15 @@ pub mod tests {
         );
         let store_file = directory.open_read(path)?;
 
-        // A reader that isn't told about the dictionary at all must not silently decompress.
-        assert!(StoreReader::open(store_file.clone(), 10, None).is_err());
-        // Nor should a reader supplied with the wrong dictionary bytes.
-        assert!(StoreReader::open(store_file, 10, Some(wrong_dictionary)).is_err());
+        // StoreReader::open no longer eagerly checks the dictionary (that would mean hashing a
+        // potentially multi-megabyte dictionary on every open) -- a missing/mismatched
+        // dictionary is instead caught by zstd's own frame checksum the first time a block is
+        // actually decompressed.
+        let reader_without_dict = StoreReader::open(store_file.clone(), 10, None)?;
+        assert!(reader_without_dict.get::<TantivyDocument>(0).is_err());
+
+        let reader_with_wrong_dict = StoreReader::open(store_file, 10, Some(wrong_dictionary))?;
+        assert!(reader_with_wrong_dict.get::<TantivyDocument>(0).is_err());
         Ok(())
     }
 

@@ -125,27 +125,11 @@ impl StoreReader {
     ) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
 
-        if footer.dictionary_content_hash != 0 {
-            let supplied_hash = dictionary
-                .as_deref()
-                .map(super::compressors::ZstdDictionaryDescriptor::hash_bytes);
-            if supplied_hash != Some(footer.dictionary_content_hash) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "doc store was compressed with zstd dictionary (hash {:x}), but the \
-                         directory supplied {}; refusing to decompress with a mismatched \
-                         dictionary",
-                        footer.dictionary_content_hash,
-                        match supplied_hash {
-                            Some(hash) => format!("a different dictionary (hash {hash:x})"),
-                            None => "no dictionary".to_string(),
-                        }
-                    ),
-                ));
-            }
-        }
-
+        // No upfront dictionary check here: blocks compressed against a dictionary carry a zstd
+        // frame checksum (see `compression_zstd_block::compress`), which the decompressor in
+        // `read_block` verifies automatically. Decompressing with a missing/mismatched dictionary
+        // therefore fails loudly there, without needing to read/hash a (potentially
+        // multi-megabyte) dictionary on every store open just to pre-check it.
         let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
         let index_data = offset_index_file.read_bytes()?;
         let space_usage =

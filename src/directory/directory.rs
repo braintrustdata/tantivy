@@ -193,13 +193,6 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
         None
     }
 
-    /// Returns the zstd dictionary the doc store should be compressed/decompressed against,
-    /// if any. Implementors that wrap another `Directory` (e.g. `ManagedDirectory`) should
-    /// delegate to the inner directory.
-    fn docstore_dictionary(&self) -> Option<Arc<[u8]>> {
-        None
-    }
-
     /// Acquire a lock in the directory given in the [`Lock`].
     ///
     /// The method is blocking or not depending on the [`Lock`] object.
