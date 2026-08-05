@@ -8,7 +8,6 @@ use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::artifact::{SegmentArtifactProvider, SegmentArtifactWriter};
 use crate::core::json_utils::index_json_values;
-use crate::directory::Directory;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::Segment;
