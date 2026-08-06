@@ -296,11 +296,12 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn test_store_reader_without_dictionary_footer_ignores_supplied_dictionary() -> crate::Result<()>
-    {
-        // A store written *without* a dictionary (footer hash == 0) must open and read fine
-        // even if a directory happens to supply one -- the footer's own hash is the source of
-        // truth for whether a dictionary check is required at all.
+    fn test_store_reader_ignores_an_unused_supplied_dictionary() -> crate::Result<()> {
+        // A store written *without* a dictionary must open and read fine even if the caller
+        // happens to supply one anyway (e.g. because the directory's settings named one, but
+        // this particular store was written before/without it) -- blocks that were never
+        // compressed against a dictionary don't reference it, so a dictionary the decompressor
+        // never needed is simply unused, not an error.
         let unused_dictionary: Arc<[u8]> = LOREM.as_bytes().to_vec().into();
         let path = Path::new("store");
         let directory = RamDirectory::create();
