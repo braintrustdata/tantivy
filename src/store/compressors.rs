@@ -231,7 +231,24 @@ impl Compressor {
                 };
                 let compressed = directory
                     .atomic_read(std::path::Path::new(&descriptor.path))
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+                    .map_err(|err| {
+                        // Preserve `NotFound`/the original `io::Error`'s kind, rather than
+                        // flattening every failure mode to `ErrorKind::Other` -- a misconfigured
+                        // `dictionary_path` should be as easy to diagnose as a typical
+                        // missing-file error.
+                        let kind = match &err {
+                            crate::directory::error::OpenReadError::FileDoesNotExist(_) => {
+                                io::ErrorKind::NotFound
+                            }
+                            crate::directory::error::OpenReadError::IoError { io_error, .. } => {
+                                io_error.kind()
+                            }
+                            crate::directory::error::OpenReadError::IncompatibleIndex(_) => {
+                                io::ErrorKind::InvalidData
+                            }
+                        };
+                        io::Error::new(kind, err.to_string())
+                    })?;
                 let bytes = super::compression_zstd_block::decompress_whole(&compressed)?;
                 Ok(Some(std::sync::Arc::from(bytes)))
             }
@@ -362,5 +379,22 @@ mod tests {
         let compressor = Compressor::Zstd(ZstdCompressor::default());
         assert!(compressor.resolve_dictionary(&directory).unwrap().is_none());
         assert!(Compressor::None.resolve_dictionary(&directory).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_dictionary_missing_file_surfaces_not_found_not_other() {
+        use crate::directory::RamDirectory;
+
+        let directory = RamDirectory::create();
+        let compressor = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "does_not_exist.bin.zst".to_string(),
+            }),
+        });
+        let err = compressor.resolve_dictionary(&directory).unwrap_err();
+        // A misconfigured `dictionary_path` should be as easy to diagnose as any other
+        // missing-file error -- not flattened to `ErrorKind::Other`.
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
