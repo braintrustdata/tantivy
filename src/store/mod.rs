@@ -66,7 +66,7 @@ pub mod tests {
     use crate::schema::{
         self, Schema, TantivyDocument, TextFieldIndexing, TextOptions, STORED, TEXT,
     };
-    use crate::{Index, IndexWriter, Term};
+    use crate::{Index, IndexSettings, IndexWriter, Term};
 
     const LOREM: &str = "Doc Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
                          eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad \
@@ -428,6 +428,99 @@ pub mod tests {
         }
         assert_eq!(store.decompressor(), Decompressor::Zstd);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently()
+    -> crate::Result<()> {
+        // Documents this fork's invariant that a dictionary is fixed for an index's life: if
+        // that's ever violated anyway (bug, race, manual meta.json edit), stacking's
+        // eligibility check only compares `Decompressor` (compressor family), which can't see
+        // a dictionary change -- rotating the dictionary between two commits should therefore
+        // force the decompress/recompress merge path (so the dictionary's own zstd checksum
+        // fires) rather than silently stacking blocks compressed against a stale dictionary.
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // Write the dictionaries to the *raw* directory, before it's wrapped in a
+        // `ManagedDirectory` by `open_or_create` below -- exactly as Brainstore's own
+        // `seed_dictionary_for_create` does (writes via the unwrapped `PrefixDirectory`, before
+        // `IndexBuilder::open_or_create` wraps it). This matters: a file written *through* the
+        // `ManagedDirectory` gets registered and becomes eligible for the automatic
+        // post-commit GC (`SegmentUpdater::list_files` only protects segment files + meta.json),
+        // which would otherwise delete an unrelated sibling file like the dictionary blob.
+        let ram_directory = RamDirectory::create();
+        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        let dict_b =
+            super::compression_zstd_block::compress_whole(b"an entirely different dictionary")?;
+        ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
+        ram_directory.atomic_write(Path::new("dict_b.bin.zst"), &dict_b)?;
+
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: "dict_a.bin.zst".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .open_or_create(ram_directory)?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            // Put enough data in each segment to be considered for stacking.
+            for _ in 0..200 {
+                index_writer
+                    .add_document(doc!(text_field=> LOREM))
+                    .expect("add_document 1 failed");
+            }
+            index_writer.commit().expect("commit 1 failed");
+            for _ in 0..200 {
+                index_writer
+                    .add_document(doc!(text_field=> LOREM))
+                    .expect("add_document 2 failed");
+            }
+            index_writer.commit().expect("commit 2 failed");
+        }
+
+        // Rotate the dictionary -- same compressor family, different dictionary. A real
+        // Brainstore-side bug/race is what this is meant to simulate; the fork itself has no
+        // way to prevent this in-process.
+        index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "dict_b.bin.zst".to_string(),
+            }),
+        });
+
+        // Drive the merge directly through `IndexMerger`/`SegmentSerializer`, the same building
+        // blocks `SegmentUpdater::merge` uses (`indexer/segment_updater.rs`), rather than through
+        // `IndexWriter::merge`'s scheduling: under `cfg(test)`, a scheduled merge that returns an
+        // `Err` deliberately panics inside a rayon worker instead of surfacing a `Result`
+        // (`segment_updater.rs`'s `if cfg!(test) { panic!(...) }`), which is orthogonal to what
+        // this test wants to observe.
+        let segments = index.searchable_segments().expect("Searchable segments failed.");
+        let merger = crate::indexer::merger::IndexMerger::open(
+            index.schema(),
+            index.settings().clone(),
+            &segments[..],
+        )?;
+        let merged_segment = index.new_segment();
+        let segment_serializer =
+            crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        let merge_result = merger.write(segment_serializer, None);
+        assert!(
+            merge_result.is_err(),
+            "merge should fail loudly (dictionary checksum mismatch) when the dictionary \
+             changed underneath it, not silently stack mismatched blocks into the merged \
+             segment; got {merge_result:?}"
+        );
         Ok(())
     }
 

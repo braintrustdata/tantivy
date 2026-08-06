@@ -199,6 +199,20 @@ impl Compressor {
         }
     }
 
+    /// Whether this compressor is configured with a zstd dictionary. Merges use this to fall
+    /// back from raw block-stacking (which never decompresses, and so never exercises the
+    /// dictionary's own zstd checksum) to a decompress/recompress path -- see
+    /// `IndexMerger::write_storable_fields` in `indexer/merger.rs`.
+    pub fn has_dictionary(&self) -> bool {
+        match self {
+            Self::None => false,
+            #[cfg(feature = "lz4-compression")]
+            Self::Lz4 => false,
+            #[cfg(feature = "zstd-compression")]
+            Self::Zstd(zstd_compressor) => zstd_compressor.dictionary.is_some(),
+        }
+    }
+
     /// If this compressor names a zstd dictionary, fetches it from `directory` at the path
     /// recorded in the descriptor (stored zstd-compressed on disk) and decompresses it. Returns
     /// `Ok(None)` if this compressor doesn't use a dictionary.
