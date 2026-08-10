@@ -46,6 +46,7 @@ pub struct SegmentReader {
 
     store_file: FileSlice,
     store_dictionary: Option<Arc<[u8]>>,
+    store_dictionary_path: Option<String>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -77,6 +78,14 @@ impl SegmentReader {
     /// Returns true if some of the documents of the segment have been deleted.
     pub fn has_deletes(&self) -> bool {
         self.num_deleted_docs() > 0
+    }
+
+    /// Path of the dictionary this segment's doc store was compressed against at write time, if
+    /// any -- frozen at write/merge time, see `SegmentMeta::docstore_dictionary_path`. Merges use
+    /// this (not the index's current `docstore_compression` setting) to decide whether raw
+    /// block-stacking is safe.
+    pub(crate) fn docstore_dictionary_path(&self) -> Option<&str> {
+        self.store_dictionary_path.as_deref()
     }
 
     /// Accessor to a segment's fast field reader given a field.
@@ -217,6 +226,7 @@ impl SegmentReader {
             .settings()
             .docstore_compression
             .resolve_dictionary(segment.index().directory())?;
+        let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
 
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
@@ -230,6 +240,7 @@ impl SegmentReader {
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
             store_dictionary,
+            store_dictionary_path,
             alive_bitset_opt,
             positions_composite,
             schema,

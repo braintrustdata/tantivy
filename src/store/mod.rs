@@ -606,6 +606,81 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
+    fn test_merge_stacks_when_both_segments_share_the_same_dictionary() -> crate::Result<()> {
+        // Segments compressed against the *same* dictionary (the common case: a dictionary
+        // configured once, unchanged, for the index's whole life) should still fast-merge
+        // (raw block-stacking, no decompress/recompress) -- the eligibility guard forcing
+        // recompress for any dictionary-configured target was overly blunt; comparing the
+        // segment's own recorded dictionary path (`SegmentMeta::docstore_dictionary_path`)
+        // against the target's current one lets same-dictionary merges take the fast path while
+        // still catching real mismatches (see the rotated/removed dictionary tests above).
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // See the rotation test above for why this is written to the raw, unwrapped directory.
+        let ram_directory = RamDirectory::create();
+        let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
+
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: "dict.bin.zst".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .open_or_create(ram_directory)?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            // Put enough data in each segment to be considered for stacking.
+            for _ in 0..200 {
+                index_writer
+                    .add_document(doc!(text_field=> LOREM))
+                    .expect("add_document 1 failed");
+            }
+            index_writer.commit().expect("commit 1 failed");
+            for _ in 0..200 {
+                index_writer
+                    .add_document(doc!(text_field=> LOREM))
+                    .expect("add_document 2 failed");
+            }
+            index_writer.commit().expect("commit 2 failed");
+        }
+
+        // Dictionary setting is untouched -- both segments and the merge target agree.
+        let segments = index.searchable_segments().expect("Searchable segments failed.");
+        assert_eq!(segments.len(), 2);
+        let merger = crate::indexer::merger::IndexMerger::open(
+            index.schema(),
+            index.settings().clone(),
+            &segments[..],
+        )?;
+        let merged_segment = index.new_segment();
+        let segment_serializer =
+            crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
+        let merge_result = merger.write(segment_serializer, None);
+        assert!(
+            merge_result.is_ok(),
+            "merge of same-dictionary segments should succeed; got {merge_result:?}"
+        );
+        assert_eq!(
+            crate::indexer::merger::take_stacked_segments_for_test(),
+            2,
+            "both segments share the merge target's dictionary and should take the fast \
+             block-stacking path, not decompress/recompress"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
     fn test_dictionary_written_through_managed_directory_survives_post_commit_gc()
     -> crate::Result<()> {
         // Regression test for a managed-directory GC hazard: seeding the dictionary blob via

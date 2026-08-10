@@ -43,7 +43,17 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn finalize(self) -> crate::Result<Index> {
         let max_doc = self.segment_writer.max_doc();
         self.segment_writer.finalize()?;
-        let segment: Segment = self.segment.with_max_doc(max_doc);
+        let dictionary_path = self
+            .segment
+            .index()
+            .settings()
+            .docstore_compression
+            .dictionary_path()
+            .map(str::to_string);
+        let segment: Segment = self
+            .segment
+            .with_max_doc(max_doc)
+            .with_docstore_dictionary_path(dictionary_path);
         let index = segment.index();
         let index_meta = IndexMeta {
             index_settings: index.settings().clone(),
