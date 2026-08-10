@@ -524,6 +524,70 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_dictionary_written_through_managed_directory_survives_post_commit_gc()
+    -> crate::Result<()> {
+        // Regression test for a managed-directory GC hazard: seeding the dictionary blob via
+        // `Index::directory()` -- a `ManagedDirectory`, and the natural, public way to write a
+        // sibling asset once you hold an open `Index` -- registers the file for garbage
+        // collection (`ManagedDirectory::atomic_write`/`open_write` unconditionally call
+        // `register_file_as_managed` before delegating). `SegmentUpdater::list_files`, the GC's
+        // live-file set, only knows about segment component files and `meta.json`; it has no
+        // notion of `index_settings.docstore_compression`'s dictionary path. `schedule_commit`
+        // runs `garbage_collect_files` unconditionally after every commit, so a dictionary
+        // written this way is deleted out from under the index on the very next commit.
+        //
+        // Contrast with `test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently`
+        // above, which deliberately writes its dictionaries to the *raw*, unwrapped directory to
+        // dodge exactly this hazard.
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let dict_path = "dict.bin.zst";
+        let dict_bytes = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: dict_path.to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+
+        // Seed the dictionary the way an integrator naturally would once they hold an open
+        // `Index`: through `Index::directory()`, i.e. the managed directory -- not through the
+        // raw pre-wrap directory the way the rotation test above does.
+        index
+            .directory()
+            .atomic_write(Path::new(dict_path), &dict_bytes)?;
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            for _ in 0..200 {
+                index_writer.add_document(doc!(text_field=> LOREM))?;
+            }
+            // The unconditional post-commit `garbage_collect_files` call is the mechanism under
+            // test: it should not sweep up a file it doesn't know is load-bearing.
+            index_writer.commit()?;
+        }
+
+        assert!(
+            index.directory().exists(Path::new(dict_path))?,
+            "dictionary file seeded through the managed directory was garbage collected on the \
+             very next commit"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_merge_of_small_segments() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
