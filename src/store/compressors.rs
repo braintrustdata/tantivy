@@ -85,6 +85,11 @@ impl<'de> Deserialize<'de> for Compressor {
 /// reload) would be wasted work. Integrity/mismatch detection instead relies on zstd's own frame
 /// checksum (see `compression_zstd_block`), which is verified as a side effect of decompression
 /// at effectively no extra cost.
+///
+/// `SegmentUpdater::list_files` protects `path` from garbage collection for any `Directory` that
+/// routes GC through it (i.e. anything wrapped in `ManagedDirectory`, which is every `Index`).
+/// Directory implementations that run their own GC outside of that path are not covered and must
+/// protect the dictionary file themselves.
 pub struct ZstdDictionaryDescriptor {
     /// Path (relative to the index's own directory) of the file holding this dictionary's bytes,
     /// stored zstd-compressed on disk.
@@ -210,6 +215,21 @@ impl Compressor {
             Self::Lz4 => false,
             #[cfg(feature = "zstd-compression")]
             Self::Zstd(zstd_compressor) => zstd_compressor.dictionary.is_some(),
+        }
+    }
+
+    /// The `Directory`-relative path of this compressor's dictionary, if any. Used by
+    /// `SegmentUpdater::list_files` to protect the dictionary file from garbage collection --
+    /// see that function for why this can't be inferred from segment metadata alone.
+    pub(crate) fn dictionary_path(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            #[cfg(feature = "lz4-compression")]
+            Self::Lz4 => None,
+            #[cfg(feature = "zstd-compression")]
+            Self::Zstd(zstd_compressor) => {
+                zstd_compressor.dictionary.as_ref().map(|d| d.path.as_str())
+            }
         }
     }
 

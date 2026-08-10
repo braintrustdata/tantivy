@@ -466,6 +466,12 @@ impl SegmentUpdater {
             .flat_map(|segment_meta| self.index.list_segment_files(&segment_meta))
             .collect();
         files.insert(META_FILEPATH.to_path_buf());
+        // The dictionary is a sibling asset referenced by path from `IndexSettings`, not from
+        // any segment's file list -- without this it's invisible to GC and gets swept the first
+        // time it's written through a `ManagedDirectory` (e.g. `Index::directory().atomic_write`).
+        if let Some(dict_path) = self.index.settings().docstore_compression.dictionary_path() {
+            files.insert(PathBuf::from(dict_path));
+        }
         files
     }
 
