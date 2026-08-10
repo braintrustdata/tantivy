@@ -892,10 +892,16 @@ impl IndexMerger {
                     // Byte-for-byte stacking below never decompresses, so it can't exercise the
                     // dictionary's own zstd checksum -- the one thing that would catch the
                     // fixed-for-index-life dictionary invariant ever being violated (bug, race,
-                    // manual meta.json edit). Force the decompress/recompress path below instead
-                    // whenever a dictionary is configured, so a violation fails loudly here
-                    // rather than silently, on some unrelated later read.
+                    // manual meta.json edit), in either direction: target now has a dictionary
+                    // (covers both "just configured" and "rotated to a different one" -- the
+                    // stacking path can't tell those two apart from `has_dictionary()` alone, so
+                    // it conservatively forces recompress for any dictionary-configured target),
+                    // or this segment's own blocks were written against a dictionary that the
+                    // target no longer has. Force the decompress/recompress path below in either
+                    // case, so a violation fails loudly here rather than silently, on some
+                    // unrelated later read.
                     || store_writer.compressor().has_dictionary()
+                    || store_reader.dictionary_used()
                 {
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
                         let doc_bytes = doc_bytes_res?;

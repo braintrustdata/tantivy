@@ -26,6 +26,7 @@ type Block = OwnedBytes;
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
     decompressor: Decompressor,
+    dictionary_used: bool,
     dictionary: Option<Arc<[u8]>>,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
@@ -137,6 +138,7 @@ impl StoreReader {
         let skip_index = SkipIndex::open(index_data);
         Ok(StoreReader {
             decompressor: footer.decompressor,
+            dictionary_used: footer.dictionary_used(),
             dictionary,
             data: data_file,
             cache: BlockCache {
@@ -156,6 +158,11 @@ impl StoreReader {
 
     pub(crate) fn decompressor(&self) -> Decompressor {
         self.decompressor
+    }
+
+    /// Whether this segment's blocks were compressed against a dictionary at write time.
+    pub(crate) fn dictionary_used(&self) -> bool {
+        self.dictionary_used
     }
 
     /// Returns the cache hit and miss statistics of the store reader.

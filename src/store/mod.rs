@@ -526,6 +526,86 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
+    fn test_merge_with_dictionary_removed_fails_loud_instead_of_stacking_silently()
+    -> crate::Result<()> {
+        // Mirror image of `test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently`:
+        // the stacking-eligibility guard used to only check whether the merge *target* currently
+        // has a dictionary configured (`store_writer.compressor().has_dictionary()`), so
+        // Some(dict) -> None went undetected -- the target's `has_dictionary()` is `false`, so
+        // the guard never fires, and blocks physically compressed against `dict_a` get raw-copied
+        // into a merged segment whose settings now say "no dictionary". This asserts the fix:
+        // comparing the segment's own recorded dictionary-use flag against the target's current
+        // setting, in both directions.
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // See the rotation test above for why this is written to the raw, unwrapped directory.
+        let ram_directory = RamDirectory::create();
+        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
+
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: "dict_a.bin.zst".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .open_or_create(ram_directory)?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            // Put enough data in each segment to be considered for stacking.
+            for _ in 0..200 {
+                index_writer
+                    .add_document(doc!(text_field=> LOREM))
+                    .expect("add_document 1 failed");
+            }
+            index_writer.commit().expect("commit 1 failed");
+            for _ in 0..200 {
+                index_writer
+                    .add_document(doc!(text_field=> LOREM))
+                    .expect("add_document 2 failed");
+            }
+            index_writer.commit().expect("commit 2 failed");
+        }
+
+        // Remove the dictionary -- same compressor family (Zstd), no dictionary. A real
+        // Brainstore-side bug/race is what this is meant to simulate; the fork itself has no
+        // way to prevent this in-process.
+        index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: None,
+        });
+
+        // Drive the merge directly through `IndexMerger`/`SegmentSerializer`; see the rotation
+        // test above for why this bypasses `IndexWriter::merge`'s scheduling.
+        let segments = index.searchable_segments().expect("Searchable segments failed.");
+        let merger = crate::indexer::merger::IndexMerger::open(
+            index.schema(),
+            index.settings().clone(),
+            &segments[..],
+        )?;
+        let merged_segment = index.new_segment();
+        let segment_serializer =
+            crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        let merge_result = merger.write(segment_serializer, None);
+        assert!(
+            merge_result.is_err(),
+            "merge should fail loudly (dictionary checksum mismatch) when the dictionary was \
+             removed underneath it, not silently stack dictionary-compressed blocks into a \
+             merged segment declared to have no dictionary; got {merge_result:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
     fn test_dictionary_written_through_managed_directory_survives_post_commit_gc()
     -> crate::Result<()> {
         // Regression test for a managed-directory GC hazard: seeding the dictionary blob via
