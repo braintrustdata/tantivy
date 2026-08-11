@@ -76,6 +76,22 @@ impl<'de> Deserialize<'de> for Compressor {
     }
 }
 
+/// Rejects anything that isn't a plain path relative to the index directory: absolute paths and
+/// any `..`/`.` component. `Directory::resolve_path` implementations (e.g. `MmapDirectory`) do a
+/// plain, unchecked `root_path.join(relative_path)` -- `PathBuf::join` fully replaces `root_path`
+/// when `relative_path` is absolute, and `..` components are passed straight through for the OS
+/// to resolve at actual file-open time. Without this check, a `dictionary_path` like
+/// `/etc/passwd` or `../../../../etc/some_file` would read (or, via whatever seeds the
+/// dictionary file, write) outside the index directory entirely.
+#[cfg(feature = "zstd-compression")]
+fn is_safe_relative_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// A small, self-describing reference to the zstd dictionary a doc store was compressed with.
 /// The dictionary's raw bytes are not part of this descriptor (and are not part of `meta.json`
@@ -138,6 +154,12 @@ impl ZstdCompressor {
                     compressor.compression_level = Some(value);
                 }
                 "dictionary_path" => {
+                    if !is_safe_relative_path(value) {
+                        return Err(format!(
+                            "dictionary_path must be a plain path relative to the index \
+                             directory (no leading '/' and no '..' components), got {value:?}"
+                        ));
+                    }
                     compressor.dictionary = Some(ZstdDictionaryDescriptor {
                         path: value.to_string(),
                     });
@@ -249,6 +271,21 @@ impl Compressor {
                 let Some(descriptor) = &zstd_compressor.dictionary else {
                     return Ok(None);
                 };
+                // Defense in depth: `ZstdDictionaryDescriptor::path` is `pub`, so a caller can
+                // construct one directly and skip `deser_from_str`'s validation. Re-check here,
+                // right before it's ever handed to a `Directory`, so an absolute path or `..`
+                // traversal can't escape the index directory (see `resolve_path` on
+                // `MmapDirectory` et al., which is a plain, unchecked `root_path.join(..)`).
+                if !is_safe_relative_path(&descriptor.path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "dictionary_path must be a plain path relative to the index \
+                             directory (no leading '/' and no '..' components), got {:?}",
+                            descriptor.path
+                        ),
+                    ));
+                }
                 let compressed = directory
                     .atomic_read(std::path::Path::new(&descriptor.path))
                     .map_err(|err| {
@@ -371,6 +408,25 @@ mod tests {
     }
 
     #[test]
+    fn deser_zstd_rejects_unsafe_dictionary_paths() {
+        // Absolute path -- `PathBuf::join` fully replaces `root_path` when the joined path is
+        // absolute, so this would otherwise read/write outside the index directory entirely.
+        assert!(ZstdCompressor::deser_from_str("zstd(dictionary_path=/etc/passwd)")
+            .unwrap_err()
+            .contains("dictionary_path must be a plain path"));
+
+        // `..` traversal -- passed straight through for the OS to resolve at open time.
+        assert!(ZstdCompressor::deser_from_str(
+            "zstd(dictionary_path=../../../../etc/passwd)"
+        )
+        .unwrap_err()
+        .contains("dictionary_path must be a plain path"));
+
+        // A plain relative path is still accepted.
+        assert!(ZstdCompressor::deser_from_str("zstd(dictionary_path=dict.bin.zst)").is_ok());
+    }
+
+    #[test]
     fn resolve_dictionary_reads_and_decompresses_from_path() {
         use crate::directory::{Directory, RamDirectory};
 
@@ -416,5 +472,34 @@ mod tests {
         // A misconfigured `dictionary_path` should be as easy to diagnose as any other
         // missing-file error -- not flattened to `ErrorKind::Other`.
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn resolve_dictionary_rejects_unsafe_paths_even_when_constructed_directly() {
+        // `ZstdDictionaryDescriptor::path` is `pub`, so a caller can bypass
+        // `deser_from_str`'s validation entirely by building the struct literal directly.
+        // `resolve_dictionary` must still refuse to hand an absolute/traversing path to the
+        // `Directory`.
+        use crate::directory::RamDirectory;
+
+        let directory = RamDirectory::create();
+
+        let absolute = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "/etc/passwd".to_string(),
+            }),
+        });
+        let err = absolute.resolve_dictionary(&directory).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let traversal = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "../../../../etc/passwd".to_string(),
+            }),
+        });
+        let err = traversal.resolve_dictionary(&directory).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
