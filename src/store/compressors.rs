@@ -26,7 +26,19 @@ impl Serialize for Compressor {
             #[cfg(feature = "lz4-compression")]
             Compressor::Lz4 => serializer.serialize_str("lz4"),
             #[cfg(feature = "zstd-compression")]
-            Compressor::Zstd(zstd) => serializer.serialize_str(&zstd.ser_to_string()),
+            Compressor::Zstd(zstd) => {
+                if let Some(dictionary) = &zstd.dictionary {
+                    if !is_safe_and_encodable_relative_path(&dictionary.path) {
+                        return Err(serde::ser::Error::custom(format!(
+                            "dictionary_path must be a plain path relative to the index \
+                             directory (no leading '/', no '..' components, and no ','), got \
+                             {:?}",
+                            dictionary.path
+                        )));
+                    }
+                }
+                serializer.serialize_str(&zstd.ser_to_string())
+            }
         }
     }
 }
@@ -76,20 +88,17 @@ impl<'de> Deserialize<'de> for Compressor {
     }
 }
 
-/// Rejects anything that isn't a plain path relative to the index directory: absolute paths and
-/// any `..`/`.` component. `Directory::resolve_path` implementations (e.g. `MmapDirectory`) do a
-/// plain, unchecked `root_path.join(relative_path)` -- `PathBuf::join` fully replaces `root_path`
-/// when `relative_path` is absolute, and `..` components are passed straight through for the OS
-/// to resolve at actual file-open time. Without this check, a `dictionary_path` like
-/// `/etc/passwd` or `../../../../etc/some_file` would read (or, via whatever seeds the
-/// dictionary file, write) outside the index directory entirely.
+/// Rejects absolute paths, `..`/`.` components (would escape the index directory via
+/// `Directory::resolve_path`'s unchecked `root_path.join`), and `,` (collides with
+/// `zstd(opt=val,...)`'s option separator).
 #[cfg(feature = "zstd-compression")]
-fn is_safe_relative_path(path: &str) -> bool {
-    let path = std::path::Path::new(path);
-    !path.is_absolute()
-        && path
+fn is_safe_and_encodable_relative_path(path: &str) -> bool {
+    let as_path = std::path::Path::new(path);
+    !as_path.is_absolute()
+        && as_path
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !path.contains(',')
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,10 +163,11 @@ impl ZstdCompressor {
                     compressor.compression_level = Some(value);
                 }
                 "dictionary_path" => {
-                    if !is_safe_relative_path(value) {
+                    if !is_safe_and_encodable_relative_path(value) {
                         return Err(format!(
                             "dictionary_path must be a plain path relative to the index \
-                             directory (no leading '/' and no '..' components), got {value:?}"
+                             directory (no leading '/', no '..' components, and no ','), \
+                             got {value:?}"
                         ));
                     }
                     compressor.dictionary = Some(ZstdDictionaryDescriptor {
@@ -275,13 +285,16 @@ impl Compressor {
                 // construct one directly and skip `deser_from_str`'s validation. Re-check here,
                 // right before it's ever handed to a `Directory`, so an absolute path or `..`
                 // traversal can't escape the index directory (see `resolve_path` on
-                // `MmapDirectory` et al., which is a plain, unchecked `root_path.join(..)`).
-                if !is_safe_relative_path(&descriptor.path) {
+                // `MmapDirectory` et al., which is a plain, unchecked `root_path.join(..)`), and
+                // so a `,` in the path can't have snuck in and desynced a subsequent
+                // `ser_to_string`/`deser_from_str` round-trip.
+                if !is_safe_and_encodable_relative_path(&descriptor.path) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "dictionary_path must be a plain path relative to the index \
-                             directory (no leading '/' and no '..' components), got {:?}",
+                             directory (no leading '/', no '..' components, and no ','), got \
+                             {:?}",
                             descriptor.path
                         ),
                     ));
@@ -427,6 +440,41 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_path_with_comma_is_rejected_not_silently_mis_encoded() {
+        // A comma is a perfectly safe, non-traversing relative path component, but it collides
+        // with `zstd(opt=val,opt=val)`'s `,`-based option separator. `ZstdDictionaryDescriptor`'s
+        // `path` field is `pub`, so a directly-constructed descriptor can carry one in even
+        // though `deser_from_str` would reject it in text form. Note this can *not* be caught by
+        // adding a check inside `deser_from_str`'s "dictionary_path" arm: `options.split(',')`
+        // fragments the string into separate options *before* any option-specific value is ever
+        // isolated, so a value containing ',' never reaches that arm as one piece -- it instead
+        // surfaces downstream as the unrelated, unhelpful `no '=' found in option "b.zst"`.
+        // Serializing (e.g. for `meta.json`) is the first point after direct construction where
+        // this is actually reachable and worth catching, so that's where it's checked.
+        let compressor_with_comma = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "a,b.zst".to_string(),
+            }),
+        });
+        let err = serde_json::to_string(&compressor_with_comma)
+            .expect_err("a ',' in dictionary_path should fail to serialize, not mis-encode");
+        assert!(
+            err.to_string().contains("dictionary_path must be a plain path"),
+            "unexpected error: {err}"
+        );
+
+        // A directly-constructed descriptor with a safe path still serializes fine.
+        let safe = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "dict.bin.zst".to_string(),
+            }),
+        });
+        assert!(serde_json::to_string(&safe).is_ok());
+    }
+
+    #[test]
     fn resolve_dictionary_reads_and_decompresses_from_path() {
         use crate::directory::{Directory, RamDirectory};
 
@@ -500,6 +548,15 @@ mod tests {
             }),
         });
         let err = traversal.resolve_dictionary(&directory).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let with_comma = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionaryDescriptor {
+                path: "a,b.zst".to_string(),
+            }),
+        });
+        let err = with_comma.resolve_dictionary(&directory).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

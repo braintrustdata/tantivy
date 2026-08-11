@@ -681,6 +681,61 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
+    fn test_single_segment_index_writer_records_dictionary_path() -> crate::Result<()> {
+        // `SingleSegmentIndexWriter::finalize` is one of four call sites that stamp
+        // `SegmentMeta::docstore_dictionary_path` at commit time (alongside the normal commit
+        // path and both merge paths) -- exercise it directly rather than relying on the other
+        // three sites' coverage by inspection, since nothing else in the crate touches this
+        // writer at all.
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // See the rotation test above for why this is written to the raw, unwrapped directory.
+        let ram_directory = RamDirectory::create();
+        let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
+
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionaryDescriptor {
+                    path: "dict.bin.zst".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let mut writer = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .single_segment_index_writer::<TantivyDocument>(
+                ram_directory,
+                crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN,
+            )?;
+        writer.add_document(doc!(text_field=> LOREM))?;
+        let index = writer.finalize()?;
+
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].meta().docstore_dictionary_path(),
+            Some("dict.bin.zst")
+        );
+
+        // Sanity: the document is actually readable back through the recorded dictionary.
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.num_docs(), 1);
+        let doc: TantivyDocument = searcher.doc(crate::DocAddress::new(0u32, 0u32))?;
+        assert_eq!(
+            *doc.get_first(text_field).and_then(|v| v.as_str()).unwrap(),
+            LOREM.to_string()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
     fn test_dictionary_written_through_managed_directory_survives_post_commit_gc()
     -> crate::Result<()> {
         // Regression test for a managed-directory GC hazard: seeding the dictionary blob via
