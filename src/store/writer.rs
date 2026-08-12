@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use common::BinarySerializable;
 
@@ -36,8 +37,10 @@ impl StoreWriter {
         compressor: Compressor,
         block_size: usize,
         dedicated_thread: bool,
+        dictionary: Option<Arc<[u8]>>,
     ) -> io::Result<StoreWriter> {
-        let block_compressor = BlockCompressor::new(compressor, writer, dedicated_thread)?;
+        let block_compressor =
+            BlockCompressor::new(compressor.clone(), writer, dedicated_thread, dictionary)?;
         Ok(StoreWriter {
             compressor,
             block_size,
@@ -49,7 +52,7 @@ impl StoreWriter {
     }
 
     pub(crate) fn compressor(&self) -> Compressor {
-        self.compressor
+        self.compressor.clone()
     }
 
     /// The memory used (inclusive childs)

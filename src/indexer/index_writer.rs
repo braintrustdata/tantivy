@@ -214,7 +214,15 @@ fn index_documents<D: Document>(
 
     let doc_opstamps: Vec<Opstamp> = segment_writer.finalize()?;
 
-    let segment_with_max_doc = segment.with_max_doc(max_doc);
+    let dictionary_path = segment
+        .index()
+        .settings()
+        .docstore_compression
+        .dictionary_path()
+        .map(str::to_string);
+    let segment_with_max_doc = segment
+        .with_max_doc(max_doc)
+        .with_docstore_dictionary_path(dictionary_path);
 
     let alive_bitset_opt = apply_deletes(&segment_with_max_doc, &mut delete_cursor, &doc_opstamps)?;
 

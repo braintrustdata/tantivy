@@ -149,7 +149,14 @@ fn merge(
 
     let merged_segment_id = merged_segment.id();
 
-    let segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
+    let dictionary_path = index
+        .settings()
+        .docstore_compression
+        .dictionary_path()
+        .map(str::to_string);
+    let segment_meta = index
+        .new_segment_meta(merged_segment_id, num_docs)
+        .with_docstore_dictionary_path(dictionary_path);
     Ok(Some(SegmentEntry::new(segment_meta, delete_cursor, None)))
 }
 
@@ -253,7 +260,13 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     let segment_serializer = SegmentSerializer::for_segment(merged_segment, true)?;
     let num_docs = merger.write(segment_serializer, None)?;
 
-    let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
+    let dictionary_path = target_settings
+        .docstore_compression
+        .dictionary_path()
+        .map(str::to_string);
+    let segment_meta = merged_index
+        .new_segment_meta(merged_segment_id, num_docs)
+        .with_docstore_dictionary_path(dictionary_path);
 
     let stats = format!(
         "Segments Merge: [{}]",
@@ -466,6 +479,12 @@ impl SegmentUpdater {
             .flat_map(|segment_meta| self.index.list_segment_files(&segment_meta))
             .collect();
         files.insert(META_FILEPATH.to_path_buf());
+        // The dictionary is a sibling asset referenced by path from `IndexSettings`, not from
+        // any segment's file list -- without this it's invisible to GC and gets swept the first
+        // time it's written through a `ManagedDirectory` (e.g. `Index::directory().atomic_write`).
+        if let Some(dict_path) = self.index.settings().docstore_compression.dictionary_path() {
+            files.insert(PathBuf::from(dict_path));
+        }
         files
     }
 

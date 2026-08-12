@@ -45,6 +45,8 @@ pub struct SegmentReader {
     fieldnorm_readers: FieldNormReaders,
 
     store_file: FileSlice,
+    store_dictionary: Option<Arc<[u8]>>,
+    store_dictionary_path: Option<String>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -76,6 +78,14 @@ impl SegmentReader {
     /// Returns true if some of the documents of the segment have been deleted.
     pub fn has_deletes(&self) -> bool {
         self.num_deleted_docs() > 0
+    }
+
+    /// Path of the dictionary this segment's doc store was compressed against at write time, if
+    /// any -- frozen at write/merge time, see `SegmentMeta::docstore_dictionary_path`. Merges use
+    /// this (not the index's current `docstore_compression` setting) to decide whether raw
+    /// block-stacking is safe.
+    pub(crate) fn docstore_dictionary_path(&self) -> Option<&str> {
+        self.store_dictionary_path.as_deref()
     }
 
     /// Accessor to a segment's fast field reader given a field.
@@ -153,7 +163,11 @@ impl SegmentReader {
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
     /// The size of blocks is configurable, this should be reflexted in the
     pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
-        StoreReader::open(self.store_file.clone(), cache_num_blocks)
+        StoreReader::open(
+            self.store_file.clone(),
+            cache_num_blocks,
+            self.store_dictionary.clone(),
+        )
     }
 
     /// Open a new segment for reading.
@@ -207,6 +221,13 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
+        let store_dictionary = segment
+            .index()
+            .settings()
+            .docstore_compression
+            .resolve_dictionary(segment.index().directory())?;
+        let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
+
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
@@ -218,6 +239,8 @@ impl SegmentReader {
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
+            store_dictionary,
+            store_dictionary_path,
             alive_bitset_opt,
             positions_composite,
             schema,

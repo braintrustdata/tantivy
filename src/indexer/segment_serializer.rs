@@ -45,14 +45,19 @@ impl SegmentSerializer {
                 // therefore will be relatively slow.
                 16000,
                 settings.docstore_compress_dedicated_thread,
+                None,
             )?
         } else {
             let store_write = segment.open_write(SegmentComponent::Store)?;
+            let dictionary = settings
+                .docstore_compression
+                .resolve_dictionary(segment.index().directory())?;
             StoreWriter::new(
                 store_write,
                 settings.docstore_compression,
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
+                dictionary,
             )?
         };
 

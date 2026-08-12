@@ -36,6 +36,22 @@ use crate::{
 /// We do not allow segments with more than
 pub const MAX_DOC_LIMIT: u32 = 1 << 31;
 
+// Test-only observability into the store-merge fast path (`store_writer.stack`) below, so tests
+// can assert stacking actually happened rather than falling back to decompress/recompress --
+// e.g. that two segments compressed against the *same* dictionary still fast-merge. Thread-local
+// rather than a shared global: tests here drive `IndexMerger::write` with `merge_thread_pool:
+// None`, which runs `write_storable_fields` synchronously on the calling (test) thread, so this
+// stays isolated per test even when `cargo test` runs tests in parallel.
+#[cfg(test)]
+thread_local! {
+    static STACKED_SEGMENTS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_stacked_segments_for_test() -> usize {
+    STACKED_SEGMENTS_FOR_TEST.with(|count| count.replace(0))
+}
+
 struct FieldPostingJob {
     field: Field,
     field_name: String,
@@ -889,6 +905,23 @@ impl IndexMerger {
                     // take 7 in order to not walk over all checkpoints.
                     || store_reader.block_checkpoints().take(7).count() < 6
                     || store_reader.decompressor() != store_writer.compressor().into()
+                    // Byte-for-byte stacking below never decompresses, so it can't exercise the
+                    // dictionary's own zstd checksum -- the one thing that would catch the
+                    // dictionary invariant (this segment's blocks and the merge target must agree
+                    // on the exact same dictionary) ever being violated (bug, race, manual
+                    // meta.json edit). Compare what this segment actually recorded when its doc
+                    // store was written (`SegmentMeta::docstore_dictionary_path`, frozen at write
+                    // time) against the target's *current* dictionary: equal (including both
+                    // being "no dictionary") allows the fast stacking path below; any mismatch --
+                    // dictionary added, removed, or rotated to a different one -- forces
+                    // decompress/recompress instead, so a violation fails loudly here rather than
+                    // silently, on some unrelated later read.
+                    || reader.docstore_dictionary_path() != store_writer.compressor().dictionary_path()
+                    // Defense in depth: also cross-check the flag recorded directly in the
+                    // `.store` file's own footer (self-contained in the file bytes, so it stays
+                    // correct even if `meta.json` is ever hand-edited or drifts independently)
+                    // rather than trusting `SegmentMeta` alone.
+                    || store_reader.dictionary_used() != store_writer.compressor().has_dictionary()
                 {
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
                         let doc_bytes = doc_bytes_res?;
@@ -898,6 +931,8 @@ impl IndexMerger {
                 } else {
                     store_writer.stack(store_reader)?;
                     stacked_segments += 1;
+                    #[cfg(test)]
+                    STACKED_SEGMENTS_FOR_TEST.with(|count| count.set(count.get() + 1));
                 }
             }
         }

@@ -62,6 +62,15 @@ impl Segment {
         }
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_docstore_dictionary_path(self, dictionary_path: Option<String>) -> Segment {
+        Segment {
+            index: self.index,
+            meta: self.meta.with_docstore_dictionary_path(dictionary_path),
+        }
+    }
+
     /// Returns the segment's id.
     pub fn id(&self) -> SegmentId {
         self.meta.id()

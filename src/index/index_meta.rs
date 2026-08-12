@@ -39,6 +39,7 @@ impl SegmentMetaInventory {
             max_doc,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
             deletes: None,
+            docstore_dictionary_path: None,
         };
         SegmentMeta::from(self.inventory.track(inner))
     }
@@ -199,6 +200,14 @@ impl SegmentMeta {
         self.num_deleted_docs() > 0
     }
 
+    /// Returns the path of the dictionary this segment's doc store was actually compressed
+    /// against at write time, if any. Frozen at commit/merge time -- unlike
+    /// `IndexSettings::docstore_compression`, which reflects the index's *current* setting and
+    /// can drift out from under an already-written segment.
+    pub fn docstore_dictionary_path(&self) -> Option<&str> {
+        self.tracked.docstore_dictionary_path.as_deref()
+    }
+
     /// Updates the max_doc value from the `SegmentMeta`.
     ///
     /// This method is only used when updating `max_doc` from 0
@@ -211,6 +220,7 @@ impl SegmentMeta {
             max_doc,
             deletes: None,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            docstore_dictionary_path: inner_meta.docstore_dictionary_path.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -231,6 +241,24 @@ impl SegmentMeta {
             max_doc: inner_meta.max_doc,
             include_temp_doc_store: Arc::new(AtomicBool::new(true)),
             deletes: Some(delete_meta),
+            docstore_dictionary_path: inner_meta.docstore_dictionary_path.clone(),
+        });
+        SegmentMeta { tracked }
+    }
+
+    /// Records the path of the dictionary this segment's doc store was actually compressed
+    /// against, if any. Called once, right after the segment's doc store is finalized (fresh
+    /// write finalization or merge output), from the index-wide `docstore_compression` setting
+    /// *at that moment* -- so it stays accurate even if the setting later changes underneath it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_docstore_dictionary_path(self, dictionary_path: Option<String>) -> SegmentMeta {
+        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
+            segment_id: inner_meta.segment_id,
+            max_doc: inner_meta.max_doc,
+            include_temp_doc_store: Arc::new(AtomicBool::new(true)),
+            deletes: inner_meta.deletes.clone(),
+            docstore_dictionary_path: dictionary_path,
         });
         SegmentMeta { tracked }
     }
@@ -246,6 +274,15 @@ struct InnerSegmentMeta {
     #[serde(skip)]
     #[serde(default = "default_temp_store")]
     pub(crate) include_temp_doc_store: Arc<AtomicBool>,
+    /// Path of the dictionary this segment's doc store was compressed against at write time,
+    /// if any. See `SegmentMeta::docstore_dictionary_path`.
+    ///
+    /// Only used to check that segments being merged were compressed against the same
+    /// dictionary as the merge target (`IndexMerger::write_storable_fields` compares this
+    /// against the target's current `docstore_compression` dictionary) -- not a general-purpose
+    /// dictionary registry/catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    docstore_dictionary_path: Option<String>,
 }
 fn default_temp_store() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
@@ -504,9 +541,11 @@ mod tests {
                 }),
                 docstore_compression: crate::store::Compressor::Zstd(ZstdCompressor {
                     compression_level: Some(4),
+                    dictionary: None,
                 }),
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
+                merge_postings_parallelism: super::default_merge_postings_parallelism(),
             },
             segments: Vec::new(),
             schema,
