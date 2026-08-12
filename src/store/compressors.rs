@@ -140,6 +140,35 @@ impl ZstdDictionary {
     }
 }
 
+/// Process-wide cache of decompressed dictionary bytes, keyed by path. Safe to key by path alone
+/// (no separate content hash) because the path itself is content-addressed (see
+/// `content_addressed_dictionary_path`) -- two different dictionaries can never share a key.
+///
+/// Weak-referenced, not LRU: an entry serves cached bytes for as long as *something else* (a
+/// `SegmentReader`, `StoreReader`, etc.) still holds a strong `Arc` to them; once every such
+/// holder drops, the entry naturally goes dead and the next lookup re-decompresses. This trades
+/// away an explicit memory ceiling for simplicity -- no eviction policy to tune, memory tracks
+/// actual live usage. Mirrors `MmapDirectory`'s own `MmapCache` (`directory/mmap_directory.rs`),
+/// the only other path-keyed weak-ref cache in this fork.
+///
+/// This only helps when dictionary usage overlaps in time (concurrently open segments, or opens
+/// in quick succession before the last reference drops) -- fully sequential open/close/open never
+/// benefits, since nothing is left alive to serve the next lookup. That's expected, not a bug.
+#[cfg(feature = "zstd-compression")]
+static DICTIONARY_CACHE: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashMap<String, std::sync::Weak<[u8]>>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+// Test-only isolation for `DICTIONARY_CACHE`: it's a process-wide static, and several tests
+// (here and in `store/mod.rs`) reuse the same literal path (e.g. "dict.bin.zst") with different
+// content across different `RamDirectory` instances. Without clearing between tests, parallel
+// test execution could serve one test's cached bytes to another under the same path. Mirrors
+// `indexer::merger::take_stacked_segments_for_test`'s same-purpose reset.
+#[cfg(all(feature = "zstd-compression", test))]
+pub(crate) fn clear_dictionary_cache_for_test() {
+    DICTIONARY_CACHE.write().unwrap().clear();
+}
+
 #[cfg(feature = "zstd-compression")]
 impl ZstdDictionary {
     /// Rejects absolute paths, `..`/`.` components (would escape the index directory via
@@ -185,6 +214,16 @@ impl ZstdDictionary {
                 ),
             ));
         }
+
+        if let Some(bytes) = DICTIONARY_CACHE
+            .read()
+            .unwrap()
+            .get(path)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(bytes);
+        }
+
         let compressed = directory
             .atomic_read(std::path::Path::new(path))
             .map_err(|err| {
@@ -204,8 +243,17 @@ impl ZstdDictionary {
                 };
                 io::Error::new(kind, err.to_string())
             })?;
-        let bytes = super::decompress_whole(&compressed)?;
-        Ok(std::sync::Arc::from(bytes))
+        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(super::decompress_whole(&compressed)?);
+
+        // Racing with another thread's concurrent miss for the same path is fine: both decompress
+        // independently and both inserts are content-identical (the path is content-addressed),
+        // so simply overwriting is correct -- no need for single-flight coordination here.
+        DICTIONARY_CACHE
+            .write()
+            .unwrap()
+            .insert(path.to_string(), std::sync::Arc::downgrade(&bytes));
+
+        Ok(bytes)
     }
 
     /// Seeds a brand-new index's dictionary: derives a content-addressed path from a SHA-256 of
@@ -605,6 +653,7 @@ mod tests {
     fn resolve_dictionary_reads_and_decompresses_from_path() {
         use crate::directory::{Directory, RamDirectory};
 
+        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
         let directory = RamDirectory::create();
         let raw_dict = b"a dictionary's worth of bytes, stored zstd-compressed on disk".to_vec();
         let compressed = super::super::compression_zstd_block::compress_whole(&raw_dict).unwrap();
@@ -618,6 +667,62 @@ mod tests {
         });
         let resolved = compressor.resolve_dictionary(&directory).unwrap();
         assert_eq!(resolved.as_deref(), Some(raw_dict.as_slice()));
+    }
+
+    #[test]
+    fn zstd_dictionary_cache_shares_bytes_while_a_strong_ref_is_alive() {
+        use crate::directory::{Directory, RamDirectory};
+
+        clear_dictionary_cache_for_test();
+        let directory = RamDirectory::create();
+        let raw = b"shared dictionary content for cache hit test".to_vec();
+        let compressed = super::super::compression_zstd_block::compress_whole(&raw).unwrap();
+        directory
+            .atomic_write(std::path::Path::new("cache_test_dict_hit.bin.zst"), &compressed)
+            .unwrap();
+
+        let dict = ZstdDictionary::Path("cache_test_dict_hit.bin.zst".to_string());
+        let first = dict.load(&directory).unwrap();
+        let second = dict.load(&directory).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a second load while the first Arc is still alive should return the cached \
+             allocation, not decompress again"
+        );
+    }
+
+    #[test]
+    fn zstd_dictionary_cache_reloads_after_last_strong_ref_drops() {
+        use crate::directory::{Directory, RamDirectory};
+
+        clear_dictionary_cache_for_test();
+        let directory = RamDirectory::create();
+        let path = std::path::Path::new("cache_test_dict_evict.bin.zst");
+
+        let raw_v1 = b"dictionary v1".to_vec();
+        directory
+            .atomic_write(path, &super::super::compression_zstd_block::compress_whole(&raw_v1).unwrap())
+            .unwrap();
+
+        let dict = ZstdDictionary::Path("cache_test_dict_evict.bin.zst".to_string());
+        let first = dict.load(&directory).unwrap();
+        assert_eq!(first.as_ref(), raw_v1.as_slice());
+        drop(first); // last strong ref -- the cache entry is now dead
+
+        // Overwrite the underlying file with different content. If the cache incorrectly served
+        // a stale (but still-cached) entry instead of reloading, this would still return v1.
+        let raw_v2 = b"dictionary v2, deliberately different content and length".to_vec();
+        directory
+            .atomic_write(path, &super::super::compression_zstd_block::compress_whole(&raw_v2).unwrap())
+            .unwrap();
+
+        let second = dict.load(&directory).unwrap();
+        assert_eq!(
+            second.as_ref(),
+            raw_v2.as_slice(),
+            "once the only strong Arc drops, a later load must reload fresh, not serve a stale \
+             cached entry"
+        );
     }
 
     #[test]

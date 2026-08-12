@@ -37,6 +37,8 @@ mod reader;
 mod writer;
 pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
 pub(crate) use self::compressors::resolve_segment_dictionary;
+#[cfg(all(feature = "zstd-compression", test))]
+pub(crate) use self::compressors::clear_dictionary_cache_for_test;
 pub use self::decompressors::Decompressor;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
@@ -458,6 +460,7 @@ pub mod tests {
         // `ManagedDirectory` gets registered and becomes eligible for the automatic
         // post-commit GC (`SegmentUpdater::list_files` only protects segment files + meta.json),
         // which would otherwise delete an unrelated sibling file like the dictionary blob.
+        clear_dictionary_cache_for_test(); // isolate from other tests sharing these literal paths
         let ram_directory = RamDirectory::create();
         let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
         let dict_b =
@@ -553,6 +556,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
+        clear_dictionary_cache_for_test(); // isolate from other tests sharing this literal path
         let ram_directory = RamDirectory::create();
         let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
         ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
@@ -637,6 +641,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
+        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
         let ram_directory = RamDirectory::create();
         let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
         ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
@@ -708,6 +713,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
+        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
         let ram_directory = RamDirectory::create();
         let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
         ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
@@ -769,6 +775,7 @@ pub mod tests {
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
 
+        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
         let dict_path = "dict.bin.zst";
         let dict_bytes = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
 
