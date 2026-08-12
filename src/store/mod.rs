@@ -35,7 +35,8 @@ mod footer;
 mod index;
 mod reader;
 mod writer;
-pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionaryDescriptor};
+pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
+pub(crate) use self::compressors::resolve_segment_dictionary;
 pub use self::decompressors::Decompressor;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
@@ -433,14 +434,19 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently()
-    -> crate::Result<()> {
-        // Documents this fork's invariant that a dictionary is fixed for an index's life: if
-        // that's ever violated anyway (bug, race, manual meta.json edit), stacking's
-        // eligibility check only compares `Decompressor` (compressor family), which can't see
-        // a dictionary change -- rotating the dictionary between two commits should therefore
-        // force the decompress/recompress merge path (so the dictionary's own zstd checksum
-        // fires) rather than silently stacking blocks compressed against a stale dictionary.
+    fn test_merge_recompresses_correctly_when_dictionary_rotates() -> crate::Result<()> {
+        // A dictionary is meant to be fixed for an index's life, but if it's ever changed anyway
+        // (bug, race, manual meta.json edit, or a deliberate migration), a merge over segments
+        // written under the old dictionary must never raw-copy their blocks (stacking) into a
+        // merged segment declared under the new one -- `SegmentReader::open` resolves each
+        // segment's *own* recorded dictionary correctly (`SegmentMeta::docstore_dictionary_path`),
+        // so decompressing old segments still works; what must not happen is skipping that
+        // decompression step and shipping dict_a-compressed bytes under a dict_b label. The
+        // eligibility check forces the decompress/recompress path whenever a segment's recorded
+        // dictionary doesn't match the merge target's, so the merge below succeeds *and*
+        // correctly migrates every document to the new dictionary -- this is only correct
+        // because recompression actually happens; assert that explicitly via the stacked-segment
+        // count, not just that the merge didn't error.
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
@@ -462,9 +468,7 @@ pub mod tests {
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict_a.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path("dict_a.bin.zst".to_string())),
             }),
             ..Default::default()
         };
@@ -494,9 +498,7 @@ pub mod tests {
         // way to prevent this in-process.
         index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "dict_b.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("dict_b.bin.zst".to_string())),
         });
 
         // Drive the merge directly through `IndexMerger`/`SegmentSerializer`, the same building
@@ -514,28 +516,38 @@ pub mod tests {
         let merged_segment = index.new_segment();
         let segment_serializer =
             crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
         let merge_result = merger.write(segment_serializer, None);
         assert!(
-            merge_result.is_err(),
-            "merge should fail loudly (dictionary checksum mismatch) when the dictionary \
-             changed underneath it, not silently stack mismatched blocks into the merged \
-             segment; got {merge_result:?}"
+            merge_result.is_ok(),
+            "merge should succeed -- decompressing each segment with its own recorded \
+             dictionary and recompressing under the new one is a correct migration, not \
+             corruption; got {merge_result:?}"
+        );
+        assert_eq!(
+            crate::indexer::merger::take_stacked_segments_for_test(),
+            0,
+            "correctness here depends entirely on the recompress path actually running -- \
+             neither segment may take the raw-copy stacking shortcut when its recorded \
+             dictionary doesn't match the target's"
         );
         Ok(())
     }
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn test_merge_with_dictionary_removed_fails_loud_instead_of_stacking_silently()
-    -> crate::Result<()> {
-        // Mirror image of `test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently`:
-        // the stacking-eligibility guard used to only check whether the merge *target* currently
-        // has a dictionary configured (`store_writer.compressor().has_dictionary()`), so
+    fn test_merge_recompresses_correctly_when_dictionary_removed() -> crate::Result<()> {
+        // Mirror image of `test_merge_recompresses_correctly_when_dictionary_rotates`: the
+        // stacking-eligibility guard used to only check whether the merge *target* currently has
+        // a dictionary configured (`store_writer.compressor().has_dictionary()`), so
         // Some(dict) -> None went undetected -- the target's `has_dictionary()` is `false`, so
-        // the guard never fires, and blocks physically compressed against `dict_a` get raw-copied
-        // into a merged segment whose settings now say "no dictionary". This asserts the fix:
-        // comparing the segment's own recorded dictionary-use flag against the target's current
-        // setting, in both directions.
+        // the guard never fired, and blocks physically compressed against `dict_a` got raw-copied
+        // into a merged segment whose settings now said "no dictionary" -- real corruption, since
+        // nothing would have decompressed them correctly. The fix compares the segment's own
+        // recorded dictionary path/flag against the target's current setting, in both
+        // directions, forcing recompress here too -- which now means each segment is correctly
+        // decompressed with its own dict_a and recompressed with no dictionary at all: a correct
+        // migration, not corruption. Assert that recompression actually ran, not just success.
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
@@ -548,9 +560,7 @@ pub mod tests {
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict_a.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path("dict_a.bin.zst".to_string())),
             }),
             ..Default::default()
         };
@@ -594,12 +604,20 @@ pub mod tests {
         let merged_segment = index.new_segment();
         let segment_serializer =
             crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
         let merge_result = merger.write(segment_serializer, None);
         assert!(
-            merge_result.is_err(),
-            "merge should fail loudly (dictionary checksum mismatch) when the dictionary was \
-             removed underneath it, not silently stack dictionary-compressed blocks into a \
-             merged segment declared to have no dictionary; got {merge_result:?}"
+            merge_result.is_ok(),
+            "merge should succeed -- decompressing each segment with its own recorded \
+             dict_a and recompressing with no dictionary is a correct migration, not \
+             corruption; got {merge_result:?}"
+        );
+        assert_eq!(
+            crate::indexer::merger::take_stacked_segments_for_test(),
+            0,
+            "correctness here depends entirely on the recompress path actually running -- \
+             neither segment may take the raw-copy stacking shortcut when its recorded \
+             dictionary doesn't match the target's"
         );
         Ok(())
     }
@@ -626,9 +644,7 @@ pub mod tests {
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
             }),
             ..Default::default()
         };
@@ -699,9 +715,7 @@ pub mod tests {
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
             }),
             ..Default::default()
         };
@@ -761,9 +775,7 @@ pub mod tests {
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: dict_path.to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path(dict_path.to_string())),
             }),
             ..Default::default()
         };

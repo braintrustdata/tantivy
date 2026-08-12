@@ -28,12 +28,12 @@ impl Serialize for Compressor {
             #[cfg(feature = "zstd-compression")]
             Compressor::Zstd(zstd) => {
                 if let Some(dictionary) = &zstd.dictionary {
-                    if !is_safe_and_encodable_relative_path(&dictionary.path) {
+                    if !ZstdDictionary::is_safe_and_encodable_relative_path(dictionary.path()) {
                         return Err(serde::ser::Error::custom(format!(
                             "dictionary_path must be a plain path relative to the index \
                              directory (no leading '/', no '..' components, and no ','), got \
                              {:?}",
-                            dictionary.path
+                            dictionary.path()
                         )));
                     }
                 }
@@ -88,37 +88,192 @@ impl<'de> Deserialize<'de> for Compressor {
     }
 }
 
-/// Rejects absolute paths, `..`/`.` components (would escape the index directory via
-/// `Directory::resolve_path`'s unchecked `root_path.join`), and `,` (collides with
-/// `zstd(opt=val,...)`'s option separator).
-#[cfg(feature = "zstd-compression")]
-fn is_safe_and_encodable_relative_path(path: &str) -> bool {
-    let as_path = std::path::Path::new(path);
-    !as_path.is_absolute()
-        && as_path
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-        && !path.contains(',')
-}
-
-#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
-/// A small, self-describing reference to the zstd dictionary a doc store was compressed with.
-/// The dictionary's raw bytes are not part of this descriptor (and are not part of `meta.json`
-/// at all) -- `path` is a `Directory`-relative path (from the index root) that callers resolve
-/// via `Directory::atomic_read`. There is deliberately no content hash here: a dictionary can be
-/// multiple megabytes, and hashing it on every doc store open (i.e. every segment, every reader
-/// reload) would be wasted work. Integrity/mismatch detection instead relies on zstd's own frame
-/// checksum (see `compression_zstd_block`), which is verified as a side effect of decompression
-/// at effectively no extra cost.
+/// A zstd dictionary a doc store was (or should be) compressed with. Owns everything about how a
+/// dictionary is stored, named, and resolved -- callers hand over raw bytes (`seed`/`from_bytes`)
+/// or a recorded path (via `meta.json`, deserialized as `Path`); they never need to know the
+/// on-disk naming convention or write the file themselves.
 ///
-/// `SegmentUpdater::list_files` protects `path` from garbage collection for any `Directory` that
+/// The dictionary's raw bytes are never part of `meta.json` -- only a `Directory`-relative path
+/// is ever persisted (see `Serialize`/`Deserialize` below), resolved via `Directory::atomic_read`.
+/// Integrity of the bytes at that path relies on zstd's own frame checksum (see
+/// `compression_zstd_block`), verified as a side effect of decompression at effectively no extra
+/// cost -- this type does not re-verify content on every load.
+///
+/// The path itself *is* content-addressed (SHA-256 of the raw bytes, see `seed`), which is a
+/// separate, cheap, one-time cost paid only when a dictionary is first seeded, not on every open.
+/// This matters for correctness, not just dedup: two different dictionaries must never compare
+/// equal as `IndexSettings` (`ZstdDictionary`'s `PartialEq` is path-based), since merges -- both
+/// `IndexMerger::write_storable_fields` and any embedder comparing `IndexSettings` before merging
+/// indices from possibly-different sources -- rely on that equality to detect a real dictionary
+/// mismatch rather than silently combining segments compressed against different dictionaries.
+///
+/// `SegmentUpdater::list_files` protects `path()` from garbage collection for any `Directory` that
 /// routes GC through it (i.e. anything wrapped in `ManagedDirectory`, which is every `Index`).
 /// Directory implementations that run their own GC outside of that path are not covered and must
 /// protect the dictionary file themselves.
-pub struct ZstdDictionaryDescriptor {
-    /// Path (relative to the index's own directory) of the file holding this dictionary's bytes,
-    /// stored zstd-compressed on disk.
-    pub path: String,
+#[derive(Clone, Debug)]
+pub enum ZstdDictionary {
+    /// Not yet resolved to bytes; `path` is where to load them from via `Directory::atomic_read`.
+    /// This is what deserializing from `meta.json` always produces.
+    Path(String),
+    /// Bytes already known -- e.g. just supplied to `seed`/`from_bytes`, or already loaded once.
+    Loaded {
+        /// Where these bytes are (or will be) persisted, relative to the index directory.
+        path: String,
+        /// The dictionary's raw (uncompressed) bytes.
+        bytes: std::sync::Arc<[u8]>,
+    },
+}
+
+// Not feature-gated: `ZstdDictionary` sits behind `Option<ZstdDictionary>` on the never-gated
+// `ZstdCompressor` struct, whose derived `PartialEq`/`Eq`/`Serialize`/`Deserialize` therefore
+// need `ZstdDictionary` to implement those traits (and thus need `path()`) unconditionally, not
+// just when the `zstd-compression` feature happens to be enabled.
+impl ZstdDictionary {
+    /// The `Directory`-relative path of this dictionary's file, regardless of whether the bytes
+    /// have been loaded yet.
+    pub fn path(&self) -> &str {
+        match self {
+            ZstdDictionary::Path(path) => path,
+            ZstdDictionary::Loaded { path, .. } => path,
+        }
+    }
+}
+
+#[cfg(feature = "zstd-compression")]
+impl ZstdDictionary {
+    /// Rejects absolute paths, `..`/`.` components (would escape the index directory via
+    /// `Directory::resolve_path`'s unchecked `root_path.join`), and `,` (collides with
+    /// `zstd(opt=val,...)`'s option separator). `ZstdDictionary` is the only thing that ever
+    /// opens a dictionary file (`load`/`load_internal`/`seed`), so it's the natural place to own
+    /// what counts as a safe path -- every other caller of this check (`Compressor::serialize`,
+    /// `ZstdCompressor::deser_from_str`) is validating a path *before* it becomes a `ZstdDictionary`.
+    pub(crate) fn is_safe_and_encodable_relative_path(path: &str) -> bool {
+        let as_path = std::path::Path::new(path);
+        !as_path.is_absolute()
+            && as_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && !path.contains(',')
+    }
+
+    /// Returns the dictionary's raw bytes, loading and decompressing them from `directory` if not
+    /// already known.
+    pub fn load(&self, directory: &dyn crate::Directory) -> io::Result<std::sync::Arc<[u8]>> {
+        match self {
+            ZstdDictionary::Loaded { bytes, .. } => Ok(bytes.clone()),
+            ZstdDictionary::Path(path) => Self::load_internal(directory, path),
+        }
+    }
+
+    /// Reads and decompresses dictionary bytes from `path` via `directory`. The mechanical core
+    /// shared by `load` (this dictionary's own path) and by segment-open resolution, which must
+    /// load from a specific *segment's own recorded* path (`SegmentMeta::docstore_dictionary_path`)
+    /// rather than this dictionary's path -- the two can differ if an index's dictionary setting
+    /// ever changes after a segment was written, and a segment must always be read back with
+    /// whatever it was actually compressed against, not the index's current setting.
+    pub(crate) fn load_internal(
+        directory: &dyn crate::Directory,
+        path: &str,
+    ) -> io::Result<std::sync::Arc<[u8]>> {
+        if !Self::is_safe_and_encodable_relative_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "dictionary_path must be a plain path relative to the index directory (no \
+                     leading '/', no '..' components, and no ','), got {path:?}"
+                ),
+            ));
+        }
+        let compressed = directory
+            .atomic_read(std::path::Path::new(path))
+            .map_err(|err| {
+                // Preserve `NotFound`/the original `io::Error`'s kind, rather than flattening
+                // every failure mode to `ErrorKind::Other` -- a misconfigured dictionary path
+                // should be as easy to diagnose as a typical missing-file error.
+                let kind = match &err {
+                    crate::directory::error::OpenReadError::FileDoesNotExist(_) => {
+                        io::ErrorKind::NotFound
+                    }
+                    crate::directory::error::OpenReadError::IoError { io_error, .. } => {
+                        io_error.kind()
+                    }
+                    crate::directory::error::OpenReadError::IncompatibleIndex(_) => {
+                        io::ErrorKind::InvalidData
+                    }
+                };
+                io::Error::new(kind, err.to_string())
+            })?;
+        let bytes = super::decompress_whole(&compressed)?;
+        Ok(std::sync::Arc::from(bytes))
+    }
+
+    /// Seeds a brand-new index's dictionary: derives a content-addressed path from a SHA-256 of
+    /// `bytes`, writes them zstd-compressed to `directory` at that path, and returns the
+    /// resulting `ZstdDictionary` (already `Loaded`, since the caller's bytes are used directly
+    /// rather than immediately reading them back). This is the *only* thing tantivy can't do on
+    /// its own when creating a new index: the actual dictionary bytes have to come from the
+    /// embedding application. Everything else -- naming, writing, and later resolving -- is
+    /// entirely this fork's own business.
+    pub fn seed(directory: &dyn crate::Directory, bytes: std::sync::Arc<[u8]>) -> io::Result<Self> {
+        let compressed = super::compress_whole(&bytes)?;
+        let path = content_addressed_dictionary_path(&bytes);
+        directory.atomic_write(std::path::Path::new(&path), &compressed)?;
+        Ok(ZstdDictionary::Loaded { path, bytes })
+    }
+
+    /// Constructs a dictionary directly from bytes already in hand, with no I/O -- for callers
+    /// that already know both the path and the bytes (e.g. reusing a dictionary previously seeded
+    /// elsewhere, or tests).
+    pub fn from_bytes(path: String, bytes: std::sync::Arc<[u8]>) -> Self {
+        ZstdDictionary::Loaded { path, bytes }
+    }
+}
+
+/// Derives a content-addressed filename for a dictionary's raw bytes: identical bytes always
+/// produce the same name (safe to re-seed/overwrite idempotently), different bytes produce
+/// different names with overwhelming probability (SHA-256), so `ZstdDictionary`/`IndexSettings`
+/// equality actually reflects dictionary identity rather than just "some caller reused the same
+/// literal path."
+#[cfg(feature = "zstd-compression")]
+fn content_addressed_dictionary_path(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes);
+    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("dict-{hex}.bin.zst")
+}
+
+impl PartialEq for ZstdDictionary {
+    /// Path-based: two dictionaries are the same iff their (content-addressed) paths match,
+    /// regardless of whether either side happens to already have bytes loaded. Resolution state
+    /// is incidental/lazy and must not affect equality -- `IndexSettings` comparisons (merges)
+    /// rely on this being a pure statement about *which* dictionary, not about caching state.
+    fn eq(&self, other: &Self) -> bool {
+        self.path() == other.path()
+    }
+}
+impl Eq for ZstdDictionary {}
+
+impl Serialize for ZstdDictionary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ZstdDictionary", 1)?;
+        state.serialize_field("path", self.path())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ZstdDictionary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: Deserializer<'de> {
+        #[derive(Deserialize)]
+        struct Repr {
+            path: String,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Ok(ZstdDictionary::Path(repr.path))
+    }
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +283,7 @@ pub struct ZstdCompressor {
     pub compression_level: Option<i32>,
     /// If set, the doc store was (and must continue to be) compressed against this dictionary.
     #[serde(default)]
-    pub dictionary: Option<ZstdDictionaryDescriptor>,
+    pub dictionary: Option<ZstdDictionary>,
 }
 
 #[cfg(feature = "zstd-compression")]
@@ -163,16 +318,14 @@ impl ZstdCompressor {
                     compressor.compression_level = Some(value);
                 }
                 "dictionary_path" => {
-                    if !is_safe_and_encodable_relative_path(value) {
+                    if !ZstdDictionary::is_safe_and_encodable_relative_path(value) {
                         return Err(format!(
                             "dictionary_path must be a plain path relative to the index \
                              directory (no leading '/', no '..' components, and no ','), \
                              got {value:?}"
                         ));
                     }
-                    compressor.dictionary = Some(ZstdDictionaryDescriptor {
-                        path: value.to_string(),
-                    });
+                    compressor.dictionary = Some(ZstdDictionary::Path(value.to_string()));
                 }
                 _ => {
                     return Err(format!("unknown zstd option {opt_name:?}"));
@@ -187,7 +340,7 @@ impl ZstdCompressor {
             opts.push(format!("compression_level={compression_level}"));
         }
         if let Some(dictionary) = &self.dictionary {
-            opts.push(format!("dictionary_path={}", dictionary.path));
+            opts.push(format!("dictionary_path={}", dictionary.path()));
         }
         if opts.is_empty() {
             "zstd".to_string()
@@ -259,15 +412,12 @@ impl Compressor {
             #[cfg(feature = "lz4-compression")]
             Self::Lz4 => None,
             #[cfg(feature = "zstd-compression")]
-            Self::Zstd(zstd_compressor) => {
-                zstd_compressor.dictionary.as_ref().map(|d| d.path.as_str())
-            }
+            Self::Zstd(zstd_compressor) => zstd_compressor.dictionary.as_ref().map(|d| d.path()),
         }
     }
 
-    /// If this compressor names a zstd dictionary, fetches it from `directory` at the path
-    /// recorded in the descriptor (stored zstd-compressed on disk) and decompresses it. Returns
-    /// `Ok(None)` if this compressor doesn't use a dictionary.
+    /// If this compressor names a zstd dictionary, loads its bytes via `directory` (see
+    /// `ZstdDictionary::load`). Returns `Ok(None)` if this compressor doesn't use a dictionary.
     pub fn resolve_dictionary(
         &self,
         directory: &dyn crate::Directory,
@@ -277,52 +427,41 @@ impl Compressor {
             #[cfg(feature = "lz4-compression")]
             Self::Lz4 => Ok(None),
             #[cfg(feature = "zstd-compression")]
-            Self::Zstd(zstd_compressor) => {
-                let Some(descriptor) = &zstd_compressor.dictionary else {
-                    return Ok(None);
-                };
-                // Defense in depth: `ZstdDictionaryDescriptor::path` is `pub`, so a caller can
-                // construct one directly and skip `deser_from_str`'s validation. Re-check here,
-                // right before it's ever handed to a `Directory`, so an absolute path or `..`
-                // traversal can't escape the index directory (see `resolve_path` on
-                // `MmapDirectory` et al., which is a plain, unchecked `root_path.join(..)`), and
-                // so a `,` in the path can't have snuck in and desynced a subsequent
-                // `ser_to_string`/`deser_from_str` round-trip.
-                if !is_safe_and_encodable_relative_path(&descriptor.path) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "dictionary_path must be a plain path relative to the index \
-                             directory (no leading '/', no '..' components, and no ','), got \
-                             {:?}",
-                            descriptor.path
-                        ),
-                    ));
-                }
-                let compressed = directory
-                    .atomic_read(std::path::Path::new(&descriptor.path))
-                    .map_err(|err| {
-                        // Preserve `NotFound`/the original `io::Error`'s kind, rather than
-                        // flattening every failure mode to `ErrorKind::Other` -- a misconfigured
-                        // `dictionary_path` should be as easy to diagnose as a typical
-                        // missing-file error.
-                        let kind = match &err {
-                            crate::directory::error::OpenReadError::FileDoesNotExist(_) => {
-                                io::ErrorKind::NotFound
-                            }
-                            crate::directory::error::OpenReadError::IoError { io_error, .. } => {
-                                io_error.kind()
-                            }
-                            crate::directory::error::OpenReadError::IncompatibleIndex(_) => {
-                                io::ErrorKind::InvalidData
-                            }
-                        };
-                        io::Error::new(kind, err.to_string())
-                    })?;
-                let bytes = super::compression_zstd_block::decompress_whole(&compressed)?;
-                Ok(Some(std::sync::Arc::from(bytes)))
-            }
+            Self::Zstd(zstd_compressor) => zstd_compressor
+                .dictionary
+                .as_ref()
+                .map(|dictionary| dictionary.load(directory))
+                .transpose(),
         }
+    }
+}
+
+/// Loads dictionary bytes for a specific *segment's own recorded* path
+/// (`SegmentMeta::docstore_dictionary_path`), rather than a `Compressor`'s currently-configured
+/// one. Opening an existing segment must always resolve whatever dictionary it was actually
+/// compressed against, not the index's current setting -- the two can differ if the index's
+/// dictionary setting ever changes after the segment was written, which is exactly the scenario
+/// the merge-eligibility checks in `indexer/merger.rs` exist to catch. Returns `Ok(None)` if the
+/// segment has no recorded dictionary path.
+pub(crate) fn resolve_segment_dictionary(
+    directory: &dyn crate::Directory,
+    segment_dictionary_path: Option<&str>,
+) -> io::Result<Option<std::sync::Arc<[u8]>>> {
+    let Some(path) = segment_dictionary_path else {
+        return Ok(None);
+    };
+    #[cfg(feature = "zstd-compression")]
+    {
+        Ok(Some(ZstdDictionary::load_internal(directory, path)?))
+    }
+    #[cfg(not(feature = "zstd-compression"))]
+    {
+        let _ = (directory, path);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "segment has a docstore dictionary path recorded, but this build lacks the \
+             zstd-compression feature",
+        ))
     }
 }
 
@@ -349,9 +488,7 @@ mod tests {
 
         let compressor_with_dict = ZstdCompressor {
             compression_level: Some(15),
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "dict.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
         };
         assert_eq!(
             ZstdCompressor::deser_from_str(&compressor_with_dict.ser_to_string()).unwrap(),
@@ -360,9 +497,7 @@ mod tests {
 
         let dict_only = ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "dict.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
         };
         assert_eq!(
             ZstdCompressor::deser_from_str(&dict_only.ser_to_string()).unwrap(),
@@ -390,9 +525,7 @@ mod tests {
             ZstdCompressor::deser_from_str("zstd(dictionary_path=dict.bin.zst)").unwrap(),
             ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
             }
         );
         assert_eq!(
@@ -400,9 +533,7 @@ mod tests {
                 .unwrap(),
             ZstdCompressor {
                 compression_level: Some(15),
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
             }
         );
         assert_eq!(
@@ -442,8 +573,8 @@ mod tests {
     #[test]
     fn dictionary_path_with_comma_is_rejected_not_silently_mis_encoded() {
         // A comma is a perfectly safe, non-traversing relative path component, but it collides
-        // with `zstd(opt=val,opt=val)`'s `,`-based option separator. `ZstdDictionaryDescriptor`'s
-        // `path` field is `pub`, so a directly-constructed descriptor can carry one in even
+        // with `zstd(opt=val,opt=val)`'s `,`-based option separator. `ZstdDictionary` can be
+        // constructed directly (`Path`/`from_bytes`/`seed`), so a caller can carry one in even
         // though `deser_from_str` would reject it in text form. Note this can *not* be caught by
         // adding a check inside `deser_from_str`'s "dictionary_path" arm: `options.split(',')`
         // fragments the string into separate options *before* any option-specific value is ever
@@ -453,9 +584,7 @@ mod tests {
         // this is actually reachable and worth catching, so that's where it's checked.
         let compressor_with_comma = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "a,b.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("a,b.zst".to_string())),
         });
         let err = serde_json::to_string(&compressor_with_comma)
             .expect_err("a ',' in dictionary_path should fail to serialize, not mis-encode");
@@ -467,9 +596,7 @@ mod tests {
         // A directly-constructed descriptor with a safe path still serializes fine.
         let safe = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "dict.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
         });
         assert!(serde_json::to_string(&safe).is_ok());
     }
@@ -487,9 +614,7 @@ mod tests {
 
         let compressor = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "dict.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
         });
         let resolved = compressor.resolve_dictionary(&directory).unwrap();
         assert_eq!(resolved.as_deref(), Some(raw_dict.as_slice()));
@@ -512,9 +637,7 @@ mod tests {
         let directory = RamDirectory::create();
         let compressor = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "does_not_exist.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path("does_not_exist.bin.zst".to_string())),
         });
         let err = compressor.resolve_dictionary(&directory).unwrap_err();
         // A misconfigured `dictionary_path` should be as easy to diagnose as any other
@@ -523,40 +646,46 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dictionary_rejects_unsafe_paths_even_when_constructed_directly() {
-        // `ZstdDictionaryDescriptor::path` is `pub`, so a caller can bypass
-        // `deser_from_str`'s validation entirely by building the struct literal directly.
-        // `resolve_dictionary` must still refuse to hand an absolute/traversing path to the
-        // `Directory`.
+    fn zstd_dictionary_is_safe_and_encodable_relative_path() {
+        // Direct unit coverage of the check itself, now owned by `ZstdDictionary` (the only
+        // entity that ever opens a dictionary file) rather than floating as a free function.
+        assert!(!ZstdDictionary::is_safe_and_encodable_relative_path(
+            "/etc/passwd"
+        ));
+        assert!(!ZstdDictionary::is_safe_and_encodable_relative_path(
+            "../../../../etc/passwd"
+        ));
+        assert!(!ZstdDictionary::is_safe_and_encodable_relative_path(
+            "a,b.zst"
+        ));
+        assert!(ZstdDictionary::is_safe_and_encodable_relative_path(
+            "dict.bin.zst"
+        ));
+    }
+
+    #[test]
+    fn zstd_dictionary_load_rejects_unsafe_paths_even_when_constructed_directly() {
+        // `ZstdDictionary::Path` can be constructed directly, so a caller can bypass
+        // `deser_from_str`'s validation entirely. `ZstdDictionary::load` -- the only place that
+        // ever hands a dictionary path to a `Directory` -- must still refuse to do so for an
+        // absolute/traversing/comma-containing path.
         use crate::directory::RamDirectory;
 
         let directory = RamDirectory::create();
 
-        let absolute = Compressor::Zstd(ZstdCompressor {
-            compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "/etc/passwd".to_string(),
-            }),
-        });
-        let err = absolute.resolve_dictionary(&directory).unwrap_err();
+        let err = ZstdDictionary::Path("/etc/passwd".to_string())
+            .load(&directory)
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
-        let traversal = Compressor::Zstd(ZstdCompressor {
-            compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "../../../../etc/passwd".to_string(),
-            }),
-        });
-        let err = traversal.resolve_dictionary(&directory).unwrap_err();
+        let err = ZstdDictionary::Path("../../../../etc/passwd".to_string())
+            .load(&directory)
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
-        let with_comma = Compressor::Zstd(ZstdCompressor {
-            compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "a,b.zst".to_string(),
-            }),
-        });
-        let err = with_comma.resolve_dictionary(&directory).unwrap_err();
+        let err = ZstdDictionary::Path("a,b.zst".to_string())
+            .load(&directory)
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

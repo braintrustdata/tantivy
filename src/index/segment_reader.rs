@@ -221,12 +221,15 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        let store_dictionary = segment
-            .index()
-            .settings()
-            .docstore_compression
-            .resolve_dictionary(segment.index().directory())?;
+        // A segment must always be read back with whatever dictionary it was actually compressed
+        // against -- its own recorded `docstore_dictionary_path` -- not the index's *current*
+        // `docstore_compression` setting, which can drift after the segment was written (rotated,
+        // added, or removed). See `crate::store::resolve_segment_dictionary`.
         let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
+        let store_dictionary = crate::store::resolve_segment_dictionary(
+            segment.index().directory(),
+            store_dictionary_path.as_deref(),
+        )?;
 
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
