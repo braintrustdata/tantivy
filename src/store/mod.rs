@@ -31,6 +31,8 @@
 
 mod compressors;
 mod decompressors;
+#[cfg(feature = "zstd-compression")]
+mod dictionary_cache;
 mod footer;
 mod index;
 mod reader;
@@ -38,7 +40,7 @@ mod writer;
 pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
 pub(crate) use self::compressors::resolve_segment_dictionary;
 #[cfg(all(feature = "zstd-compression", test))]
-pub(crate) use self::compressors::clear_dictionary_cache_for_test;
+pub(crate) use self::dictionary_cache::clear_for_test as clear_dictionary_cache_for_test;
 pub use self::decompressors::Decompressor;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};

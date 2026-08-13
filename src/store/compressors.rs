@@ -140,38 +140,6 @@ impl ZstdDictionary {
     }
 }
 
-/// Process-wide cache of decompressed dictionary bytes, keyed by path. Safe to key by path alone
-/// (no separate directory identity in the key) because `load_internal` *verifies*, not assumes,
-/// that a path is genuinely content-addressed before ever inserting into this map (recomputes
-/// the hash of what was actually loaded and rejects a mismatch) -- so an entry that made it in
-/// here is guaranteed unique to its content, regardless of which `Directory`/index it came from.
-///
-
-/// Weak-referenced, not LRU: an entry serves cached bytes for as long as *something else* (a
-/// `SegmentReader`, `StoreReader`, etc.) still holds a strong `Arc` to them; once every such
-/// holder drops, the entry naturally goes dead and the next lookup re-decompresses. This trades
-/// away an explicit memory ceiling for simplicity -- no eviction policy to tune, memory tracks
-/// actual live usage. Mirrors `MmapDirectory`'s own `MmapCache` (`directory/mmap_directory.rs`),
-/// the only other path-keyed weak-ref cache in this fork.
-///
-/// This only helps when dictionary usage overlaps in time (concurrently open segments, or opens
-/// in quick succession before the last reference drops) -- fully sequential open/close/open never
-/// benefits, since nothing is left alive to serve the next lookup. That's expected, not a bug.
-#[cfg(feature = "zstd-compression")]
-static DICTIONARY_CACHE: once_cell::sync::Lazy<
-    std::sync::RwLock<std::collections::HashMap<String, std::sync::Weak<[u8]>>>,
-> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
-
-// Test-only isolation for `DICTIONARY_CACHE`: it's a process-wide static, and several tests
-// (here and in `store/mod.rs`) reuse the same literal path (e.g. "dict.bin.zst") with different
-// content across different `RamDirectory` instances. Without clearing between tests, parallel
-// test execution could serve one test's cached bytes to another under the same path. Mirrors
-// `indexer::merger::take_stacked_segments_for_test`'s same-purpose reset.
-#[cfg(all(feature = "zstd-compression", test))]
-pub(crate) fn clear_dictionary_cache_for_test() {
-    DICTIONARY_CACHE.write().unwrap().clear();
-}
-
 #[cfg(feature = "zstd-compression")]
 impl ZstdDictionary {
     /// Rejects absolute paths, `..`/`.` components (would escape the index directory via
@@ -218,12 +186,7 @@ impl ZstdDictionary {
             ));
         }
 
-        if let Some(bytes) = DICTIONARY_CACHE
-            .read()
-            .unwrap()
-            .get(path)
-            .and_then(std::sync::Weak::upgrade)
-        {
+        if let Some(bytes) = super::dictionary_cache::get(path) {
             return Ok(bytes);
         }
 
@@ -272,10 +235,7 @@ impl ZstdDictionary {
         // Racing with another thread's concurrent miss for the same path is fine: both decompress
         // independently and both inserts are content-identical (verified above), so simply
         // overwriting is correct -- no need for single-flight coordination here.
-        DICTIONARY_CACHE
-            .write()
-            .unwrap()
-            .insert(path.to_string(), std::sync::Arc::downgrade(&bytes));
+        super::dictionary_cache::insert(path, &bytes);
 
         Ok(bytes)
     }
@@ -540,6 +500,7 @@ pub(crate) fn resolve_segment_dictionary(
 #[cfg(all(feature = "zstd-compression", test))]
 mod tests {
     use super::*;
+    use crate::store::clear_dictionary_cache_for_test;
 
     #[test]
     fn zstd_serde_roundtrip() {
