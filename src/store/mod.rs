@@ -817,6 +817,92 @@ pub mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_gc_retains_old_segments_dictionary_after_rotation() -> crate::Result<()> {
+        // Regression test for a gap the per-segment dictionary read fix (see the rotation/removal
+        // tests above) introduced: `SegmentReader::open` reads a segment back using its own
+        // frozen `SegmentMeta::docstore_dictionary_path`, not the index's current setting -- so a
+        // segment written under dict_a still needs dict_a's file on disk even after the index
+        // rotates to dict_b, until that segment is merged away. `SegmentUpdater::list_files` (the
+        // GC live-file set) must protect every live segment's own recorded dictionary, not just
+        // the index's current one, or GC sweeps dict_a out from under a still-live segment on the
+        // very next commit -- and the next read or merge-recompress fails with `NotFound`.
+        clear_dictionary_cache_for_test();
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        let dict_b =
+            super::compression_zstd_block::compress_whole(b"an entirely different dictionary")?;
+
+        // Unlike the rotation/removal tests above, this test seeds dictionaries *through* the
+        // managed directory (`index.directory()`), not the raw pre-wrap one. That's deliberate:
+        // `ManagedDirectory::garbage_collect` only ever considers deleting files it registered as
+        // managed in the first place (`atomic_write`/`open_write` on the wrapped directory does
+        // that registration) -- a file written pre-wrap, like the rotation tests above do
+        // specifically to *dodge* GC registration, is invisible to GC and could never be swept
+        // regardless of `list_files`. To actually exercise the sweep hazard this test guards
+        // against, the dictionary must be a real GC candidate.
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionary::Path("dict_a.bin.zst".to_string())),
+            }),
+            ..Default::default()
+        };
+        let mut index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+        index
+            .directory()
+            .atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            index_writer
+                .add_document(doc!(text_field=> LOREM))
+                .expect("add_document 1 failed");
+            index_writer.commit().expect("commit 1 failed");
+        }
+
+        // Rotate to dict_b -- the segment committed above is still recorded as using dict_a.
+        index
+            .directory()
+            .atomic_write(Path::new("dict_b.bin.zst"), &dict_b)?;
+        index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionary::Path("dict_b.bin.zst".to_string())),
+        });
+
+        {
+            // The commit below is what triggers the post-commit `garbage_collect_files` pass
+            // under test -- the mechanism that used to only protect the *current* dictionary.
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            index_writer
+                .add_document(doc!(text_field=> LOREM))
+                .expect("add_document 2 failed");
+            index_writer.commit().expect("commit 2 failed");
+        }
+
+        assert_eq!(
+            index.searchable_segment_ids()?.len(),
+            2,
+            "test assumes no merge happened yet -- the first segment should still be live and \
+             still depend on dict_a"
+        );
+        assert!(
+            index.directory().exists(Path::new("dict_a.bin.zst"))?,
+            "dict_a was garbage collected while a live, not-yet-merged segment still recorded \
+             it as its own dictionary"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_merge_of_small_segments() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
