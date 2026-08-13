@@ -460,18 +460,25 @@ pub mod tests {
         // `ManagedDirectory` gets registered and becomes eligible for the automatic
         // post-commit GC (`SegmentUpdater::list_files` only protects segment files + meta.json),
         // which would otherwise delete an unrelated sibling file like the dictionary blob.
-        clear_dictionary_cache_for_test(); // isolate from other tests sharing these literal paths
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        let dict_b =
-            super::compression_zstd_block::compress_whole(b"an entirely different dictionary")?;
-        ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
-        ram_directory.atomic_write(Path::new("dict_b.bin.zst"), &dict_b)?;
+        // `seed` writes under a content-addressed name and hands back a `Loaded` value; grab just
+        // the path and construct a fresh `Path` for settings, matching what a real `meta.json`
+        // deserialize would produce (never `Loaded` -- bytes are never persisted).
+        let dict_a_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
+        let dict_b_path = ZstdDictionary::seed(
+            &ram_directory,
+            Arc::from(b"an entirely different dictionary".as_slice()),
+        )?
+        .path()
+        .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionary::Path("dict_a.bin.zst".to_string())),
+                dictionary: Some(ZstdDictionary::Path(dict_a_path)),
             }),
             ..Default::default()
         };
@@ -501,7 +508,7 @@ pub mod tests {
         // way to prevent this in-process.
         index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionary::Path("dict_b.bin.zst".to_string())),
+            dictionary: Some(ZstdDictionary::Path(dict_b_path)),
         });
 
         // Drive the merge directly through `IndexMerger`/`SegmentSerializer`, the same building
@@ -556,15 +563,16 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
-        clear_dictionary_cache_for_test(); // isolate from other tests sharing this literal path
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
+        let dict_a_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionary::Path("dict_a.bin.zst".to_string())),
+                dictionary: Some(ZstdDictionary::Path(dict_a_path)),
             }),
             ..Default::default()
         };
@@ -641,15 +649,16 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
-        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
+        let dict_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
+                dictionary: Some(ZstdDictionary::Path(dict_path)),
             }),
             ..Default::default()
         };
@@ -713,15 +722,16 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
-        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
+        let dict_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
+                dictionary: Some(ZstdDictionary::Path(dict_path.clone())),
             }),
             ..Default::default()
         };
@@ -740,7 +750,7 @@ pub mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(
             segments[0].meta().docstore_dictionary_path(),
-            Some("dict.bin.zst")
+            Some(dict_path.as_str())
         );
 
         // Sanity: the document is actually readable back through the recorded dictionary.
@@ -775,14 +785,21 @@ pub mod tests {
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
 
-        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
-        let dict_path = "dict.bin.zst";
-        let dict_bytes = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        clear_dictionary_cache_for_test();
+        // Compute the content-addressed name via a throwaway directory -- the real write below
+        // goes through the actual index's managed directory, which is the whole point of this
+        // test; this is just to get the correct name without a chicken-and-egg problem (settings
+        // need the path before the index exists to write through its own managed directory).
+        let dict_bytes: Arc<[u8]> = Arc::from(LOREM.as_bytes());
+        let dict_path = ZstdDictionary::seed(&RamDirectory::create(), dict_bytes.clone())?
+            .path()
+            .to_string();
+        let dict_compressed = super::compression_zstd_block::compress_whole(&dict_bytes)?;
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionary::Path(dict_path.to_string())),
+                dictionary: Some(ZstdDictionary::Path(dict_path.clone())),
             }),
             ..Default::default()
         };
@@ -796,7 +813,7 @@ pub mod tests {
         // raw pre-wrap directory the way the rotation test above does.
         index
             .directory()
-            .atomic_write(Path::new(dict_path), &dict_bytes)?;
+            .atomic_write(Path::new(&dict_path), &dict_compressed)?;
 
         {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
@@ -809,7 +826,7 @@ pub mod tests {
         }
 
         assert!(
-            index.directory().exists(Path::new(dict_path))?,
+            index.directory().exists(Path::new(&dict_path))?,
             "dictionary file seeded through the managed directory was garbage collected on the \
              very next commit"
         );
@@ -833,9 +850,19 @@ pub mod tests {
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
 
-        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        let dict_b =
-            super::compression_zstd_block::compress_whole(b"an entirely different dictionary")?;
+        let dict_a_bytes: Arc<[u8]> = Arc::from(LOREM.as_bytes());
+        let dict_b_bytes: Arc<[u8]> = Arc::from(b"an entirely different dictionary".as_slice());
+        // Compute the content-addressed names via throwaway directories -- see the
+        // managed-directory GC test above for why (settings need the path before the real
+        // index/managed directory exist to write through).
+        let dict_a_path = ZstdDictionary::seed(&RamDirectory::create(), dict_a_bytes.clone())?
+            .path()
+            .to_string();
+        let dict_b_path = ZstdDictionary::seed(&RamDirectory::create(), dict_b_bytes.clone())?
+            .path()
+            .to_string();
+        let dict_a_compressed = super::compression_zstd_block::compress_whole(&dict_a_bytes)?;
+        let dict_b_compressed = super::compression_zstd_block::compress_whole(&dict_b_bytes)?;
 
         // Unlike the rotation/removal tests above, this test seeds dictionaries *through* the
         // managed directory (`index.directory()`), not the raw pre-wrap one. That's deliberate:
@@ -848,7 +875,7 @@ pub mod tests {
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionary::Path("dict_a.bin.zst".to_string())),
+                dictionary: Some(ZstdDictionary::Path(dict_a_path.clone())),
             }),
             ..Default::default()
         };
@@ -858,7 +885,7 @@ pub mod tests {
             .create_in_ram()?;
         index
             .directory()
-            .atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
+            .atomic_write(Path::new(&dict_a_path), &dict_a_compressed)?;
         {
             let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
@@ -871,10 +898,10 @@ pub mod tests {
         // Rotate to dict_b -- the segment committed above is still recorded as using dict_a.
         index
             .directory()
-            .atomic_write(Path::new("dict_b.bin.zst"), &dict_b)?;
+            .atomic_write(Path::new(&dict_b_path), &dict_b_compressed)?;
         index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionary::Path("dict_b.bin.zst".to_string())),
+            dictionary: Some(ZstdDictionary::Path(dict_b_path)),
         });
 
         {
@@ -895,7 +922,7 @@ pub mod tests {
              still depend on dict_a"
         );
         assert!(
-            index.directory().exists(Path::new("dict_a.bin.zst"))?,
+            index.directory().exists(Path::new(&dict_a_path))?,
             "dict_a was garbage collected while a live, not-yet-merged segment still recorded \
              it as its own dictionary"
         );

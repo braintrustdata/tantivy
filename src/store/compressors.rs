@@ -141,9 +141,12 @@ impl ZstdDictionary {
 }
 
 /// Process-wide cache of decompressed dictionary bytes, keyed by path. Safe to key by path alone
-/// (no separate content hash) because the path itself is content-addressed (see
-/// `content_addressed_dictionary_path`) -- two different dictionaries can never share a key.
+/// (no separate directory identity in the key) because `load_internal` *verifies*, not assumes,
+/// that a path is genuinely content-addressed before ever inserting into this map (recomputes
+/// the hash of what was actually loaded and rejects a mismatch) -- so an entry that made it in
+/// here is guaranteed unique to its content, regardless of which `Directory`/index it came from.
 ///
+
 /// Weak-referenced, not LRU: an entry serves cached bytes for as long as *something else* (a
 /// `SegmentReader`, `StoreReader`, etc.) still holds a strong `Arc` to them; once every such
 /// holder drops, the entry naturally goes dead and the next lookup re-decompresses. This trades
@@ -245,9 +248,30 @@ impl ZstdDictionary {
             })?;
         let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(super::decompress_whole(&compressed)?);
 
+        // The cache's whole safety argument is "the path is content-addressed, so path equality
+        // implies content equality" -- but nothing stops a caller from constructing
+        // `ZstdDictionary::Path` with an arbitrary string (it's a public variant), and a fixed
+        // literal name was literally this fork's previous design. Don't just assume the
+        // invariant holds: verify it, on every cold load, by recomputing the content-addressed
+        // name for what was actually read and comparing it against `path`. A mismatch means
+        // caching under `path` would be unsafe (two different directories could then poison each
+        // other's cache entry under the same literal name) -- refuse rather than cache it.
+        let expected_path = content_addressed_dictionary_path(&bytes);
+        if expected_path != path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "dictionary at {path:?} does not hash to its own path (expected \
+                     {expected_path:?}) -- refusing to cache it under a name that doesn't \
+                     uniquely identify its content, since the dictionary cache is process-wide \
+                     and keyed by path alone"
+                ),
+            ));
+        }
+
         // Racing with another thread's concurrent miss for the same path is fine: both decompress
-        // independently and both inserts are content-identical (the path is content-addressed),
-        // so simply overwriting is correct -- no need for single-flight coordination here.
+        // independently and both inserts are content-identical (verified above), so simply
+        // overwriting is correct -- no need for single-flight coordination here.
         DICTIONARY_CACHE
             .write()
             .unwrap()
@@ -651,41 +675,41 @@ mod tests {
 
     #[test]
     fn resolve_dictionary_reads_and_decompresses_from_path() {
-        use crate::directory::{Directory, RamDirectory};
+        use crate::directory::RamDirectory;
+        use std::sync::Arc;
 
-        clear_dictionary_cache_for_test(); // isolate from other tests sharing "dict.bin.zst"
+        clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
-        let raw_dict = b"a dictionary's worth of bytes, stored zstd-compressed on disk".to_vec();
-        let compressed = super::super::compression_zstd_block::compress_whole(&raw_dict).unwrap();
-        directory
-            .atomic_write(std::path::Path::new("dict.bin.zst"), &compressed)
-            .unwrap();
+        let raw_dict: Arc<[u8]> =
+            Arc::from(b"a dictionary's worth of bytes, stored zstd-compressed on disk".to_vec());
+        // `seed` writes the compressed bytes under the correct content-addressed name; construct
+        // a fresh `Path` (not the `Loaded` value `seed` returns) so `resolve_dictionary` actually
+        // exercises the read-from-`Directory` path this test means to cover.
+        let seeded = ZstdDictionary::seed(&directory, raw_dict.clone()).unwrap();
 
         let compressor = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
+            dictionary: Some(ZstdDictionary::Path(seeded.path().to_string())),
         });
         let resolved = compressor.resolve_dictionary(&directory).unwrap();
-        assert_eq!(resolved.as_deref(), Some(raw_dict.as_slice()));
+        assert_eq!(resolved.as_deref(), Some(raw_dict.as_ref()));
     }
 
     #[test]
     fn zstd_dictionary_cache_shares_bytes_while_a_strong_ref_is_alive() {
-        use crate::directory::{Directory, RamDirectory};
+        use crate::directory::RamDirectory;
+        use std::sync::Arc;
 
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
-        let raw = b"shared dictionary content for cache hit test".to_vec();
-        let compressed = super::super::compression_zstd_block::compress_whole(&raw).unwrap();
-        directory
-            .atomic_write(std::path::Path::new("cache_test_dict_hit.bin.zst"), &compressed)
-            .unwrap();
+        let raw: Arc<[u8]> = Arc::from(b"shared dictionary content for cache hit test".to_vec());
+        let seeded = ZstdDictionary::seed(&directory, raw).unwrap();
 
-        let dict = ZstdDictionary::Path("cache_test_dict_hit.bin.zst".to_string());
+        let dict = ZstdDictionary::Path(seeded.path().to_string());
         let first = dict.load(&directory).unwrap();
         let second = dict.load(&directory).unwrap();
         assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
+            Arc::ptr_eq(&first, &second),
             "a second load while the first Arc is still alive should return the cached \
              allocation, not decompress again"
         );
@@ -694,34 +718,113 @@ mod tests {
     #[test]
     fn zstd_dictionary_cache_reloads_after_last_strong_ref_drops() {
         use crate::directory::{Directory, RamDirectory};
+        use std::sync::Arc;
 
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
-        let path = std::path::Path::new("cache_test_dict_evict.bin.zst");
+        let raw: Arc<[u8]> = Arc::from(b"dictionary content for cache eviction test".to_vec());
+        let seeded = ZstdDictionary::seed(&directory, raw.clone()).unwrap();
+        let path = seeded.path().to_string();
 
-        let raw_v1 = b"dictionary v1".to_vec();
-        directory
-            .atomic_write(path, &super::super::compression_zstd_block::compress_whole(&raw_v1).unwrap())
-            .unwrap();
-
-        let dict = ZstdDictionary::Path("cache_test_dict_evict.bin.zst".to_string());
+        let dict = ZstdDictionary::Path(path.clone());
         let first = dict.load(&directory).unwrap();
-        assert_eq!(first.as_ref(), raw_v1.as_slice());
+        assert_eq!(first.as_ref(), raw.as_ref());
         drop(first); // last strong ref -- the cache entry is now dead
 
-        // Overwrite the underlying file with different content. If the cache incorrectly served
-        // a stale (but still-cached) entry instead of reloading, this would still return v1.
-        let raw_v2 = b"dictionary v2, deliberately different content and length".to_vec();
+        // Delete the underlying file. Overwriting it with *different* content, the way this test
+        // used to prove non-staleness, no longer works: `load_internal` now verifies a loaded
+        // dictionary hashes back to its own path, so mismatched content at the same path would
+        // just be (correctly) rejected -- that's a different code path than the one this test
+        // means to exercise. Deleting instead proves the same thing more directly: if the cache
+        // incorrectly served a stale entry instead of reloading, this would still succeed with
+        // the old (correct) content; since it correctly reloads, it must now fail with `NotFound`.
+        directory.delete(std::path::Path::new(&path)).unwrap();
+        let err = dict.load(&directory).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "once the only strong Arc drops, a later load must reload fresh (and see the file is \
+             gone), not serve a stale cached entry"
+        );
+    }
+
+    #[test]
+    fn zstd_dictionary_load_rejects_content_that_does_not_hash_to_its_own_path() {
+        // The cache's safety argument is "the path is content-addressed, so path equality implies
+        // content equality" -- but `ZstdDictionary::Path` is a public variant, constructible with
+        // any string, and a fixed literal name was this fork's own previous design (and remains
+        // possible for any embedder, legacy data, or manual `meta.json` edit). `load_internal`
+        // must not just assume the invariant holds: it verifies it on every cold load, refusing
+        // to cache (or return) bytes whose hash doesn't match the path they were loaded from.
+        use crate::directory::{Directory, RamDirectory};
+
+        clear_dictionary_cache_for_test();
+        let directory = RamDirectory::create();
+        let content = b"this content does not hash to the literal path below".to_vec();
+        let compressed = super::super::compression_zstd_block::compress_whole(&content).unwrap();
         directory
-            .atomic_write(path, &super::super::compression_zstd_block::compress_whole(&raw_v2).unwrap())
+            .atomic_write(std::path::Path::new("not-actually-a-hash.bin.zst"), &compressed)
             .unwrap();
 
-        let second = dict.load(&directory).unwrap();
+        let dict = ZstdDictionary::Path("not-actually-a-hash.bin.zst".to_string());
+        let err = dict.load(&directory).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("does not hash to its own path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn zstd_dictionary_shared_literal_path_across_directories_never_serves_cross_contaminated_bytes()
+     {
+        // Direct regression test for a reviewer-flagged scenario: two different `Directory`
+        // instances (simulating two different open indexes in one process) using the same
+        // non-content-addressed literal path, each with their own different bytes at that path.
+        // Before hash verification, whichever loaded first could populate the process-wide cache
+        // under that shared literal key, and the other could then silently receive the wrong
+        // index's bytes on its own lookup for the same key, for as long as that Arc stayed alive.
+        // With verification, neither load can ever succeed: a non-hash-derived shared literal can
+        // never accumulate a valid cache entry in the first place (every insert attempt is
+        // checked against its own content and rejected if it doesn't match) -- so there's no
+        // window in which a correct entry could exist for the other directory to be incorrectly
+        // served.
+        use crate::directory::{Directory, RamDirectory};
+
+        clear_dictionary_cache_for_test();
+        let shared_literal_path = "dict.bin.zst"; // fixed literal, not content-addressed
+
+        let directory_a = RamDirectory::create();
+        directory_a
+            .atomic_write(
+                std::path::Path::new(shared_literal_path),
+                &super::super::compression_zstd_block::compress_whole(b"index A's dictionary")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let directory_b = RamDirectory::create();
+        directory_b
+            .atomic_write(
+                std::path::Path::new(shared_literal_path),
+                &super::super::compression_zstd_block::compress_whole(
+                    b"index B's completely different dictionary",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let dict = ZstdDictionary::Path(shared_literal_path.to_string());
         assert_eq!(
-            second.as_ref(),
-            raw_v2.as_slice(),
-            "once the only strong Arc drops, a later load must reload fresh, not serve a stale \
-             cached entry"
+            dict.load(&directory_a).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "index A's own load should fail rather than populate the shared cache key"
+        );
+        assert_eq!(
+            dict.load(&directory_b).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "index B's load must independently fail too -- it must never receive index A's \
+             bytes from the shared cache key, since nothing valid was ever cached there"
         );
     }
 
