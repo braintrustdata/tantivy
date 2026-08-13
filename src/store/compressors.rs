@@ -89,23 +89,20 @@ impl<'de> Deserialize<'de> for Compressor {
 }
 
 /// A zstd dictionary a doc store was (or should be) compressed with. Owns everything about how a
-/// dictionary is stored, named, and resolved -- callers hand over raw bytes (`seed`/`from_bytes`)
-/// or a recorded path (via `meta.json`, deserialized as `Path`); they never need to know the
-/// on-disk naming convention or write the file themselves.
+/// dictionary is stored, named, and resolved -- callers hand over raw bytes (`seed`) or a
+/// recorded path (via `meta.json`, deserialized as `Path`); they never need to know the on-disk
+/// naming convention or write the file themselves.
 ///
 /// The dictionary's raw bytes are never part of `meta.json` -- only a `Directory`-relative path
 /// is ever persisted (see `Serialize`/`Deserialize` below), resolved via `Directory::atomic_read`.
-/// Integrity of the bytes at that path relies on zstd's own frame checksum (see
-/// `compression_zstd_block`), verified as a side effect of decompression at effectively no extra
-/// cost -- this type does not re-verify content on every load.
 ///
-/// The path itself *is* content-addressed (SHA-256 of the raw bytes, see `seed`), which is a
-/// separate, cheap, one-time cost paid only when a dictionary is first seeded, not on every open.
-/// This matters for correctness, not just dedup: two different dictionaries must never compare
-/// equal as `IndexSettings` (`ZstdDictionary`'s `PartialEq` is path-based), since merges -- both
-/// `IndexMerger::write_storable_fields` and any embedder comparing `IndexSettings` before merging
-/// indices from possibly-different sources -- rely on that equality to detect a real dictionary
-/// mismatch rather than silently combining segments compressed against different dictionaries.
+/// The path itself *is* content-addressed (SHA-256 of the raw bytes, see `seed`): two different
+/// dictionaries must never compare equal as `IndexSettings` (`PartialEq` here is path-based),
+/// since merges rely on that equality to detect a real mismatch instead of silently combining
+/// incompatible segments. `seed` is the *only* way to produce a `Loaded` value -- no
+/// `from_bytes`-style constructor exists, since one would let path and bytes be paired
+/// inconsistently, defeating that guarantee. A `Path`, which can come from anywhere (`meta.json`,
+/// direct construction), gets re-verified on every cold load instead (see `load_internal`).
 ///
 /// `SegmentUpdater::list_files` protects `path()` from garbage collection for any `Directory` that
 /// routes GC through it (i.e. anything wrapped in `ManagedDirectory`, which is every `Index`).
@@ -116,7 +113,8 @@ pub enum ZstdDictionary {
     /// Not yet resolved to bytes; `path` is where to load them from via `Directory::atomic_read`.
     /// This is what deserializing from `meta.json` always produces.
     Path(String),
-    /// Bytes already known -- e.g. just supplied to `seed`/`from_bytes`, or already loaded once.
+    /// Bytes already known, always via `seed`, which computes `path` from `bytes` itself so the
+    /// two can never disagree.
     Loaded {
         /// Where these bytes are (or will be) persisted, relative to the index directory.
         path: String,
@@ -252,13 +250,6 @@ impl ZstdDictionary {
         let path = content_addressed_dictionary_path(&bytes);
         directory.atomic_write(std::path::Path::new(&path), &compressed)?;
         Ok(ZstdDictionary::Loaded { path, bytes })
-    }
-
-    /// Constructs a dictionary directly from bytes already in hand, with no I/O -- for callers
-    /// that already know both the path and the bytes (e.g. reusing a dictionary previously seeded
-    /// elsewhere, or tests).
-    pub fn from_bytes(path: String, bytes: std::sync::Arc<[u8]>) -> Self {
-        ZstdDictionary::Loaded { path, bytes }
     }
 }
 
@@ -606,9 +597,9 @@ mod tests {
     #[test]
     fn dictionary_path_with_comma_is_rejected_not_silently_mis_encoded() {
         // A comma is a perfectly safe, non-traversing relative path component, but it collides
-        // with `zstd(opt=val,opt=val)`'s `,`-based option separator. `ZstdDictionary` can be
-        // constructed directly (`Path`/`from_bytes`/`seed`), so a caller can carry one in even
-        // though `deser_from_str` would reject it in text form. Note this can *not* be caught by
+        // with `zstd(opt=val,opt=val)`'s `,`-based option separator. `ZstdDictionary::Path` can be
+        // constructed directly, so a caller can carry one in even though `deser_from_str` would
+        // reject it in text form. Note this can *not* be caught by
         // adding a check inside `deser_from_str`'s "dictionary_path" arm: `options.split(',')`
         // fragments the string into separate options *before* any option-specific value is ever
         // isolated, so a value containing ',' never reaches that arm as one piece -- it instead
