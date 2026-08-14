@@ -22,8 +22,7 @@ use std::sync::{Arc, RwLock, Weak};
 
 use once_cell::sync::Lazy;
 
-static CACHE: Lazy<RwLock<HashMap<String, Weak<[u8]>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static CACHE: Lazy<RwLock<HashMap<String, Weak<[u8]>>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Returns cached bytes for `path`, if a strong reference is still alive somewhere.
 pub(crate) fn get(path: &str) -> Option<Arc<[u8]>> {
@@ -34,11 +33,17 @@ pub(crate) fn get(path: &str) -> Option<Arc<[u8]>> {
 /// path is fine to just overwrite: the caller is responsible for having already verified that
 /// `path` uniquely identifies `bytes`, so any two concurrent inserts for the same path are
 /// content-identical.
+///
+/// Also sweeps every dead entry from the map first. This is the only place that ever grows the
+/// map (`get` is read-only), and it already pays for the write lock, so piggybacking the sweep
+/// here is free synchronization-wise -- no separate queue/LRU bookkeeping needed to know which
+/// entries are stale, since `Weak::strong_count` already answers that directly. Cost is O(distinct
+/// paths ever inserted) per cache-miss, not per lookup, so it stays proportional to how many
+/// unique dictionaries have actually been loaded, not to traffic.
 pub(crate) fn insert(path: &str, bytes: &Arc<[u8]>) {
-    CACHE
-        .write()
-        .unwrap()
-        .insert(path.to_string(), Arc::downgrade(bytes));
+    let mut cache = CACHE.write().unwrap();
+    cache.retain(|_, weak| weak.strong_count() > 0);
+    cache.insert(path.to_string(), Arc::downgrade(bytes));
 }
 
 /// Test-only isolation: this cache is a process-wide static, and several tests use different

@@ -20,7 +20,9 @@ pub enum Compressor {
 
 impl Serialize for Compressor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         match self {
             Compressor::None => serializer.serialize_str("none"),
             #[cfg(feature = "lz4-compression")]
@@ -45,44 +47,45 @@ impl Serialize for Compressor {
 
 impl<'de> Deserialize<'de> for Compressor {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         let buf = String::deserialize(deserializer)?;
-        let compressor = match buf.as_str() {
-            "none" => Compressor::None,
-            #[cfg(feature = "lz4-compression")]
-            "lz4" => Compressor::Lz4,
-            #[cfg(not(feature = "lz4-compression"))]
-            "lz4" => {
-                return Err(serde::de::Error::custom(
+        let compressor =
+            match buf.as_str() {
+                "none" => Compressor::None,
+                #[cfg(feature = "lz4-compression")]
+                "lz4" => Compressor::Lz4,
+                #[cfg(not(feature = "lz4-compression"))]
+                "lz4" => return Err(serde::de::Error::custom(
                     "unsupported variant `lz4`, please enable Tantivy's `lz4-compression` feature",
-                ))
-            }
-            #[cfg(feature = "zstd-compression")]
-            _ if buf.starts_with("zstd") => Compressor::Zstd(
-                ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
-            ),
-            #[cfg(not(feature = "zstd-compression"))]
-            _ if buf.starts_with("zstd") => {
-                return Err(serde::de::Error::custom(
-                    "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
+                )),
+                #[cfg(feature = "zstd-compression")]
+                _ if buf.starts_with("zstd") => Compressor::Zstd(
+                    ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
+                ),
+                #[cfg(not(feature = "zstd-compression"))]
+                _ if buf.starts_with("zstd") => {
+                    return Err(serde::de::Error::custom(
+                        "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
                      feature",
-                ))
-            }
-            _ => {
-                return Err(serde::de::Error::unknown_variant(
-                    &buf,
-                    &[
-                        "none",
-                        #[cfg(feature = "lz4-compression")]
-                        "lz4",
-                        #[cfg(feature = "zstd-compression")]
-                        "zstd",
-                        #[cfg(feature = "zstd-compression")]
-                        "zstd(compression_level=5)",
-                    ],
-                ));
-            }
-        };
+                    ))
+                }
+                _ => {
+                    return Err(serde::de::Error::unknown_variant(
+                        &buf,
+                        &[
+                            "none",
+                            #[cfg(feature = "lz4-compression")]
+                            "lz4",
+                            #[cfg(feature = "zstd-compression")]
+                            "zstd",
+                            #[cfg(feature = "zstd-compression")]
+                            "zstd(compression_level=5)",
+                        ],
+                    ));
+                }
+            };
 
         Ok(compressor)
     }
@@ -115,12 +118,25 @@ pub enum ZstdDictionary {
     Path(String),
     /// Bytes already known, always via `seed`, which computes `path` from `bytes` itself so the
     /// two can never disagree.
-    Loaded {
-        /// Where these bytes are (or will be) persisted, relative to the index directory.
-        path: String,
-        /// The dictionary's raw (uncompressed) bytes.
-        bytes: std::sync::Arc<[u8]>,
-    },
+    ///
+    /// Wraps a private-field struct rather than named fields directly: enum variant fields
+    /// always share the enum's own `pub` visibility (Rust has no per-field visibility on enum
+    /// variants), so `path`/`bytes` living right on `Loaded` would make it publicly
+    /// constructible with a mismatched pair -- unlike `Path` above, that mismatch is never
+    /// re-verified (`load` returns `bytes` straight through, see below), so it would silently
+    /// defeat the invariant this type exists to hold. Routing through `LoadedZstdDictionary`,
+    /// whose fields are private to this module, makes `seed` the only way to produce one.
+    Loaded(LoadedZstdDictionary),
+}
+
+/// The bytes-known payload of `ZstdDictionary::Loaded`, split out into its own type purely so
+/// `path`/`bytes` can be private -- enum fields can't be, but struct fields can. `seed` (below)
+/// is the only code with module-private access, and it's the only place a value of this type is
+/// ever built, so `path` and `bytes` can never disagree.
+#[derive(Clone, Debug)]
+pub struct LoadedZstdDictionary {
+    path: String,
+    bytes: std::sync::Arc<[u8]>,
 }
 
 // Not feature-gated: `ZstdDictionary` sits behind `Option<ZstdDictionary>` on the never-gated
@@ -133,7 +149,7 @@ impl ZstdDictionary {
     pub fn path(&self) -> &str {
         match self {
             ZstdDictionary::Path(path) => path,
-            ZstdDictionary::Loaded { path, .. } => path,
+            ZstdDictionary::Loaded(loaded) => &loaded.path,
         }
     }
 }
@@ -159,7 +175,7 @@ impl ZstdDictionary {
     /// already known.
     pub fn load(&self, directory: &dyn crate::Directory) -> io::Result<std::sync::Arc<[u8]>> {
         match self {
-            ZstdDictionary::Loaded { bytes, .. } => Ok(bytes.clone()),
+            ZstdDictionary::Loaded(loaded) => Ok(loaded.bytes.clone()),
             ZstdDictionary::Path(path) => Self::load_internal(directory, path),
         }
     }
@@ -207,7 +223,8 @@ impl ZstdDictionary {
                 };
                 io::Error::new(kind, err.to_string())
             })?;
-        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(super::decompress_whole(&compressed)?);
+        let bytes: std::sync::Arc<[u8]> =
+            std::sync::Arc::from(super::decompress_whole(&compressed)?);
 
         // The cache's whole safety argument is "the path is content-addressed, so path equality
         // implies content equality" -- but nothing stops a caller from constructing
@@ -249,7 +266,7 @@ impl ZstdDictionary {
         let compressed = super::compress_whole(&bytes)?;
         let path = content_addressed_dictionary_path(&bytes);
         directory.atomic_write(std::path::Path::new(&path), &compressed)?;
-        Ok(ZstdDictionary::Loaded { path, bytes })
+        Ok(ZstdDictionary::Loaded(LoadedZstdDictionary { path, bytes }))
     }
 }
 
@@ -279,7 +296,9 @@ impl Eq for ZstdDictionary {}
 
 impl Serialize for ZstdDictionary {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("ZstdDictionary", 1)?;
         state.serialize_field("path", self.path())?;
@@ -289,7 +308,9 @@ impl Serialize for ZstdDictionary {
 
 impl<'de> Deserialize<'de> for ZstdDictionary {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         #[derive(Deserialize)]
         struct Repr {
             path: String,
@@ -553,8 +574,10 @@ mod tests {
             }
         );
         assert_eq!(
-            ZstdCompressor::deser_from_str("zstd(compression_level=15,dictionary_path=dict.bin.zst)")
-                .unwrap(),
+            ZstdCompressor::deser_from_str(
+                "zstd(compression_level=15,dictionary_path=dict.bin.zst)"
+            )
+            .unwrap(),
             ZstdCompressor {
                 compression_level: Some(15),
                 dictionary: Some(ZstdDictionary::Path("dict.bin.zst".to_string())),
@@ -579,16 +602,18 @@ mod tests {
     fn deser_zstd_rejects_unsafe_dictionary_paths() {
         // Absolute path -- `PathBuf::join` fully replaces `root_path` when the joined path is
         // absolute, so this would otherwise read/write outside the index directory entirely.
-        assert!(ZstdCompressor::deser_from_str("zstd(dictionary_path=/etc/passwd)")
-            .unwrap_err()
-            .contains("dictionary_path must be a plain path"));
+        assert!(
+            ZstdCompressor::deser_from_str("zstd(dictionary_path=/etc/passwd)")
+                .unwrap_err()
+                .contains("dictionary_path must be a plain path")
+        );
 
         // `..` traversal -- passed straight through for the OS to resolve at open time.
-        assert!(ZstdCompressor::deser_from_str(
-            "zstd(dictionary_path=../../../../etc/passwd)"
-        )
-        .unwrap_err()
-        .contains("dictionary_path must be a plain path"));
+        assert!(
+            ZstdCompressor::deser_from_str("zstd(dictionary_path=../../../../etc/passwd)")
+                .unwrap_err()
+                .contains("dictionary_path must be a plain path")
+        );
 
         // A plain relative path is still accepted.
         assert!(ZstdCompressor::deser_from_str("zstd(dictionary_path=dict.bin.zst)").is_ok());
@@ -613,7 +638,8 @@ mod tests {
         let err = serde_json::to_string(&compressor_with_comma)
             .expect_err("a ',' in dictionary_path should fail to serialize, not mis-encode");
         assert!(
-            err.to_string().contains("dictionary_path must be a plain path"),
+            err.to_string()
+                .contains("dictionary_path must be a plain path"),
             "unexpected error: {err}"
         );
 
@@ -715,7 +741,10 @@ mod tests {
         let content = b"this content does not hash to the literal path below".to_vec();
         let compressed = super::super::compression_zstd_block::compress_whole(&content).unwrap();
         directory
-            .atomic_write(std::path::Path::new("not-actually-a-hash.bin.zst"), &compressed)
+            .atomic_write(
+                std::path::Path::new("not-actually-a-hash.bin.zst"),
+                &compressed,
+            )
             .unwrap();
 
         let dict = ZstdDictionary::Path("not-actually-a-hash.bin.zst".to_string());
@@ -728,8 +757,8 @@ mod tests {
     }
 
     #[test]
-    fn zstd_dictionary_shared_literal_path_across_directories_never_serves_cross_contaminated_bytes()
-     {
+    fn zstd_dictionary_shared_literal_path_across_directories_never_serves_cross_contaminated_bytes(
+    ) {
         // Direct regression test for a reviewer-flagged scenario: two different `Directory`
         // instances (simulating two different open indexes in one process) using the same
         // non-content-addressed literal path, each with their own different bytes at that path.
@@ -787,7 +816,10 @@ mod tests {
         let directory = RamDirectory::create();
         let compressor = Compressor::Zstd(ZstdCompressor::default());
         assert!(compressor.resolve_dictionary(&directory).unwrap().is_none());
-        assert!(Compressor::None.resolve_dictionary(&directory).unwrap().is_none());
+        assert!(Compressor::None
+            .resolve_dictionary(&directory)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
