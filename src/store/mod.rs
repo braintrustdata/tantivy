@@ -31,11 +31,16 @@
 
 mod compressors;
 mod decompressors;
+#[cfg(feature = "zstd-compression")]
+mod dictionary_cache;
 mod footer;
 mod index;
 mod reader;
 mod writer;
-pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionaryDescriptor};
+pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
+pub(crate) use self::compressors::resolve_segment_dictionary;
+#[cfg(all(feature = "zstd-compression", test))]
+pub(crate) use self::dictionary_cache::clear_for_test as clear_dictionary_cache_for_test;
 pub use self::decompressors::Decompressor;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
@@ -433,14 +438,19 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently()
-    -> crate::Result<()> {
-        // Documents this fork's invariant that a dictionary is fixed for an index's life: if
-        // that's ever violated anyway (bug, race, manual meta.json edit), stacking's
-        // eligibility check only compares `Decompressor` (compressor family), which can't see
-        // a dictionary change -- rotating the dictionary between two commits should therefore
-        // force the decompress/recompress merge path (so the dictionary's own zstd checksum
-        // fires) rather than silently stacking blocks compressed against a stale dictionary.
+    fn test_merge_recompresses_correctly_when_dictionary_rotates() -> crate::Result<()> {
+        // A dictionary is meant to be fixed for an index's life, but if it's ever changed anyway
+        // (bug, race, manual meta.json edit, or a deliberate migration), a merge over segments
+        // written under the old dictionary must never raw-copy their blocks (stacking) into a
+        // merged segment declared under the new one -- `SegmentReader::open` resolves each
+        // segment's *own* recorded dictionary correctly (`SegmentMeta::docstore_dictionary_path`),
+        // so decompressing old segments still works; what must not happen is skipping that
+        // decompression step and shipping dict_a-compressed bytes under a dict_b label. The
+        // eligibility check forces the decompress/recompress path whenever a segment's recorded
+        // dictionary doesn't match the merge target's, so the merge below succeeds *and*
+        // correctly migrates every document to the new dictionary -- this is only correct
+        // because recompression actually happens; assert that explicitly via the stacked-segment
+        // count, not just that the merge didn't error.
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
@@ -452,19 +462,25 @@ pub mod tests {
         // `ManagedDirectory` gets registered and becomes eligible for the automatic
         // post-commit GC (`SegmentUpdater::list_files` only protects segment files + meta.json),
         // which would otherwise delete an unrelated sibling file like the dictionary blob.
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        let dict_b =
-            super::compression_zstd_block::compress_whole(b"an entirely different dictionary")?;
-        ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
-        ram_directory.atomic_write(Path::new("dict_b.bin.zst"), &dict_b)?;
+        // `seed` writes under a content-addressed name and hands back a `Loaded` value; grab just
+        // the path and construct a fresh `Path` for settings, matching what a real `meta.json`
+        // deserialize would produce (never `Loaded` -- bytes are never persisted).
+        let dict_a_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
+        let dict_b_path = ZstdDictionary::seed(
+            &ram_directory,
+            Arc::from(b"an entirely different dictionary".as_slice()),
+        )?
+        .path()
+        .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict_a.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path(dict_a_path)),
             }),
             ..Default::default()
         };
@@ -494,9 +510,7 @@ pub mod tests {
         // way to prevent this in-process.
         index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionaryDescriptor {
-                path: "dict_b.bin.zst".to_string(),
-            }),
+            dictionary: Some(ZstdDictionary::Path(dict_b_path)),
         });
 
         // Drive the merge directly through `IndexMerger`/`SegmentSerializer`, the same building
@@ -514,43 +528,53 @@ pub mod tests {
         let merged_segment = index.new_segment();
         let segment_serializer =
             crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
         let merge_result = merger.write(segment_serializer, None);
         assert!(
-            merge_result.is_err(),
-            "merge should fail loudly (dictionary checksum mismatch) when the dictionary \
-             changed underneath it, not silently stack mismatched blocks into the merged \
-             segment; got {merge_result:?}"
+            merge_result.is_ok(),
+            "merge should succeed -- decompressing each segment with its own recorded \
+             dictionary and recompressing under the new one is a correct migration, not \
+             corruption; got {merge_result:?}"
+        );
+        assert_eq!(
+            crate::indexer::merger::take_stacked_segments_for_test(),
+            0,
+            "correctness here depends entirely on the recompress path actually running -- \
+             neither segment may take the raw-copy stacking shortcut when its recorded \
+             dictionary doesn't match the target's"
         );
         Ok(())
     }
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn test_merge_with_dictionary_removed_fails_loud_instead_of_stacking_silently()
-    -> crate::Result<()> {
-        // Mirror image of `test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently`:
-        // the stacking-eligibility guard used to only check whether the merge *target* currently
-        // has a dictionary configured (`store_writer.compressor().has_dictionary()`), so
+    fn test_merge_recompresses_correctly_when_dictionary_removed() -> crate::Result<()> {
+        // Mirror image of `test_merge_recompresses_correctly_when_dictionary_rotates`: the
+        // stacking-eligibility guard used to only check whether the merge *target* currently has
+        // a dictionary configured (`store_writer.compressor().has_dictionary()`), so
         // Some(dict) -> None went undetected -- the target's `has_dictionary()` is `false`, so
-        // the guard never fires, and blocks physically compressed against `dict_a` get raw-copied
-        // into a merged segment whose settings now say "no dictionary". This asserts the fix:
-        // comparing the segment's own recorded dictionary-use flag against the target's current
-        // setting, in both directions.
+        // the guard never fired, and blocks physically compressed against `dict_a` got raw-copied
+        // into a merged segment whose settings now said "no dictionary" -- real corruption, since
+        // nothing would have decompressed them correctly. The fix compares the segment's own
+        // recorded dictionary path/flag against the target's current setting, in both
+        // directions, forcing recompress here too -- which now means each segment is correctly
+        // decompressed with its own dict_a and recompressed with no dictionary at all: a correct
+        // migration, not corruption. Assert that recompression actually ran, not just success.
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict_a = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        ram_directory.atomic_write(Path::new("dict_a.bin.zst"), &dict_a)?;
+        let dict_a_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict_a.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path(dict_a_path)),
             }),
             ..Default::default()
         };
@@ -594,12 +618,20 @@ pub mod tests {
         let merged_segment = index.new_segment();
         let segment_serializer =
             crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
+        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
         let merge_result = merger.write(segment_serializer, None);
         assert!(
-            merge_result.is_err(),
-            "merge should fail loudly (dictionary checksum mismatch) when the dictionary was \
-             removed underneath it, not silently stack dictionary-compressed blocks into a \
-             merged segment declared to have no dictionary; got {merge_result:?}"
+            merge_result.is_ok(),
+            "merge should succeed -- decompressing each segment with its own recorded \
+             dict_a and recompressing with no dictionary is a correct migration, not \
+             corruption; got {merge_result:?}"
+        );
+        assert_eq!(
+            crate::indexer::merger::take_stacked_segments_for_test(),
+            0,
+            "correctness here depends entirely on the recompress path actually running -- \
+             neither segment may take the raw-copy stacking shortcut when its recorded \
+             dictionary doesn't match the target's"
         );
         Ok(())
     }
@@ -619,16 +651,16 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
+        let dict_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path(dict_path)),
             }),
             ..Default::default()
         };
@@ -692,16 +724,16 @@ pub mod tests {
         let schema = schema_builder.build();
 
         // See the rotation test above for why this is written to the raw, unwrapped directory.
+        clear_dictionary_cache_for_test();
         let ram_directory = RamDirectory::create();
-        let dict = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
-        ram_directory.atomic_write(Path::new("dict.bin.zst"), &dict)?;
+        let dict_path = ZstdDictionary::seed(&ram_directory, Arc::from(LOREM.as_bytes()))?
+            .path()
+            .to_string();
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: "dict.bin.zst".to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path(dict_path.clone())),
             }),
             ..Default::default()
         };
@@ -720,7 +752,7 @@ pub mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(
             segments[0].meta().docstore_dictionary_path(),
-            Some("dict.bin.zst")
+            Some(dict_path.as_str())
         );
 
         // Sanity: the document is actually readable back through the recorded dictionary.
@@ -755,15 +787,21 @@ pub mod tests {
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
 
-        let dict_path = "dict.bin.zst";
-        let dict_bytes = super::compression_zstd_block::compress_whole(LOREM.as_bytes())?;
+        clear_dictionary_cache_for_test();
+        // Compute the content-addressed name via a throwaway directory -- the real write below
+        // goes through the actual index's managed directory, which is the whole point of this
+        // test; this is just to get the correct name without a chicken-and-egg problem (settings
+        // need the path before the index exists to write through its own managed directory).
+        let dict_bytes: Arc<[u8]> = Arc::from(LOREM.as_bytes());
+        let dict_path = ZstdDictionary::seed(&RamDirectory::create(), dict_bytes.clone())?
+            .path()
+            .to_string();
+        let dict_compressed = super::compression_zstd_block::compress_whole(&dict_bytes)?;
 
         let settings = IndexSettings {
             docstore_compression: Compressor::Zstd(ZstdCompressor {
                 compression_level: None,
-                dictionary: Some(ZstdDictionaryDescriptor {
-                    path: dict_path.to_string(),
-                }),
+                dictionary: Some(ZstdDictionary::Path(dict_path.clone())),
             }),
             ..Default::default()
         };
@@ -777,7 +815,7 @@ pub mod tests {
         // raw pre-wrap directory the way the rotation test above does.
         index
             .directory()
-            .atomic_write(Path::new(dict_path), &dict_bytes)?;
+            .atomic_write(Path::new(&dict_path), &dict_compressed)?;
 
         {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
@@ -790,9 +828,105 @@ pub mod tests {
         }
 
         assert!(
-            index.directory().exists(Path::new(dict_path))?,
+            index.directory().exists(Path::new(&dict_path))?,
             "dictionary file seeded through the managed directory was garbage collected on the \
              very next commit"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn test_gc_retains_old_segments_dictionary_after_rotation() -> crate::Result<()> {
+        // Regression test for a gap the per-segment dictionary read fix (see the rotation/removal
+        // tests above) introduced: `SegmentReader::open` reads a segment back using its own
+        // frozen `SegmentMeta::docstore_dictionary_path`, not the index's current setting -- so a
+        // segment written under dict_a still needs dict_a's file on disk even after the index
+        // rotates to dict_b, until that segment is merged away. `SegmentUpdater::list_files` (the
+        // GC live-file set) must protect every live segment's own recorded dictionary, not just
+        // the index's current one, or GC sweeps dict_a out from under a still-live segment on the
+        // very next commit -- and the next read or merge-recompress fails with `NotFound`.
+        clear_dictionary_cache_for_test();
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        let dict_a_bytes: Arc<[u8]> = Arc::from(LOREM.as_bytes());
+        let dict_b_bytes: Arc<[u8]> = Arc::from(b"an entirely different dictionary".as_slice());
+        // Compute the content-addressed names via throwaway directories -- see the
+        // managed-directory GC test above for why (settings need the path before the real
+        // index/managed directory exist to write through).
+        let dict_a_path = ZstdDictionary::seed(&RamDirectory::create(), dict_a_bytes.clone())?
+            .path()
+            .to_string();
+        let dict_b_path = ZstdDictionary::seed(&RamDirectory::create(), dict_b_bytes.clone())?
+            .path()
+            .to_string();
+        let dict_a_compressed = super::compression_zstd_block::compress_whole(&dict_a_bytes)?;
+        let dict_b_compressed = super::compression_zstd_block::compress_whole(&dict_b_bytes)?;
+
+        // Unlike the rotation/removal tests above, this test seeds dictionaries *through* the
+        // managed directory (`index.directory()`), not the raw pre-wrap one. That's deliberate:
+        // `ManagedDirectory::garbage_collect` only ever considers deleting files it registered as
+        // managed in the first place (`atomic_write`/`open_write` on the wrapped directory does
+        // that registration) -- a file written pre-wrap, like the rotation tests above do
+        // specifically to *dodge* GC registration, is invisible to GC and could never be swept
+        // regardless of `list_files`. To actually exercise the sweep hazard this test guards
+        // against, the dictionary must be a real GC candidate.
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionary::Path(dict_a_path.clone())),
+            }),
+            ..Default::default()
+        };
+        let mut index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+        index
+            .directory()
+            .atomic_write(Path::new(&dict_a_path), &dict_a_compressed)?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            index_writer
+                .add_document(doc!(text_field=> LOREM))
+                .expect("add_document 1 failed");
+            index_writer.commit().expect("commit 1 failed");
+        }
+
+        // Rotate to dict_b -- the segment committed above is still recorded as using dict_a.
+        index
+            .directory()
+            .atomic_write(Path::new(&dict_b_path), &dict_b_compressed)?;
+        index.settings_mut().docstore_compression = Compressor::Zstd(ZstdCompressor {
+            compression_level: None,
+            dictionary: Some(ZstdDictionary::Path(dict_b_path)),
+        });
+
+        {
+            // The commit below is what triggers the post-commit `garbage_collect_files` pass
+            // under test -- the mechanism that used to only protect the *current* dictionary.
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+            index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            index_writer
+                .add_document(doc!(text_field=> LOREM))
+                .expect("add_document 2 failed");
+            index_writer.commit().expect("commit 2 failed");
+        }
+
+        assert_eq!(
+            index.searchable_segment_ids()?.len(),
+            2,
+            "test assumes no merge happened yet -- the first segment should still be live and \
+             still depend on dict_a"
+        );
+        assert!(
+            index.directory().exists(Path::new(&dict_a_path))?,
+            "dict_a was garbage collected while a live, not-yet-merged segment still recorded \
+             it as its own dictionary"
         );
 
         Ok(())

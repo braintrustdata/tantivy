@@ -472,18 +472,31 @@ impl SegmentUpdater {
     /// This does not include lock files, or files that are obsolete
     /// but have not yet been deleted by the garbage collector.
     fn list_files(&self) -> HashSet<PathBuf> {
-        let mut files: HashSet<PathBuf> = self
-            .index
-            .list_all_segment_metas()
-            .into_iter()
-            .flat_map(|segment_meta| self.index.list_segment_files(&segment_meta))
+        let segment_metas = self.index.list_all_segment_metas();
+        let mut files: HashSet<PathBuf> = segment_metas
+            .iter()
+            .flat_map(|segment_meta| self.index.list_segment_files(segment_meta))
             .collect();
         files.insert(META_FILEPATH.to_path_buf());
-        // The dictionary is a sibling asset referenced by path from `IndexSettings`, not from
-        // any segment's file list -- without this it's invisible to GC and gets swept the first
-        // time it's written through a `ManagedDirectory` (e.g. `Index::directory().atomic_write`).
+        // The dictionary is a sibling asset referenced by path from `IndexSettings`/`SegmentMeta`,
+        // not from any segment's file list -- without this it's invisible to GC and gets swept
+        // the first time it's written through a `ManagedDirectory` (e.g.
+        // `Index::directory().atomic_write`).
         if let Some(dict_path) = self.index.settings().docstore_compression.dictionary_path() {
             files.insert(PathBuf::from(dict_path));
+        }
+        // Each live segment's *own* recorded dictionary must also be protected, not just the
+        // index's *current* setting: `SegmentReader::open` reads a segment back using its own
+        // frozen `SegmentMeta::docstore_dictionary_path` (see `index/segment_reader.rs`), which
+        // can name a stale dictionary if the index's setting was rotated/removed after that
+        // segment was written but before it's merged away. Without this, GC would sweep the old
+        // dictionary file while a live, not-yet-merged segment still depends on it, and the next
+        // read or merge-recompress would fail with `NotFound` instead of succeeding (or failing
+        // loud via checksum, the intended failure mode for a real mismatch).
+        for segment_meta in &segment_metas {
+            if let Some(dict_path) = segment_meta.docstore_dictionary_path() {
+                files.insert(PathBuf::from(dict_path));
+            }
         }
         files
     }
