@@ -1,9 +1,9 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
 use common::file_slice::FileSlice;
-use common::{BinarySerializable, FixedSize, HasLen, OwnedBytes};
+use common::{BinarySerializable, CountingWriter, FixedSize, HasLen, OwnedBytes};
 use tantivy_bitpacker::{compute_num_bits, BitPacker};
 use tantivy_fst::raw::Fst;
 use tantivy_fst::{IntoStreamer, Map, MapBuilder, Streamer};
@@ -252,6 +252,34 @@ pub(crate) struct BlockMeta {
     pub block_addr: BlockAddr,
 }
 
+/// Scratch outputs used to build an SSTable index without retaining all block
+/// boundary keys in memory.
+pub struct SSTableIndexScratchFiles {
+    fst: Box<dyn SSTableIndexScratch>,
+    block_metas: Box<dyn SSTableIndexScratch>,
+    block_addrs: Box<dyn SSTableIndexScratch>,
+}
+
+impl SSTableIndexScratchFiles {
+    pub fn new(
+        fst: Box<dyn SSTableIndexScratch>,
+        block_metas: Box<dyn SSTableIndexScratch>,
+        block_addrs: Box<dyn SSTableIndexScratch>,
+    ) -> Self {
+        Self {
+            fst,
+            block_metas,
+            block_addrs,
+        }
+    }
+}
+
+/// A temporary output that can be copied from its beginning after it has been
+/// written.
+pub trait SSTableIndexScratch: Write + Send {
+    fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64>;
+}
+
 impl BinarySerializable for BlockStartAddr {
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         let start = self.byte_range_start as u64;
@@ -298,53 +326,167 @@ fn find_shorter_str_in_between(left: &mut Vec<u8>, right: &[u8]) {
     }
 }
 
-#[derive(Default)]
 pub struct SSTableIndexBuilder {
-    blocks: Vec<BlockMeta>,
+    inner: SSTableIndexBuilderInner,
+}
+
+enum SSTableIndexBuilderInner {
+    Deferred(Vec<BlockMeta>),
+    Streaming(StreamingSSTableIndexBuilder),
+}
+
+struct StreamingSSTableIndexBuilder {
+    fst_builder: Option<MapBuilder<CountingWriter<BufWriter<Box<dyn SSTableIndexScratch>>>>>,
+    block_store_writer: BlockAddrStoreWriter,
+    pending_block: Option<BlockMeta>,
+    num_finalized_blocks: u64,
+}
+
+impl Default for SSTableIndexBuilder {
+    fn default() -> Self {
+        Self {
+            inner: SSTableIndexBuilderInner::Deferred(Vec::new()),
+        }
+    }
 }
 
 impl SSTableIndexBuilder {
+    pub(crate) fn new_with_scratch(scratch: SSTableIndexScratchFiles) -> io::Result<Self> {
+        let fst_writer = CountingWriter::wrap(BufWriter::new(scratch.fst));
+        let fst_builder = MapBuilder::new(fst_writer).map_err(fst_error_to_io_error)?;
+        Ok(Self {
+            inner: SSTableIndexBuilderInner::Streaming(StreamingSSTableIndexBuilder {
+                fst_builder: Some(fst_builder),
+                block_store_writer: BlockAddrStoreWriter::new_streaming(
+                    scratch.block_metas,
+                    scratch.block_addrs,
+                ),
+                pending_block: None,
+                num_finalized_blocks: 0,
+            }),
+        })
+    }
+
     /// In order to make the index as light as possible, we
     /// try to find a shorter alternative to the last key of the last block
     /// that is still smaller than the next key.
-    pub(crate) fn shorten_last_block_key_given_next_key(&mut self, next_key: &[u8]) {
-        if let Some(last_block) = self.blocks.last_mut() {
-            find_shorter_str_in_between(&mut last_block.last_key_or_greater, next_key);
+    pub(crate) fn shorten_last_block_key_given_next_key(
+        &mut self,
+        next_key: &[u8],
+    ) -> io::Result<()> {
+        match &mut self.inner {
+            SSTableIndexBuilderInner::Deferred(blocks) => {
+                if let Some(last_block) = blocks.last_mut() {
+                    find_shorter_str_in_between(&mut last_block.last_key_or_greater, next_key);
+                }
+                Ok(())
+            }
+            SSTableIndexBuilderInner::Streaming(streaming) => {
+                streaming.finalize_pending_block(Some(next_key))
+            }
         }
     }
 
     pub fn add_block(&mut self, last_key: &[u8], byte_range: Range<usize>, first_ordinal: u64) {
-        self.blocks.push(BlockMeta {
+        let block = BlockMeta {
             last_key_or_greater: last_key.to_vec(),
             block_addr: BlockAddr {
                 byte_range,
                 first_ordinal,
             },
-        })
+        };
+        match &mut self.inner {
+            SSTableIndexBuilderInner::Deferred(blocks) => blocks.push(block),
+            SSTableIndexBuilderInner::Streaming(streaming) => {
+                debug_assert!(streaming.pending_block.is_none());
+                streaming.pending_block = Some(block);
+            }
+        }
     }
 
-    pub fn serialize<W: std::io::Write>(&self, wrt: W) -> io::Result<u64> {
-        if self.blocks.len() <= 1 {
+    pub fn serialize<W: Write>(&self, wrt: W) -> io::Result<u64> {
+        match &self.inner {
+            SSTableIndexBuilderInner::Deferred(blocks) => serialize_deferred(blocks, wrt),
+            SSTableIndexBuilderInner::Streaming(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "streaming SSTable indexes are serialized by their owning writer",
+            )),
+        }
+    }
+
+    pub(crate) fn serialize_for_writer<W: Write>(&mut self, wrt: W) -> io::Result<u64> {
+        match &mut self.inner {
+            SSTableIndexBuilderInner::Deferred(blocks) => serialize_deferred(blocks, wrt),
+            SSTableIndexBuilderInner::Streaming(streaming) => streaming.serialize(wrt),
+        }
+    }
+}
+
+fn serialize_deferred<W: Write>(blocks: &[BlockMeta], wrt: W) -> io::Result<u64> {
+    if blocks.len() <= 1 {
+        return Ok(0);
+    }
+    let counting_writer = CountingWriter::wrap(wrt);
+    let mut map_builder = MapBuilder::new(counting_writer).map_err(fst_error_to_io_error)?;
+    for (i, block) in blocks.iter().enumerate() {
+        map_builder
+            .insert(&block.last_key_or_greater, i as u64)
+            .map_err(fst_error_to_io_error)?;
+    }
+    let counting_writer = map_builder.into_inner().map_err(fst_error_to_io_error)?;
+    let written_bytes = counting_writer.written_bytes();
+    let mut wrt = counting_writer.finish();
+
+    let mut block_store_writer = BlockAddrStoreWriter::new();
+    for block in blocks {
+        block_store_writer.write_block_meta(block.block_addr.clone())?;
+    }
+    block_store_writer.serialize(&mut wrt)?;
+
+    Ok(written_bytes)
+}
+
+impl StreamingSSTableIndexBuilder {
+    fn finalize_pending_block(&mut self, next_key: Option<&[u8]>) -> io::Result<()> {
+        let Some(mut block) = self.pending_block.take() else {
+            return Ok(());
+        };
+        if let Some(next_key) = next_key {
+            find_shorter_str_in_between(&mut block.last_key_or_greater, next_key);
+        }
+        self.fst_builder
+            .as_mut()
+            .expect("streaming SSTable index builder already serialized")
+            .insert(&block.last_key_or_greater, self.num_finalized_blocks)
+            .map_err(fst_error_to_io_error)?;
+        self.block_store_writer.write_block_meta(block.block_addr)?;
+        self.num_finalized_blocks += 1;
+        Ok(())
+    }
+
+    fn serialize<W: Write>(&mut self, mut wrt: W) -> io::Result<u64> {
+        // A dictionary with zero or one block deliberately has no index in the
+        // v3 format. The FST scratch header is discarded in that case.
+        if self.num_finalized_blocks == 0 {
             return Ok(0);
         }
-        let counting_writer = common::CountingWriter::wrap(wrt);
-        let mut map_builder = MapBuilder::new(counting_writer).map_err(fst_error_to_io_error)?;
-        for (i, block) in self.blocks.iter().enumerate() {
-            map_builder
-                .insert(&block.last_key_or_greater, i as u64)
-                .map_err(fst_error_to_io_error)?;
-        }
-        let counting_writer = map_builder.into_inner().map_err(fst_error_to_io_error)?;
-        let written_bytes = counting_writer.written_bytes();
-        let mut wrt = counting_writer.finish();
+        self.finalize_pending_block(None)?;
 
-        let mut block_store_writer = BlockAddrStoreWriter::new();
-        for block in &self.blocks {
-            block_store_writer.write_block_meta(block.block_addr.clone())?;
-        }
-        block_store_writer.serialize(&mut wrt)?;
+        let fst_builder = self
+            .fst_builder
+            .take()
+            .expect("streaming SSTable index builder serialized twice");
+        let fst_writer = fst_builder.into_inner().map_err(fst_error_to_io_error)?;
+        let fst_len = fst_writer.written_bytes();
+        let mut fst_scratch = fst_writer
+            .finish()
+            .into_inner()
+            .map_err(|error| error.into_error())?;
+        let copied_fst_len = fst_scratch.copy_into(&mut wrt)?;
+        debug_assert_eq!(copied_fst_len, fst_len);
+        self.block_store_writer.serialize(&mut wrt)?;
 
-        Ok(written_bytes)
+        Ok(fst_len)
     }
 }
 
@@ -683,17 +825,102 @@ fn binary_search(max: u64, cmp_fn: impl Fn(u64) -> std::cmp::Ordering) -> Result
     Err(left)
 }
 
+trait IndexOutput: Write {
+    fn written_bytes(&self) -> u64;
+    fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64>;
+}
+
+#[derive(Default)]
+struct MemoryIndexOutput(Vec<u8>);
+
+impl Write for MemoryIndexOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.extend_from_slice(buf);
+        Ok(())
+    }
+}
+
+impl IndexOutput for MemoryIndexOutput {
+    fn written_bytes(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64> {
+        output.write_all(&self.0)?;
+        Ok(self.0.len() as u64)
+    }
+}
+
+struct ScratchIndexOutput {
+    scratch: BufWriter<Box<dyn SSTableIndexScratch>>,
+    written_bytes: u64,
+}
+
+impl Write for ScratchIndexOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.scratch.write(buf)?;
+        self.written_bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.scratch.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.scratch.write_all(buf)?;
+        self.written_bytes += buf.len() as u64;
+        Ok(())
+    }
+}
+
+impl IndexOutput for ScratchIndexOutput {
+    fn written_bytes(&self) -> u64 {
+        self.written_bytes
+    }
+
+    fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64> {
+        self.scratch.flush()?;
+        self.scratch.get_mut().copy_into(output)
+    }
+}
+
 struct BlockAddrStoreWriter {
-    buffer_block_metas: Vec<u8>,
-    buffer_addrs: Vec<u8>,
+    buffer_block_metas: Box<dyn IndexOutput>,
+    buffer_addrs: Box<dyn IndexOutput>,
     block_addrs: Vec<BlockAddr>,
 }
 
 impl BlockAddrStoreWriter {
     fn new() -> Self {
         BlockAddrStoreWriter {
-            buffer_block_metas: Vec::new(),
-            buffer_addrs: Vec::new(),
+            buffer_block_metas: Box::new(MemoryIndexOutput::default()),
+            buffer_addrs: Box::new(MemoryIndexOutput::default()),
+            block_addrs: Vec::with_capacity(STORE_BLOCK_LEN),
+        }
+    }
+
+    fn new_streaming(
+        block_metas: Box<dyn SSTableIndexScratch>,
+        block_addrs: Box<dyn SSTableIndexScratch>,
+    ) -> Self {
+        BlockAddrStoreWriter {
+            buffer_block_metas: Box::new(ScratchIndexOutput {
+                scratch: BufWriter::new(block_metas),
+                written_bytes: 0,
+            }),
+            buffer_addrs: Box::new(ScratchIndexOutput {
+                scratch: BufWriter::new(block_addrs),
+                written_bytes: 0,
+            }),
             block_addrs: Vec::with_capacity(STORE_BLOCK_LEN),
         }
     }
@@ -736,7 +963,7 @@ impl BlockAddrStoreWriter {
         let ordinal_shift = 1 << (first_ordinal_nbits - 1);
 
         let block_addr_block_meta = BlockAddrBlockMetadata {
-            offset: self.buffer_addrs.len() as u64,
+            offset: self.buffer_addrs.written_bytes(),
             ref_block_addr: ref_block_addr.to_block_start(),
             range_start_slope,
             first_ordinal_slope,
@@ -746,7 +973,7 @@ impl BlockAddrStoreWriter {
             range_shift,
             ordinal_shift,
         };
-        block_addr_block_meta.serialize(&mut self.buffer_block_metas)?;
+        block_addr_block_meta.serialize(&mut *self.buffer_block_metas)?;
 
         let mut bit_packer = BitPacker::new();
 
@@ -755,13 +982,13 @@ impl BlockAddrStoreWriter {
             bit_packer.write(
                 (block_addr.byte_range.start as i64 - range_pred + range_shift) as u64,
                 range_start_nbits,
-                &mut self.buffer_addrs,
+                &mut *self.buffer_addrs,
             )?;
             let first_ordinal_pred = (first_ordinal_slope as u64 * i as u64) as i64;
             bit_packer.write(
                 (block_addr.first_ordinal as i64 - first_ordinal_pred + ordinal_shift) as u64,
                 first_ordinal_nbits,
-                &mut self.buffer_addrs,
+                &mut *self.buffer_addrs,
             )?;
         }
 
@@ -769,9 +996,9 @@ impl BlockAddrStoreWriter {
         bit_packer.write(
             (last_block_addr.byte_range.end as i64 - range_pred + range_shift) as u64,
             range_start_nbits,
-            &mut self.buffer_addrs,
+            &mut *self.buffer_addrs,
         )?;
-        bit_packer.flush(&mut self.buffer_addrs)?;
+        bit_packer.flush(&mut *self.buffer_addrs)?;
 
         self.block_addrs.clear();
         Ok(())
@@ -787,10 +1014,12 @@ impl BlockAddrStoreWriter {
 
     fn serialize<W: std::io::Write>(&mut self, wrt: &mut W) -> io::Result<()> {
         self.flush_block()?;
-        let len = self.buffer_block_metas.len() as u64;
+        let len = self.buffer_block_metas.written_bytes();
         len.serialize(wrt)?;
-        wrt.write_all(&self.buffer_block_metas)?;
-        wrt.write_all(&self.buffer_addrs)?;
+        let copied_meta_len = self.buffer_block_metas.copy_into(wrt)?;
+        debug_assert_eq!(copied_meta_len, len);
+        let copied_addr_len = self.buffer_addrs.copy_into(wrt)?;
+        debug_assert_eq!(copied_addr_len, self.buffer_addrs.written_bytes());
         Ok(())
     }
 }
@@ -857,13 +1086,87 @@ fn find_best_slope(elements: impl Iterator<Item = (usize, u64)> + Clone) -> (u32
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Arc;
 
     use common::file_slice::FileSlice;
     use common::OwnedBytes;
 
-    use super::{BlockAddr, SSTableIndexBuilder, SSTableIndexV3};
+    use super::{
+        BlockAddr, SSTableIndexBuilder, SSTableIndexBuilderInner, SSTableIndexScratch,
+        SSTableIndexScratchFiles, SSTableIndexV3,
+    };
     use crate::SSTableDataCorruption;
+
+    #[derive(Default)]
+    struct CountingScratch(u64);
+
+    impl Write for CountingScratch {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SSTableIndexScratch for CountingScratch {
+        fn copy_into(&mut self, _output: &mut dyn Write) -> io::Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    fn counting_scratch_files() -> SSTableIndexScratchFiles {
+        SSTableIndexScratchFiles::new(
+            Box::new(CountingScratch::default()),
+            Box::new(CountingScratch::default()),
+            Box::new(CountingScratch::default()),
+        )
+    }
+
+    #[test]
+    fn test_streaming_builder_retains_one_boundary_key() {
+        let mut builder = SSTableIndexBuilder::new_with_scratch(counting_scratch_files()).unwrap();
+        for block_id in 0usize..10_000 {
+            if block_id > 0 {
+                let first_key = format!("{block_id:08}-first");
+                builder
+                    .shorten_last_block_key_given_next_key(first_key.as_bytes())
+                    .unwrap();
+            }
+            let last_key = format!("{block_id:08}-last");
+            builder.add_block(
+                last_key.as_bytes(),
+                block_id * 10..block_id * 10 + 10,
+                block_id as u64,
+            );
+        }
+
+        let SSTableIndexBuilderInner::Streaming(streaming) = &builder.inner else {
+            unreachable!();
+        };
+        assert_eq!(streaming.num_finalized_blocks, 9_999);
+        assert_eq!(
+            streaming
+                .pending_block
+                .as_ref()
+                .unwrap()
+                .last_key_or_greater,
+            b"00009999-last"
+        );
+        assert!(streaming.block_store_writer.block_addrs.len() < super::STORE_BLOCK_LEN);
+        assert!(
+            streaming
+                .fst_builder
+                .as_ref()
+                .unwrap()
+                .get_ref()
+                .written_bytes()
+                > 0
+        );
+    }
 
     #[test]
     fn test_sstable_index() {

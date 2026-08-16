@@ -176,6 +176,14 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
         InnerTermDictBuilder::create(w).map(TermDictionaryBuilder)
     }
 
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn create_with_scratch(
+        w: W,
+        scratch: sstable::SSTableIndexScratchFiles,
+    ) -> io::Result<Self> {
+        InnerTermDictBuilder::new_with_index_scratch(w, scratch).map(TermDictionaryBuilder)
+    }
+
     /// Inserts a `(key, value)` pair in the term dictionary.
     ///
     /// *Keys have to be inserted in order.*

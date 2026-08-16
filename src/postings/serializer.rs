@@ -104,11 +104,18 @@ impl TempFieldWrite {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "temp postings file closed"))
     }
 
-    pub(crate) fn copy_into<W: Write>(&mut self, output: &mut W) -> io::Result<u64> {
+    pub(crate) fn copy_into<W: Write + ?Sized>(&mut self, output: &mut W) -> io::Result<u64> {
         let file = self.file_mut()?;
         file.flush()?;
         file.rewind()?;
         io::copy(file, output)
+    }
+}
+
+#[cfg(feature = "quickwit")]
+impl sstable::SSTableIndexScratch for TempFieldWrite {
+    fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64> {
+        TempFieldWrite::copy_into(self, output)
     }
 }
 
@@ -228,11 +235,68 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         positions_write: &'a mut CountingWriter<W>,
         fieldnorm_reader: Option<FieldNormReader>,
     ) -> io::Result<FieldSerializer<'a, W>> {
+        let term_dictionary_builder = TermDictionaryBuilder::create(term_dictionary_write)?;
+        Self::create_with_term_dictionary_builder(
+            field_type,
+            total_num_tokens,
+            term_dictionary_builder,
+            postings_write,
+            positions_write,
+            fieldnorm_reader,
+        )
+    }
+
+    pub(crate) fn create_with_scratch(
+        field_type: &FieldType,
+        total_num_tokens: u64,
+        term_dictionary_write: &'a mut CountingWriter<W>,
+        postings_write: &'a mut CountingWriter<W>,
+        positions_write: &'a mut CountingWriter<W>,
+        fieldnorm_reader: Option<FieldNormReader>,
+        scratch_temp_root: Option<&Path>,
+    ) -> io::Result<FieldSerializer<'a, W>> {
+        #[cfg(not(feature = "quickwit"))]
+        let term_dictionary_builder = {
+            let _ = scratch_temp_root;
+            TermDictionaryBuilder::create(term_dictionary_write)?
+        };
+        #[cfg(feature = "quickwit")]
+        let scratch = sstable::SSTableIndexScratchFiles::new(
+            Box::new(TempFieldWrite::create("term-index-fst", scratch_temp_root)?),
+            Box::new(TempFieldWrite::create(
+                "term-index-block-metas",
+                scratch_temp_root,
+            )?),
+            Box::new(TempFieldWrite::create(
+                "term-index-block-addrs",
+                scratch_temp_root,
+            )?),
+        );
+        #[cfg(feature = "quickwit")]
+        let term_dictionary_builder =
+            TermDictionaryBuilder::create_with_scratch(term_dictionary_write, scratch)?;
+        Self::create_with_term_dictionary_builder(
+            field_type,
+            total_num_tokens,
+            term_dictionary_builder,
+            postings_write,
+            positions_write,
+            fieldnorm_reader,
+        )
+    }
+
+    fn create_with_term_dictionary_builder(
+        field_type: &FieldType,
+        total_num_tokens: u64,
+        term_dictionary_builder: TermDictionaryBuilder<&'a mut CountingWriter<W>>,
+        postings_write: &'a mut CountingWriter<W>,
+        positions_write: &'a mut CountingWriter<W>,
+        fieldnorm_reader: Option<FieldNormReader>,
+    ) -> io::Result<FieldSerializer<'a, W>> {
         total_num_tokens.serialize(postings_write)?;
         let index_record_option = field_type
             .index_record_option()
             .unwrap_or(IndexRecordOption::Basic);
-        let term_dictionary_builder = TermDictionaryBuilder::create(term_dictionary_write)?;
         let average_fieldnorm = fieldnorm_reader
             .as_ref()
             .map(|ff_reader| (total_num_tokens as Score / ff_reader.num_docs() as Score))
@@ -583,5 +647,53 @@ impl<W: Write> PostingsSerializer<W> {
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+    }
+}
+
+#[cfg(all(test, feature = "quickwit"))]
+mod scratch_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::TempFieldWrite;
+
+    fn scratch_files(root: &Path) -> sstable::SSTableIndexScratchFiles {
+        sstable::SSTableIndexScratchFiles::new(
+            Box::new(TempFieldWrite::create("test-fst", Some(root)).unwrap()),
+            Box::new(TempFieldWrite::create("test-metas", Some(root)).unwrap()),
+            Box::new(TempFieldWrite::create("test-addrs", Some(root)).unwrap()),
+        )
+    }
+
+    fn num_files(root: &Path) -> usize {
+        fs::read_dir(root).unwrap().count()
+    }
+
+    #[test]
+    fn test_index_scratch_files_are_cleaned_up() {
+        for finish in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "tantivy-index-scratch-cleanup-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::create_dir(&root).unwrap();
+            let mut writer =
+                sstable::Writer::<_, sstable::value::VoidValueWriter>::new_with_index_scratch(
+                    Vec::new(),
+                    scratch_files(&root),
+                )
+                .unwrap();
+            writer.set_block_len(1);
+            writer.insert(b"a", &()).unwrap();
+            writer.insert(b"b", &()).unwrap();
+            assert_eq!(num_files(&root), 3);
+            if finish {
+                writer.finish().unwrap();
+            } else {
+                drop(writer);
+            }
+            assert_eq!(num_files(&root), 0);
+            fs::remove_dir(&root).unwrap();
+        }
     }
 }

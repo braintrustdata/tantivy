@@ -619,13 +619,14 @@ impl IndexMerger {
             "positions",
             scratch_temp_root.as_deref(),
         )?);
-        let mut field_serializer = FieldSerializer::create(
+        let mut field_serializer = FieldSerializer::create_with_scratch(
             field_entry.field_type(),
             total_num_tokens,
             &mut terms_write,
             &mut postings_write,
             &mut positions_write,
             fieldnorm_reader,
+            scratch_temp_root.as_deref(),
         )?;
         self.serialize_postings_into_field(
             indexed_field,
