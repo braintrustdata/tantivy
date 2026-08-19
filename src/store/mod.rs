@@ -768,6 +768,80 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
+    fn test_dictionary_is_read_only_when_the_doc_store_is() -> crate::Result<()> {
+        // A dictionary is resolved on first doc store access, never while opening a segment or
+        // building a searcher -- see `SegmentReader::store_dictionary` and
+        // `SearcherInner::store_reader` for why (dictionaries are multi-megabyte whole-file
+        // reads, and plenty of searches never touch a stored field). Deleting the dictionary out
+        // from under a committed index is the sharpest way to observe where the read actually
+        // happens: everything that doesn't read stored fields keeps working, and only the
+        // stored-field fetch fails. Before this was lazy, `index.reader()` itself failed here.
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
+        let schema = schema_builder.build();
+
+        // See the rotation test above for why the dictionary is seeded into the raw, unwrapped
+        // directory. The handle is kept around because `RamDirectory` clones share their backing
+        // storage, so the file can be deleted through it again below.
+        //
+        // The dictionary content is unique to this test, unlike the `LOREM` bytes every other
+        // dictionary test here seeds: paths are content-addressed and the decompressed-bytes
+        // cache is process-wide and keyed by path alone, so sharing content with a test running
+        // in parallel would let *its* live copy serve the read below, deleted file or not.
+        clear_dictionary_cache_for_test();
+        let ram_directory = RamDirectory::create();
+        let dict_path = ZstdDictionary::seed(
+            &ram_directory,
+            Arc::from(b"dictionary bytes unique to the lazy-doc-store-read test".as_slice()),
+        )?
+        .path()
+        .to_string();
+        let settings = IndexSettings {
+            docstore_compression: Compressor::Zstd(ZstdCompressor {
+                compression_level: None,
+                dictionary: Some(ZstdDictionary::Path(dict_path.clone())),
+            }),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .open_or_create(ram_directory.clone())?;
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field=> LOREM))?;
+            index_writer.commit()?;
+        }
+
+        // Both the file and the process-wide cache of its decompressed bytes have to go: the
+        // cache would otherwise still serve the write path's copy, and this test would pass
+        // whether or not anything ever read the file.
+        ram_directory
+            .delete(Path::new(&dict_path))
+            .expect("deleting the seeded dictionary should succeed");
+        clear_dictionary_cache_for_test();
+
+        // Opening the reader, and every search that stays out of the doc store, is unaffected.
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.num_docs(), 1);
+        assert_eq!(
+            searcher.search(&crate::query::AllQuery, &crate::collector::Count)?,
+            1
+        );
+
+        let err = searcher
+            .doc::<TantivyDocument>(crate::DocAddress::new(0u32, 0u32))
+            .expect_err("reading a stored field is what needs the dictionary, and it is gone");
+        assert!(
+            matches!(&err, crate::TantivyError::IoError(io_error)
+                if io_error.kind() == std::io::ErrorKind::NotFound),
+            "expected a NotFound io error naming the deleted dictionary, got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
     fn test_dictionary_written_through_managed_directory_survives_post_commit_gc()
     -> crate::Result<()> {
         // Regression test for a managed-directory GC hazard: seeding the dictionary blob via
