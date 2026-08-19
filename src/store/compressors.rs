@@ -180,6 +180,29 @@ impl ZstdDictionary {
         }
     }
 
+    /// [`ZstdDictionary::load`], for callers on an async runtime: the dictionary file is read via
+    /// `Directory::atomic_read_async` instead of blocking the calling thread, so the read can
+    /// overlap with whatever else that caller is doing (in practice: the doc store's own footer
+    /// and skip index reads, which share nothing with this).
+    ///
+    /// Only the read differs. Path validation, the process-wide cache lookup, and the
+    /// decompress-and-verify tail are the same code as the blocking path (see `load_internal`
+    /// and `load_internal_async`) -- those are where a divergence between the two would be a
+    /// correctness bug, so they are deliberately not duplicated.
+    ///
+    /// Note that the decompression and the content-hash verification still run on the calling
+    /// task; they are CPU-bound and cannot be awaited. That is a deliberate trade: for a
+    /// multi-megabyte dictionary they cost a small fraction of the read they follow.
+    pub async fn load_async(
+        &self,
+        directory: &dyn crate::Directory,
+    ) -> io::Result<std::sync::Arc<[u8]>> {
+        match self {
+            ZstdDictionary::Loaded(loaded) => Ok(loaded.bytes.clone()),
+            ZstdDictionary::Path(path) => Self::load_internal_async(directory, path).await,
+        }
+    }
+
     /// Reads and decompresses dictionary bytes from `path` via `directory`. The mechanical core
     /// shared by `load` (this dictionary's own path) and by segment-open resolution, which must
     /// load from a specific *segment's own recorded* path (`SegmentMeta::docstore_dictionary_path`)
@@ -190,6 +213,34 @@ impl ZstdDictionary {
         directory: &dyn crate::Directory,
         path: &str,
     ) -> io::Result<std::sync::Arc<[u8]>> {
+        if let Some(bytes) = Self::load_cached(path)? {
+            return Ok(bytes);
+        }
+        let compressed = directory
+            .atomic_read(std::path::Path::new(path))
+            .map_err(open_read_error_to_io_error)?;
+        Self::decompress_verify_and_cache(path, &compressed)
+    }
+
+    /// [`ZstdDictionary::load_internal`], awaiting the read rather than blocking on it. See
+    /// `load_async`.
+    pub(crate) async fn load_internal_async(
+        directory: &dyn crate::Directory,
+        path: &str,
+    ) -> io::Result<std::sync::Arc<[u8]>> {
+        if let Some(bytes) = Self::load_cached(path)? {
+            return Ok(bytes);
+        }
+        let compressed = directory
+            .atomic_read_async(std::path::Path::new(path))
+            .await
+            .map_err(open_read_error_to_io_error)?;
+        Self::decompress_verify_and_cache(path, &compressed)
+    }
+
+    /// Everything the blocking and awaiting loads do *before* the read: validate the path, then
+    /// try the process-wide cache. Performs no I/O, so both paths share it verbatim.
+    fn load_cached(path: &str) -> io::Result<Option<std::sync::Arc<[u8]>>> {
         if !Self::is_safe_and_encodable_relative_path(path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -200,31 +251,19 @@ impl ZstdDictionary {
             ));
         }
 
-        if let Some(bytes) = super::dictionary_cache::get(path) {
-            return Ok(bytes);
-        }
+        Ok(super::dictionary_cache::get(path))
+    }
 
-        let compressed = directory
-            .atomic_read(std::path::Path::new(path))
-            .map_err(|err| {
-                // Preserve `NotFound`/the original `io::Error`'s kind, rather than flattening
-                // every failure mode to `ErrorKind::Other` -- a misconfigured dictionary path
-                // should be as easy to diagnose as a typical missing-file error.
-                let kind = match &err {
-                    crate::directory::error::OpenReadError::FileDoesNotExist(_) => {
-                        io::ErrorKind::NotFound
-                    }
-                    crate::directory::error::OpenReadError::IoError { io_error, .. } => {
-                        io_error.kind()
-                    }
-                    crate::directory::error::OpenReadError::IncompatibleIndex(_) => {
-                        io::ErrorKind::InvalidData
-                    }
-                };
-                io::Error::new(kind, err.to_string())
-            })?;
+    /// Everything the blocking and awaiting loads do *after* the read: decompress, verify that
+    /// the bytes really do hash to `path`, and cache them. CPU-bound only, no I/O, so both paths
+    /// share it verbatim -- this is the half where a divergence between them would silently
+    /// weaken the cache's safety invariant.
+    fn decompress_verify_and_cache(
+        path: &str,
+        compressed: &[u8],
+    ) -> io::Result<std::sync::Arc<[u8]>> {
         let bytes: std::sync::Arc<[u8]> =
-            std::sync::Arc::from(super::decompress_whole(&compressed)?);
+            std::sync::Arc::from(super::decompress_whole(compressed)?);
 
         // The cache's whole safety argument is "the path is content-addressed, so path equality
         // implies content equality" -- but nothing stops a caller from constructing
@@ -268,6 +307,19 @@ impl ZstdDictionary {
         directory.atomic_write(std::path::Path::new(&path), &compressed)?;
         Ok(ZstdDictionary::Loaded(LoadedZstdDictionary { path, bytes }))
     }
+}
+
+/// Preserves `NotFound`/the original `io::Error`'s kind, rather than flattening every failure
+/// mode to `ErrorKind::Other` -- a misconfigured dictionary path should be as easy to diagnose as
+/// a typical missing-file error. Shared by the blocking and awaiting reads.
+#[cfg(feature = "zstd-compression")]
+fn open_read_error_to_io_error(err: crate::directory::error::OpenReadError) -> io::Error {
+    let kind = match &err {
+        crate::directory::error::OpenReadError::FileDoesNotExist(_) => io::ErrorKind::NotFound,
+        crate::directory::error::OpenReadError::IoError { io_error, .. } => io_error.kind(),
+        crate::directory::error::OpenReadError::IncompatibleIndex(_) => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, err.to_string())
 }
 
 /// Derives a content-addressed filename for a dictionary's raw bytes: identical bytes always
@@ -879,5 +931,194 @@ mod tests {
             .load(&directory)
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// Wraps a `RamDirectory` and counts which of the two read methods a caller actually took,
+    /// so a test can tell an awaited read apart from the trait's blocking default -- both return
+    /// the same bytes, so nothing else distinguishes them.
+    #[derive(Clone, Debug)]
+    struct ReadCountingDirectory {
+        inner: crate::directory::RamDirectory,
+        blocking_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        awaited_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ReadCountingDirectory {
+        fn create() -> Self {
+            Self {
+                inner: crate::directory::RamDirectory::create(),
+                blocking_reads: Default::default(),
+                awaited_reads: Default::default(),
+            }
+        }
+
+        fn blocking_reads(&self) -> usize {
+            self.blocking_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn awaited_reads(&self) -> usize {
+            self.awaited_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Directory for ReadCountingDirectory {
+        fn get_file_handle(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<std::sync::Arc<dyn crate::directory::FileHandle>, crate::directory::error::OpenReadError>
+        {
+            self.inner.get_file_handle(path)
+        }
+
+        fn delete(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), crate::directory::error::DeleteError> {
+            self.inner.delete(path)
+        }
+
+        fn exists(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<bool, crate::directory::error::OpenReadError> {
+            self.inner.exists(path)
+        }
+
+        fn open_write(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<crate::directory::WritePtr, crate::directory::error::OpenWriteError> {
+            self.inner.open_write(path)
+        }
+
+        fn atomic_read(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<Vec<u8>, crate::directory::error::OpenReadError> {
+            self.blocking_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.atomic_read(path)
+        }
+
+        async fn atomic_read_async(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<Vec<u8>, crate::directory::error::OpenReadError> {
+            self.awaited_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.atomic_read(path)
+        }
+
+        fn atomic_write(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+            self.inner.atomic_write(path, data)
+        }
+
+        fn sync_directory(&self) -> std::io::Result<()> {
+            self.inner.sync_directory()
+        }
+
+        fn watch(
+            &self,
+            watch_callback: crate::directory::WatchCallback,
+        ) -> crate::Result<crate::directory::WatchHandle> {
+            self.inner.watch(watch_callback)
+        }
+    }
+
+    #[test]
+    fn load_async_awaits_the_directorys_read_and_shares_the_cache_with_load() {
+        use std::sync::Arc;
+
+        use futures::executor::block_on;
+
+        // Dictionary content unique to this test: paths are content-addressed and the cache is
+        // process-wide and keyed by path alone, so content shared with a test running in parallel
+        // would let that test's live copy serve these lookups and the read counts below would
+        // measure nothing.
+        clear_dictionary_cache_for_test();
+        let directory = ReadCountingDirectory::create();
+        let raw_dict: Arc<[u8]> = Arc::from(b"the awaited-load test's own dictionary".to_vec());
+        let path = ZstdDictionary::seed(&directory, raw_dict.clone())
+            .unwrap()
+            .path()
+            .to_string();
+        // `seed` writes through `atomic_write`, so no read has happened yet.
+        assert_eq!(directory.blocking_reads(), 0);
+        assert_eq!(directory.awaited_reads(), 0);
+
+        // Constructed as `Path`, not the `Loaded` value `seed` returned, so the read actually
+        // happens. Bind the result: the cache is weak-ref, so dropping this would evict the entry
+        // the second half of this test depends on.
+        let dictionary = ZstdDictionary::Path(path);
+        let loaded = block_on(dictionary.load_async(&directory)).unwrap();
+        assert_eq!(loaded.as_ref(), raw_dict.as_ref());
+        assert_eq!(
+            (directory.awaited_reads(), directory.blocking_reads()),
+            (1, 0),
+            "load_async must await the directory's own read, not fall through to the trait's \
+             blocking default"
+        );
+
+        // Both loads share one cache, so the blocking path finds what the awaited path cached.
+        let loaded_again = dictionary.load(&directory).unwrap();
+        assert_eq!(loaded_again.as_ref(), raw_dict.as_ref());
+        assert_eq!(
+            (directory.awaited_reads(), directory.blocking_reads()),
+            (1, 0),
+            "a blocking load after an awaited one must be served from the shared cache, without \
+             reading again"
+        );
+    }
+
+    #[test]
+    fn load_async_on_a_directory_without_an_async_read_uses_the_blocking_default() {
+        use std::sync::Arc;
+
+        use futures::executor::block_on;
+
+        use crate::directory::RamDirectory;
+
+        // `RamDirectory` never overrides `atomic_read_async` -- its reads are local, so the
+        // trait's default (just perform the blocking read inline) is the right behavior, and
+        // `load_async` has to work on it unchanged.
+        clear_dictionary_cache_for_test();
+        let directory = RamDirectory::create();
+        let raw_dict: Arc<[u8]> =
+            Arc::from(b"the blocking-default test's own dictionary".to_vec());
+        let path = ZstdDictionary::seed(&directory, raw_dict.clone())
+            .unwrap()
+            .path()
+            .to_string();
+
+        let loaded = block_on(ZstdDictionary::Path(path).load_async(&directory)).unwrap();
+        assert_eq!(loaded.as_ref(), raw_dict.as_ref());
+    }
+
+    #[test]
+    fn load_async_verifies_the_content_hash_like_load_does() {
+        use futures::executor::block_on;
+
+        use crate::directory::{Directory, RamDirectory};
+
+        // The decompress-and-verify tail is shared between the two loads precisely so this can't
+        // diverge; assert it through the awaited path rather than trusting that by inspection.
+        clear_dictionary_cache_for_test();
+        let directory = RamDirectory::create();
+        let literal_path = "dict-not-a-real-content-hash.bin.zst";
+        directory
+            .atomic_write(
+                std::path::Path::new(literal_path),
+                &super::super::compression_zstd_block::compress_whole(
+                    b"bytes that do not hash to the name they are stored under",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let err = block_on(ZstdDictionary::Path(literal_path.to_string()).load_async(&directory))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
