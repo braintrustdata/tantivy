@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io, thread};
 
+use async_trait::async_trait;
+
 use crate::directory::directory_lock::Lock;
 use crate::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use crate::directory::{FileHandle, FileSlice, WatchCallback, WatchHandle, WritePtr};
@@ -106,6 +108,7 @@ fn retry_policy(is_blocking: bool) -> RetryPolicy {
 /// should be your default choice.
 /// - The [`RamDirectory`][crate::directory::RamDirectory], which
 /// should be used mostly for tests.
+#[async_trait]
 pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// Opens a file and returns a boxed `FileHandle`.
     ///
@@ -172,6 +175,21 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     ///
     /// You should only use this to read files create with [`Directory::atomic_write()`].
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError>;
+
+    /// [`Directory::atomic_read()`], for callers that can await the read rather than block on it.
+    ///
+    /// The default implementation just performs the blocking read inline, which is correct for
+    /// every directory whose reads are local anyway (`RamDirectory`, `MmapDirectory`). A
+    /// directory backed by remote storage should override it, so that callers on an async
+    /// runtime can overlap the read with other work instead of occupying a thread for its
+    /// duration; wrappers should forward it, or they silently downgrade an inner directory's
+    /// async read back to a blocking one.
+    ///
+    /// This mirrors `FileHandle::read_bytes_async`, the same sync/async pair one level down.
+    #[doc(hidden)]
+    async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        self.atomic_read(path)
+    }
 
     /// Atomically replace the content of a file with data.
     ///

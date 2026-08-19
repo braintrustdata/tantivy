@@ -15,6 +15,7 @@ rust-version = "1.63"
 exclude = ["benches/*.json", "benches/*.txt"]
 
 [dependencies]
+async-trait = "0.1"
 oneshot = "0.1.5"
 base64 = "0.22.0"
 byteorder = "1.4.3"

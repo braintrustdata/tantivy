@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::{io, result};
 
+use async_trait::async_trait;
 use crc32fast::Hasher;
 
 use crate::core::MANAGED_FILEPATH;
@@ -268,6 +269,7 @@ impl ManagedDirectory {
     }
 }
 
+#[async_trait]
 impl Directory for ManagedDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_slice = self.open_read(path)?;
@@ -301,6 +303,12 @@ impl Directory for ManagedDirectory {
 
     fn atomic_read(&self, path: &Path) -> result::Result<Vec<u8>, OpenReadError> {
         self.directory.atomic_read(path)
+    }
+
+    /// Forwarded rather than left to the trait's blocking default: this directory is a wrapper,
+    /// and an inner directory that reads asynchronously must not lose that just by being wrapped.
+    async fn atomic_read_async(&self, path: &Path) -> result::Result<Vec<u8>, OpenReadError> {
+        self.directory.atomic_read_async(path).await
     }
 
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
