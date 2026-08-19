@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{fmt, io};
 
+use once_cell::sync::OnceCell;
+
 use crate::collector::Collector;
 use crate::core::Executor;
 use crate::index::SegmentReader;
@@ -86,18 +88,21 @@ impl Searcher {
     /// The searcher uses the segment ordinal to route the
     /// request to the right `Segment`.
     pub fn doc<D: DocumentDeserialize>(&self, doc_address: DocAddress) -> crate::Result<D> {
-        let store_reader = &self.inner.store_readers[doc_address.segment_ord as usize];
+        let store_reader = self.inner.store_reader(doc_address.segment_ord)?;
         store_reader.get(doc_address.doc_id)
     }
 
     /// The cache stats for the underlying store reader.
     ///
-    /// Aggregates the sum for each segment store reader.
+    /// Aggregates the sum for each segment store reader. Segments whose store reader hasn't been
+    /// opened yet (see `SearcherInner::store_reader`) have no cache to report on, and contribute
+    /// nothing.
     pub fn doc_store_cache_stats(&self) -> CacheStats {
         let cache_stats: CacheStats = self
             .inner
             .store_readers
             .iter()
+            .filter_map(OnceCell::get)
             .map(|reader| reader.cache_stats())
             .sum();
         cache_stats
@@ -109,7 +114,7 @@ impl Searcher {
         &self,
         doc_address: DocAddress,
     ) -> crate::Result<D> {
-        let store_reader = &self.inner.store_readers[doc_address.segment_ord as usize];
+        let store_reader = self.inner.store_reader(doc_address.segment_ord)?;
         store_reader.get_async(doc_address.doc_id).await
     }
 
@@ -258,7 +263,14 @@ pub(crate) struct SearcherInner {
     schema: Schema,
     index: Index,
     segment_readers: Vec<SegmentReader>,
-    store_readers: Vec<StoreReader>,
+    /// One slot per segment, in `segment_readers` order, each filled on that segment's first doc
+    /// fetch (see `store_reader`). Opening a store reader is not free -- it reads the doc store's
+    /// footer and skip index, and resolves the segment's zstd dictionary if it has one (see
+    /// `SegmentReader::get_store_reader`) -- and a great many searches never fetch a stored field
+    /// at all (counts, aggregations, anything served from fast fields), so this is deferred rather
+    /// than paid for every segment up front.
+    store_readers: Vec<OnceCell<StoreReader>>,
+    doc_store_cache_num_blocks: usize,
     generation: TrackedObject<SearcherGeneration>,
 }
 
@@ -279,17 +291,27 @@ impl SearcherInner {
             generation.segments(),
             "Set of segments referenced by this Searcher and its SearcherGeneration must match"
         );
-        let store_readers: Vec<StoreReader> = segment_readers
-            .iter()
-            .map(|segment_reader| segment_reader.get_store_reader(doc_store_cache_num_blocks))
-            .collect::<io::Result<Vec<_>>>()?;
+        let store_readers = segment_readers.iter().map(|_| OnceCell::new()).collect();
 
         Ok(SearcherInner {
             schema,
             index,
             segment_readers,
             store_readers,
+            doc_store_cache_num_blocks,
             generation,
+        })
+    }
+
+    /// This segment's doc store reader, opening it on first use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `segment_ord` is out of bounds, same as the direct indexing this replaced.
+    fn store_reader(&self, segment_ord: u32) -> io::Result<&StoreReader> {
+        self.store_readers[segment_ord as usize].get_or_try_init(|| {
+            self.segment_readers[segment_ord as usize]
+                .get_store_reader(self.doc_store_cache_num_blocks)
         })
     }
 }

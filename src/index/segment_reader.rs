@@ -5,8 +5,9 @@ use std::{fmt, io};
 
 use fnv::FnvHashMap;
 use itertools::Itertools;
+use once_cell::sync::OnceCell;
 
-use crate::directory::{CompositeFile, FileSlice};
+use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
@@ -45,8 +46,22 @@ pub struct SegmentReader {
     fieldnorm_readers: FieldNormReaders,
 
     store_file: FileSlice,
-    store_dictionary: Option<Arc<[u8]>>,
+    /// Resolved lazily, on the first `get_store_reader` call -- never at open time. Dictionaries
+    /// are multi-megabyte and read whole (`Directory::atomic_read`, no lazy slicing), and the
+    /// only thing that ever needs them is the doc store; a query that touches no stored field
+    /// (a filter, a count, anything served entirely from fast fields) must not pay for one.
+    ///
+    /// `Arc`-shared, so the resolution is paid once across every clone of this reader (same
+    /// reasoning as `inv_idx_reader_cache` above). A failed load is not memoized -- `OnceCell`
+    /// only fills on success -- so a transient directory error is retried by the next reader
+    /// rather than poisoning this segment for the life of the searcher.
+    store_dictionary: Arc<OnceCell<Option<Arc<[u8]>>>>,
     store_dictionary_path: Option<String>,
+    /// Held solely to resolve `store_dictionary` above, long after `open` has returned. This is
+    /// the one segment file whose bytes aren't reachable through an already-opened `FileSlice`:
+    /// the dictionary is an index-level sibling file, named by a path recorded in this segment's
+    /// own `SegmentMeta`, so opening it lazily means keeping the directory it lives in.
+    store_directory: Arc<dyn Directory>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -162,12 +177,26 @@ impl SegmentReader {
     ///
     /// `cache_num_blocks` sets the number of decompressed blocks to be cached in an LRU.
     /// The size of blocks is configurable, this should be reflexted in the
+    ///
+    /// This is where a dictionary-compressed segment's dictionary is actually read from the
+    /// directory (see `store_dictionary`), so this call -- not `open` -- is what can fail on a
+    /// missing or corrupted dictionary file.
     pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
-        StoreReader::open(
-            self.store_file.clone(),
-            cache_num_blocks,
-            self.store_dictionary.clone(),
-        )
+        let dictionary = self.store_dictionary()?;
+        StoreReader::open(self.store_file.clone(), cache_num_blocks, dictionary)
+    }
+
+    /// This segment's doc store dictionary bytes, loading them on first use. See
+    /// `store_dictionary`'s own comment for why this is deferred rather than done in `open`.
+    fn store_dictionary(&self) -> io::Result<Option<Arc<[u8]>>> {
+        self.store_dictionary
+            .get_or_try_init(|| {
+                crate::store::resolve_segment_dictionary(
+                    &*self.store_directory,
+                    self.store_dictionary_path.as_deref(),
+                )
+            })
+            .cloned()
     }
 
     /// Open a new segment for reading.
@@ -225,11 +254,11 @@ impl SegmentReader {
         // against -- its own recorded `docstore_dictionary_path` -- not the index's *current*
         // `docstore_compression` setting, which can drift after the segment was written (rotated,
         // added, or removed). See `crate::store::resolve_segment_dictionary`.
+        //
+        // Only the path is captured here; the bytes are read on first doc store access (see
+        // `store_dictionary`), so opening a segment stays free of dictionary I/O.
         let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
-        let store_dictionary = crate::store::resolve_segment_dictionary(
-            segment.index().directory(),
-            store_dictionary_path.as_deref(),
-        )?;
+        let store_directory: Arc<dyn Directory> = Arc::new(segment.index().directory().clone());
 
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
@@ -242,8 +271,9 @@ impl SegmentReader {
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
-            store_dictionary,
+            store_dictionary: Arc::new(OnceCell::new()),
             store_dictionary_path,
+            store_directory,
             alive_bitset_opt,
             positions_composite,
             schema,
