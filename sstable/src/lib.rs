@@ -12,7 +12,10 @@ mod streamer;
 pub mod value;
 
 mod sstable_index_v3;
-pub use sstable_index_v3::{BlockAddr, SSTableIndex, SSTableIndexBuilder, SSTableIndexV3};
+pub use sstable_index_v3::{
+    BlockAddr, SSTableIndex, SSTableIndexBuilder, SSTableIndexScratch, SSTableIndexScratchFiles,
+    SSTableIndexV3,
+};
 mod sstable_index_v2;
 pub(crate) mod vint;
 pub use dictionary::Dictionary;
@@ -206,6 +209,15 @@ where
         }
     }
 
+    /// Creates a writer that spills its SSTable index construction to the
+    /// supplied scratch outputs.
+    pub fn new_with_index_scratch(wrt: W, scratch: SSTableIndexScratchFiles) -> io::Result<Self> {
+        Ok(Writer {
+            index_builder: SSTableIndexBuilder::new_with_scratch(scratch)?,
+            ..Self::new(wrt)
+        })
+    }
+
     /// Set the target block length.
     ///
     /// The delta part of a block will generally be slightly larger than the requested `block_len`,
@@ -249,7 +261,7 @@ where
         // shorten the last term in the last block.
         if self.first_ordinal_of_the_block == self.num_terms {
             self.index_builder
-                .shorten_last_block_key_given_next_key(key);
+                .shorten_last_block_key_given_next_key(key)?;
         }
         let keep_len = common_prefix_len(&self.previous_key, key);
         let add_len = key.len() - keep_len;
@@ -306,7 +318,7 @@ where
 
         let offset = wrt.written_bytes();
 
-        let fst_len: u64 = self.index_builder.serialize(&mut wrt)?;
+        let fst_len: u64 = self.index_builder.serialize_for_writer(&mut wrt)?;
         wrt.write_all(&fst_len.to_le_bytes())?;
         wrt.write_all(&offset.to_le_bytes())?;
         wrt.write_all(&self.num_terms.to_le_bytes())?;
@@ -320,12 +332,68 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::io;
+    use std::io::{self, Cursor, Seek, Write};
     use std::ops::Bound;
 
     use common::OwnedBytes;
 
-    use super::{common_prefix_len, MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable};
+    use super::value::VoidValueWriter;
+    use super::{
+        common_prefix_len, MonotonicU64SSTable, SSTable, SSTableIndexScratch,
+        SSTableIndexScratchFiles, VoidMerge, VoidSSTable, Writer,
+    };
+
+    #[derive(Default)]
+    struct MemoryScratch(Cursor<Vec<u8>>);
+
+    impl Write for MemoryScratch {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SSTableIndexScratch for MemoryScratch {
+        fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64> {
+            self.0.rewind()?;
+            io::copy(&mut self.0, output)
+        }
+    }
+
+    fn memory_scratch_files() -> SSTableIndexScratchFiles {
+        SSTableIndexScratchFiles::new(
+            Box::new(MemoryScratch::default()),
+            Box::new(MemoryScratch::default()),
+            Box::new(MemoryScratch::default()),
+        )
+    }
+
+    fn write_test_sstable(keys: &[Vec<u8>], streaming: bool) -> Vec<u8> {
+        let mut output = Vec::new();
+        if streaming {
+            let mut writer = Writer::<_, VoidValueWriter>::new_with_index_scratch(
+                &mut output,
+                memory_scratch_files(),
+            )
+            .unwrap();
+            writer.set_block_len(64);
+            for key in keys {
+                writer.insert(key, &()).unwrap();
+            }
+            writer.finish().unwrap();
+        } else {
+            let mut writer = VoidSSTable::writer(&mut output);
+            writer.set_block_len(64);
+            for key in keys {
+                writer.insert(key, &()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        output
+    }
 
     fn aux_test_common_prefix_len(left: &str, right: &str, expect_len: usize) {
         assert_eq!(
@@ -367,6 +435,45 @@ mod test {
         assert!(sstable_reader.advance().unwrap());
         assert_eq!(sstable_reader.key(), &long_key2[..]);
         assert!(!sstable_reader.advance().unwrap());
+    }
+
+    #[test]
+    fn test_streaming_index_is_byte_identical() {
+        let test_cases = [
+            Vec::new(),
+            vec![b"one term".to_vec()],
+            (0u32..300)
+                .map(|term_ord| {
+                    let mut key = vec![b'a'; 1_024];
+                    key.extend_from_slice(&term_ord.to_be_bytes());
+                    key
+                })
+                .collect(),
+            vec![vec![b'a'; 64 * 1_024], vec![b'b'; 64 * 1_024]],
+        ];
+        for keys in test_cases {
+            assert_eq!(
+                write_test_sstable(&keys, true),
+                write_test_sstable(&keys, false)
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(50))]
+        #[test]
+        fn test_streaming_index_is_byte_identical_for_random_keys(
+            keys in prop::collection::btree_set(
+                prop::collection::vec(any::<u8>(), 0..256),
+                0..200,
+            ),
+        ) {
+            let keys: Vec<Vec<u8>> = keys.into_iter().collect();
+            prop_assert_eq!(
+                write_test_sstable(&keys, true),
+                write_test_sstable(&keys, false),
+            );
+        }
     }
 
     #[test]
