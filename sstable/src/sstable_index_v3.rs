@@ -254,6 +254,10 @@ pub(crate) struct BlockMeta {
 
 /// Scratch outputs used to build an SSTable index without retaining all block
 /// boundary keys in memory.
+///
+/// The v3 index stores the FST, block metadata, and packed block addresses
+/// consecutively. They are built as separate streams here because their final
+/// order cannot be written to the SSTable until the FST is complete.
 pub struct SSTableIndexScratchFiles {
     fst: Box<dyn SSTableIndexScratch>,
     block_metas: Box<dyn SSTableIndexScratch>,
@@ -276,6 +280,9 @@ impl SSTableIndexScratchFiles {
 
 /// A temporary output that can be copied from its beginning after it has been
 /// written.
+///
+/// Implementations are expected to start empty. `copy_into` must make all
+/// preceding writes visible and copy the output from its beginning.
 pub trait SSTableIndexScratch: Write + Send {
     fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64>;
 }
@@ -331,21 +338,28 @@ pub struct SSTableIndexBuilder {
 }
 
 enum SSTableIndexBuilderInner {
-    Deferred(Vec<BlockMeta>),
+    /// Retains every block until `serialize`. This remains the default for normal indexing.
+    InMemory(Vec<BlockMeta>),
+    /// Finalizes each block as the following block begins and spills the index
+    /// streams to scratch storage.
     Streaming(StreamingSSTableIndexBuilder),
 }
 
 struct StreamingSSTableIndexBuilder {
     fst_builder: Option<MapBuilder<CountingWriter<BufWriter<Box<dyn SSTableIndexScratch>>>>>,
     block_store_writer: BlockAddrStoreWriter,
+    // A block's separator cannot be shortened until the first key of the next
+    // block is known. Keeping only that block pending avoids retaining all of
+    // the boundary keys seen so far.
     pending_block: Option<BlockMeta>,
+    // This is also the value stored in the FST for the next finalized block.
     num_finalized_blocks: u64,
 }
 
 impl Default for SSTableIndexBuilder {
     fn default() -> Self {
         Self {
-            inner: SSTableIndexBuilderInner::Deferred(Vec::new()),
+            inner: SSTableIndexBuilderInner::InMemory(Vec::new()),
         }
     }
 }
@@ -375,13 +389,16 @@ impl SSTableIndexBuilder {
         next_key: &[u8],
     ) -> io::Result<()> {
         match &mut self.inner {
-            SSTableIndexBuilderInner::Deferred(blocks) => {
+            SSTableIndexBuilderInner::InMemory(blocks) => {
                 if let Some(last_block) = blocks.last_mut() {
                     find_shorter_str_in_between(&mut last_block.last_key_or_greater, next_key);
                 }
                 Ok(())
             }
             SSTableIndexBuilderInner::Streaming(streaming) => {
+                // `next_key` is the right-hand bound needed to turn the
+                // previous block's last key into its final separator. Once
+                // that separator is known, the block never needs revisiting.
                 streaming.finalize_pending_block(Some(next_key))
             }
         }
@@ -396,9 +413,11 @@ impl SSTableIndexBuilder {
             },
         };
         match &mut self.inner {
-            SSTableIndexBuilderInner::Deferred(blocks) => blocks.push(block),
+            SSTableIndexBuilderInner::InMemory(blocks) => blocks.push(block),
             SSTableIndexBuilderInner::Streaming(streaming) => {
                 debug_assert!(streaming.pending_block.is_none());
+                // Wait for the first key of the next block before emitting
+                // this one. The final block is emitted during `serialize`.
                 streaming.pending_block = Some(block);
             }
         }
@@ -406,7 +425,10 @@ impl SSTableIndexBuilder {
 
     pub fn serialize<W: Write>(&self, wrt: W) -> io::Result<u64> {
         match &self.inner {
-            SSTableIndexBuilderInner::Deferred(blocks) => serialize_deferred(blocks, wrt),
+            SSTableIndexBuilderInner::InMemory(blocks) => serialize_in_memory(blocks, wrt),
+            // Finishing the FST and rewinding the scratch outputs require
+            // mutable ownership. `Writer::finish` uses `serialize_for_writer`
+            // for that path while this existing public API stays unchanged.
             SSTableIndexBuilderInner::Streaming(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "streaming SSTable indexes are serialized by their owning writer",
@@ -416,13 +438,13 @@ impl SSTableIndexBuilder {
 
     pub(crate) fn serialize_for_writer<W: Write>(&mut self, wrt: W) -> io::Result<u64> {
         match &mut self.inner {
-            SSTableIndexBuilderInner::Deferred(blocks) => serialize_deferred(blocks, wrt),
+            SSTableIndexBuilderInner::InMemory(blocks) => serialize_in_memory(blocks, wrt),
             SSTableIndexBuilderInner::Streaming(streaming) => streaming.serialize(wrt),
         }
     }
 }
 
-fn serialize_deferred<W: Write>(blocks: &[BlockMeta], wrt: W) -> io::Result<u64> {
+fn serialize_in_memory<W: Write>(blocks: &[BlockMeta], wrt: W) -> io::Result<u64> {
     if blocks.len() <= 1 {
         return Ok(0);
     }
@@ -451,9 +473,13 @@ impl StreamingSSTableIndexBuilder {
         let Some(mut block) = self.pending_block.take() else {
             return Ok(());
         };
+        // Every block except the last has a next key and can use it to shorten
+        // its separator. The last block keeps its actual last key.
         if let Some(next_key) = next_key {
             find_shorter_str_in_between(&mut block.last_key_or_greater, next_key);
         }
+        // The FST entry and address entry are emitted together so their
+        // ordinals remain aligned without retaining a Vec<BlockMeta>.
         self.fst_builder
             .as_mut()
             .expect("streaming SSTable index builder already serialized")
@@ -466,12 +492,16 @@ impl StreamingSSTableIndexBuilder {
 
     fn serialize<W: Write>(&mut self, mut wrt: W) -> io::Result<u64> {
         // A dictionary with zero or one block deliberately has no index in the
-        // v3 format. The FST scratch header is discarded in that case.
+        // v3 format. If no block has been finalized, there can only be zero
+        // blocks or one pending block, so the FST scratch header is discarded.
         if self.num_finalized_blocks == 0 {
             return Ok(0);
         }
+        // There is no following key for the final block, so emit it unchanged.
         self.finalize_pending_block(None)?;
 
+        // Finishing the MapBuilder writes its footer and flushes the BufWriter.
+        // Only then is it safe for the scratch implementation to rewind.
         let fst_builder = self
             .fst_builder
             .take()
@@ -482,6 +512,9 @@ impl StreamingSSTableIndexBuilder {
             .finish()
             .into_inner()
             .map_err(|error| error.into_error())?;
+
+        // Preserve the existing v3 layout:
+        //   FST | block-metadata length | block metadata | packed addresses
         let copied_fst_len = fst_scratch.copy_into(&mut wrt)?;
         debug_assert_eq!(copied_fst_len, fst_len);
         self.block_store_writer.serialize(&mut wrt)?;
@@ -825,6 +858,9 @@ fn binary_search(max: u64, cmp_fn: impl Fn(u64) -> std::cmp::Ordering) -> Result
     Err(left)
 }
 
+/// Destination for the two block-address streams. Using the same interface
+/// for a Vec and scratch storage keeps the address encoder byte-identical in
+/// in-memory and streaming modes.
 trait IndexOutput: Write {
     fn written_bytes(&self) -> u64;
     fn copy_into(&mut self, output: &mut dyn Write) -> io::Result<u64>;
@@ -839,11 +875,6 @@ impl Write for MemoryIndexOutput {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.0.extend_from_slice(buf);
         Ok(())
     }
 }
@@ -861,6 +892,8 @@ impl IndexOutput for MemoryIndexOutput {
 
 struct ScratchIndexOutput {
     scratch: BufWriter<Box<dyn SSTableIndexScratch>>,
+    // Unlike Vec, scratch storage has no in-memory length to query. We need
+    // the byte count while encoding offsets into the packed-address stream.
     written_bytes: u64,
 }
 
@@ -894,8 +927,12 @@ impl IndexOutput for ScratchIndexOutput {
 }
 
 struct BlockAddrStoreWriter {
+    // Metadata and packed addresses occupy separate regions in the on-disk
+    // format, so they must be accumulated in separate outputs.
     buffer_block_metas: Box<dyn IndexOutput>,
     buffer_addrs: Box<dyn IndexOutput>,
+    // Address compression operates independently on fixed-size groups. This
+    // is the only address batch retained by the streaming implementation.
     block_addrs: Vec<BlockAddr>,
 }
 
@@ -963,6 +1000,8 @@ impl BlockAddrStoreWriter {
         let ordinal_shift = 1 << (first_ordinal_nbits - 1);
 
         let block_addr_block_meta = BlockAddrBlockMetadata {
+            // Offsets are relative to the start of the packed-address region,
+            // regardless of whether that region is a Vec or a scratch file.
             offset: self.buffer_addrs.written_bytes(),
             ref_block_addr: ref_block_addr.to_block_start(),
             range_start_slope,
@@ -1015,6 +1054,7 @@ impl BlockAddrStoreWriter {
     fn serialize<W: std::io::Write>(&mut self, wrt: &mut W) -> io::Result<()> {
         self.flush_block()?;
         let len = self.buffer_block_metas.written_bytes();
+        // The reader uses this length to split the two regions back apart.
         len.serialize(wrt)?;
         let copied_meta_len = self.buffer_block_metas.copy_into(wrt)?;
         debug_assert_eq!(copied_meta_len, len);

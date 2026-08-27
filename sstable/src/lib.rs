@@ -213,11 +213,8 @@ where
     /// supplied scratch outputs.
     pub fn new_with_index_scratch(wrt: W, scratch: SSTableIndexScratchFiles) -> io::Result<Self> {
         Ok(Writer {
-            previous_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
-            num_terms: 0u64,
             index_builder: SSTableIndexBuilder::new_with_scratch(scratch)?,
-            delta_writer: DeltaWriter::new(wrt),
-            first_ordinal_of_the_block: 0u64,
+            ..Self::new(wrt)
         })
     }
 

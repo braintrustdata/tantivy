@@ -261,20 +261,20 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             TermDictionaryBuilder::create(term_dictionary_write)?
         };
         #[cfg(feature = "quickwit")]
-        let scratch = sstable::SSTableIndexScratchFiles::new(
-            Box::new(TempFieldWrite::create("term-index-fst", scratch_temp_root)?),
-            Box::new(TempFieldWrite::create(
-                "term-index-block-metas",
-                scratch_temp_root,
-            )?),
-            Box::new(TempFieldWrite::create(
-                "term-index-block-addrs",
-                scratch_temp_root,
-            )?),
-        );
-        #[cfg(feature = "quickwit")]
-        let term_dictionary_builder =
-            TermDictionaryBuilder::create_with_scratch(term_dictionary_write, scratch)?;
+        let term_dictionary_builder = {
+            let scratch = sstable::SSTableIndexScratchFiles::new(
+              Box::new(TempFieldWrite::create("term-index-fst", scratch_temp_root)?),
+              Box::new(TempFieldWrite::create(
+                  "term-index-block-metas",
+                  scratch_temp_root,
+              )?),
+              Box::new(TempFieldWrite::create(
+                  "term-index-block-addrs",
+                  scratch_temp_root,
+              )?),
+          );
+            TermDictionaryBuilder::create_with_scratch(term_dictionary_write, scratch)?
+        };
         Self::create_with_term_dictionary_builder(
             field_type,
             total_num_tokens,
