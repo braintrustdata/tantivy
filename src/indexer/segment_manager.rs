@@ -31,7 +31,7 @@ impl SegmentRegisters {
         } else if self.committed.contains_all(segment_ids) {
             Some(SegmentsStatus::Committed)
         } else {
-            warn!(
+            debug!(
                 "segment_ids: {:?}, committed_ids: {:?}, uncommitted_ids {:?}",
                 segment_ids,
                 self.committed.segment_ids(),
@@ -193,7 +193,7 @@ impl SegmentManager {
         let segments_status = registers_lock
             .segments_status(before_merge_segment_ids)
             .ok_or_else(|| {
-                warn!("couldn't find segment in SegmentManager");
+                debug!("couldn't find segment in SegmentManager");
                 crate::TantivyError::InvalidArgument(
                     "The segments that were merged could not be found in the SegmentManager. This \
                      is not necessarily a bug, and can happen after a rollback for instance."
