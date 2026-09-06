@@ -304,3 +304,100 @@ fn test_option_collector_none() -> crate::Result<()> {
     assert_eq!(counts, None);
     Ok(())
 }
+
+#[test]
+fn test_collect_existing_scorer() -> crate::Result<()> {
+    use crate::query::{ConstScorer, Explanation, Scorer, VecDocSet, Weight};
+    use crate::schema::INDEXED;
+    use crate::{DocSet, Term, TERMINATED};
+
+    struct IterationOnlyWeight(Vec<DocId>);
+
+    impl Weight for IterationOnlyWeight {
+        fn scorer(&self, _: &SegmentReader, _: Score) -> crate::Result<Box<dyn Scorer>> {
+            panic!("collect_segment must preserve specialized Weight iteration")
+        }
+
+        fn explain(&self, _: &SegmentReader, _: DocId) -> crate::Result<Explanation> {
+            panic!("collection does not explain documents")
+        }
+
+        fn for_each(
+            &self,
+            _: &SegmentReader,
+            callback: &mut dyn FnMut(DocId, Score),
+        ) -> crate::Result<()> {
+            for &doc in &self.0 {
+                callback(doc, 7.5);
+            }
+            Ok(())
+        }
+
+        fn for_each_no_score(
+            &self,
+            _: &SegmentReader,
+            callback: &mut dyn FnMut(&[DocId]),
+        ) -> crate::Result<()> {
+            callback(&self.0);
+            Ok(())
+        }
+    }
+
+    let deleted = vec![0, 63, 64, 128, 256];
+    for with_deletes in [false, true] {
+        let mut schema = Schema::builder();
+        let id = schema.add_u64_field("id", INDEXED);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        for doc in 0..257u64 {
+            writer.add_document(doc!(id => doc))?;
+        }
+        writer.commit()?;
+        if with_deletes {
+            for &doc in &deleted {
+                writer.delete_term(Term::from_field_u64(id, u64::from(doc)));
+            }
+            writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let reader = &searcher.segment_readers()[0];
+        assert_eq!(reader.alive_bitset().is_some(), with_deletes);
+
+        let mut cases: Vec<Vec<DocId>> = [0, 1, 63, 64, 65, 128, 129, 257]
+            .into_iter()
+            .map(|len| (0..len).collect())
+            .collect();
+        cases.push(deleted.clone());
+        for docs in cases {
+            for offset in [0, 1, 63, 64, 65, 127, 128, 256, 257] {
+                for compute_score in [false, true] {
+                    let collector = TestCollector { compute_score };
+                    let mut scorer = ConstScorer::new(VecDocSet::from(docs.clone()), 7.5);
+                    for _ in 0..offset {
+                        if scorer.doc() != TERMINATED {
+                            scorer.advance();
+                        }
+                    }
+                    let remaining: Vec<_> = docs.iter().copied().skip(offset).collect();
+                    let expected: Vec<_> = remaining
+                        .iter()
+                        .copied()
+                        .filter(|doc| !with_deletes || !deleted.contains(doc))
+                        .map(|doc| DocAddress::new(0, doc))
+                        .collect();
+                    let actual = collector.collect_segment_with_scorer(&mut scorer, 0, reader)?;
+                    let baseline =
+                        collector.collect_segment(&IterationOnlyWeight(remaining), 0, reader)?;
+                    assert_eq!(actual.docs(), expected);
+                    assert_eq!(baseline.docs(), expected);
+                    let scores = vec![if compute_score { 7.5 } else { 0.0 }; expected.len()];
+                    assert_eq!(actual.scores(), scores);
+                    assert_eq!(baseline.scores(), scores);
+                    assert_eq!(scorer.doc(), TERMINATED);
+                }
+            }
+        }
+    }
+    Ok(())
+}

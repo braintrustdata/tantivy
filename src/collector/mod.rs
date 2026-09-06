@@ -107,7 +107,8 @@ mod tweak_score_top_collector;
 pub use self::tweak_score_top_collector::{ScoreSegmentTweaker, ScoreTweaker};
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
-use crate::query::Weight;
+use crate::query::{for_each_docset_buffered, for_each_scorer, Scorer, Weight};
+use crate::COLLECT_BLOCK_BUFFER_LEN;
 
 mod docset_collector;
 pub use self::docset_collector::DocSetCollector;
@@ -170,32 +171,97 @@ pub trait Collector: Sync + Send {
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
-        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        CollectionSource::Weight(weight).collect(self, segment_ord, reader)
+    }
 
-        match (reader.alive_bitset(), self.requires_scoring()) {
+    /// Collects the remaining documents from an existing scorer, including its current document.
+    /// Calls `for_segment` even for an exhausted scorer. Does not invoke `Weight` iteration or
+    /// an overridden `collect_segment` implementation.
+    fn collect_segment_with_scorer(
+        &self,
+        scorer: &mut dyn Scorer,
+        segment_ord: u32,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        CollectionSource::Scorer(scorer).collect(self, segment_ord, reader)
+    }
+}
+
+enum CollectionSource<'a> {
+    Weight(&'a dyn Weight),
+    Scorer(&'a mut dyn Scorer),
+}
+
+impl CollectionSource<'_> {
+    fn for_each(
+        &mut self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score),
+    ) -> crate::Result<()> {
+        match self {
+            Self::Weight(weight) => weight.for_each(reader, callback),
+            Self::Scorer(scorer) => {
+                for_each_scorer(*scorer, callback);
+                Ok(())
+            }
+        }
+    }
+
+    fn for_each_no_score(
+        &mut self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(&[DocId]),
+    ) -> crate::Result<()> {
+        match self {
+            Self::Weight(weight) => weight.for_each_no_score(reader, callback),
+            Self::Scorer(scorer) => {
+                let mut buffer = [0; COLLECT_BLOCK_BUFFER_LEN];
+                for_each_docset_buffered(*scorer, &mut buffer, callback);
+                Ok(())
+            }
+        }
+    }
+
+    fn collect<C: Collector + ?Sized>(
+        mut self,
+        collector: &C,
+        segment_ord: u32,
+        reader: &SegmentReader,
+    ) -> crate::Result<<C::Child as SegmentCollector>::Fruit> {
+        let mut segment_collector = collector.for_segment(segment_ord, reader)?;
+
+        match (reader.alive_bitset(), collector.requires_scoring()) {
             (Some(alive_bitset), true) => {
-                weight.for_each(reader, &mut |doc, score| {
+                self.for_each(reader, &mut |doc, score| {
                     if alive_bitset.is_alive(doc) {
                         segment_collector.collect(doc, score);
                     }
                 })?;
             }
             (Some(alive_bitset), false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    for doc in docs.iter().cloned() {
-                        if alive_bitset.is_alive(doc) {
-                            segment_collector.collect(doc, 0.0);
+                self.for_each_no_score(reader, &mut |docs| {
+                    let mut live_docs = [0; COLLECT_BLOCK_BUFFER_LEN];
+                    for chunk in docs.chunks(COLLECT_BLOCK_BUFFER_LEN) {
+                        let mut len = 0;
+                        for &doc in chunk {
+                            if alive_bitset.is_alive(doc) {
+                                live_docs[len] = doc;
+                                len += 1;
+                            }
+                        }
+                        if len != 0 {
+                            segment_collector.collect_block(&live_docs[..len]);
                         }
                     }
                 })?;
             }
             (None, true) => {
-                weight.for_each(reader, &mut |doc, score| {
+                self.for_each(reader, &mut |doc, score| {
                     segment_collector.collect(doc, score);
                 })?;
             }
             (None, false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
+                self.for_each_no_score(reader, &mut |docs| {
                     segment_collector.collect_block(docs);
                 })?;
             }
