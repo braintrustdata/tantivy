@@ -35,6 +35,14 @@ pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYT
 // We impose the number of index writer threads to be at most this.
 pub const MAX_NUM_THREAD: usize = 8;
 
+/// A committed batch and the segments containing its indexed documents.
+pub struct IndexedSegmentsCommit {
+    /// The opstamp of the committed batch.
+    pub opstamp: Opstamp,
+    /// Post-delete segment metadata for documents indexed in this batch.
+    pub indexed_segments: Vec<SegmentMeta>,
+}
+
 // Add document will block if the number of docs waiting in the queue to be indexed
 // reaches `PIPELINE_MAX_SIZE_IN_DOCS`
 const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
@@ -701,6 +709,15 @@ impl<D: Document> IndexWriter<D> {
         self.prepare_commit()?.commit()
     }
 
+    /// Commits pending operations and returns the live segments indexed by this batch.
+    ///
+    /// Holding the returned segment metadata prevents Tantivy's garbage collector from
+    /// removing its files if a later merge replaces those segments. A delete-only commit
+    /// returns no segments.
+    pub fn commit_and_capture_indexed_segments(&mut self) -> crate::Result<IndexedSegmentsCommit> {
+        self.prepare_commit()?.commit_and_capture_indexed_segments()
+    }
+
     pub(crate) fn segment_updater(&self) -> &SegmentUpdater {
         &self.segment_updater
     }
@@ -1119,6 +1136,63 @@ mod tests {
         }
         reader.reload()?;
         reader.searcher();
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_and_capture_indexed_segments_applies_deletes() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", STRING | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+
+        writer.add_document(doc!(text_field => "deleted"))?;
+        writer.add_document(doc!(text_field => "retained"))?;
+        writer.delete_term(Term::from_field_text(text_field, "deleted"));
+        let result = writer.commit_and_capture_indexed_segments()?;
+
+        assert_eq!(result.opstamp, index.load_metas()?.opstamp);
+        assert_eq!(result.indexed_segments.len(), 1);
+        assert_eq!(result.indexed_segments[0].num_docs(), 1);
+        assert_eq!(
+            crate::SegmentReader::open(&index.segment(result.indexed_segments[0].clone()))?
+                .num_docs(),
+            1
+        );
+
+        writer.delete_term(Term::from_field_text(text_field, "retained"));
+        let delete_only = writer.commit_and_capture_indexed_segments()?;
+        assert!(delete_only.indexed_segments.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_captured_indexed_segments_survive_merge() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", STRING | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        writer.add_document(doc!(text_field => "first"))?;
+        let first = writer.commit_and_capture_indexed_segments()?;
+        writer.add_document(doc!(text_field => "second"))?;
+        let second = writer.commit_and_capture_indexed_segments()?;
+
+        assert_eq!(first.indexed_segments.len(), 1);
+        assert_eq!(second.indexed_segments.len(), 1);
+        let original_id = first.indexed_segments[0].id();
+        writer
+            .merge(&[original_id, second.indexed_segments[0].id()])
+            .wait()?;
+        writer.garbage_collect_files().wait()?;
+
+        assert!(!index.searchable_segment_ids()?.contains(&original_id));
+        assert_eq!(
+            crate::SegmentReader::open(&index.segment(first.indexed_segments[0].clone()))?
+                .num_docs(),
+            1
+        );
         Ok(())
     }
 

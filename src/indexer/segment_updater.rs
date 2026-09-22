@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use super::segment_manager::SegmentManager;
+use super::IndexedSegmentsCommit;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
@@ -514,6 +515,32 @@ impl SegmentUpdater {
             let _ = garbage_collect_files(segment_updater.clone());
             segment_updater.consider_merge_options();
             Ok(opstamp)
+        })
+    }
+
+    pub(crate) fn schedule_commit_and_capture_indexed_segments(
+        &self,
+        opstamp: Opstamp,
+        payload: Option<String>,
+    ) -> FutureResult<IndexedSegmentsCommit> {
+        let segment_updater: SegmentUpdater = self.clone();
+        self.schedule_task(move || {
+            let indexed_ids = segment_updater.segment_manager.uncommitted_segment_ids();
+            let segment_entries = segment_updater.purge_deletes(opstamp)?;
+            let indexed_segments = segment_entries
+                .iter()
+                .filter(|entry| indexed_ids.contains(&entry.segment_id()))
+                .filter(|entry| entry.meta().num_docs() > 0)
+                .map(|entry| entry.meta().clone())
+                .collect();
+            segment_updater.segment_manager.commit(segment_entries);
+            segment_updater.save_metas(opstamp, payload)?;
+            let _ = garbage_collect_files(segment_updater.clone());
+            segment_updater.consider_merge_options();
+            Ok(IndexedSegmentsCommit {
+                opstamp,
+                indexed_segments,
+            })
         })
     }
 

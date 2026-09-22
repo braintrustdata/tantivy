@@ -1,4 +1,4 @@
-use super::IndexWriter;
+use super::{IndexWriter, IndexedSegmentsCommit};
 use crate::schema::document::Document;
 use crate::{FutureResult, Opstamp, TantivyDocument};
 
@@ -37,6 +37,14 @@ impl<'a, D: Document> PreparedCommit<'a, D> {
     /// See `.commit_future()`.
     pub fn commit(self) -> crate::Result<Opstamp> {
         self.commit_future().wait()
+    }
+
+    /// Commits and captures this batch's live indexed segments.
+    pub fn commit_and_capture_indexed_segments(self) -> crate::Result<IndexedSegmentsCommit> {
+        self.index_writer
+            .segment_updater()
+            .schedule_commit_and_capture_indexed_segments(self.opstamp, self.payload)
+            .wait()
     }
 
     /// Proceeds to commit.

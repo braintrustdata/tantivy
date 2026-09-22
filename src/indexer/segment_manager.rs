@@ -98,6 +98,10 @@ impl SegmentManager {
         segment_entries
     }
 
+    pub(crate) fn uncommitted_segment_ids(&self) -> HashSet<SegmentId> {
+        self.read().uncommitted.segment_ids().into_iter().collect()
+    }
+
     // Lock poisoning should never happen :
     // The lock is acquired and released within this class,
     // and the operations cannot panic.
