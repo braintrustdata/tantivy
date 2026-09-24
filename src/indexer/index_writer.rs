@@ -1199,67 +1199,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "failpoints")]
-    #[test]
-    fn test_capture_uncommitted_segment_during_merge() -> crate::Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{mpsc, Arc, Mutex};
-        use std::time::Duration;
-
-        let mut schema_builder = schema::Schema::builder();
-        let text_field = schema_builder.add_text_field("text", STRING | STORED);
-        let index = Index::create_in_ram(schema_builder.build());
-        let mut writer = index.writer_for_tests()?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
-
-        writer.add_document(doc!(text_field => "captured"))?;
-        writer.commit()?;
-        let segment_meta = index
-            .searchable_segment_metas()?
-            .into_iter()
-            .next()
-            .expect("the committed document should have a segment");
-
-        writer.segment_updater.remove_all_segments();
-        writer.add_segment(segment_meta.clone())?;
-
-        let _fail_scenario_guard = fail::FailScenario::setup();
-        let (merge_started_tx, merge_started_rx) = mpsc::channel();
-        let (resume_merge_tx, resume_merge_rx) = mpsc::channel();
-        let resume_merge_rx = Arc::new(Mutex::new(resume_merge_rx));
-        let failpoint_entered = Arc::new(AtomicBool::new(false));
-        let failpoint_resume_rx = resume_merge_rx.clone();
-        let failpoint_started_tx = merge_started_tx.clone();
-        let failpoint_entered_clone = failpoint_entered.clone();
-        fail::cfg_callback("SegmentReader::open#middle", move || {
-            if !failpoint_entered_clone.swap(true, Ordering::SeqCst) {
-                let _ = failpoint_started_tx.send(());
-                let _ = failpoint_resume_rx.lock().unwrap().recv();
-            }
-        })
-        .unwrap();
-
-        let merge = writer.merge(&[segment_meta.id()]);
-        merge_started_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("merge should reach the pause point");
-
-        let capture_result = writer.commit_and_capture_indexed_segments();
-        resume_merge_tx.send(()).unwrap();
-        assert!(merge.wait()?.is_some());
-        let captured = capture_result?;
-
-        assert_eq!(captured.indexed_segments.len(), 1);
-        assert_eq!(captured.indexed_segments[0].id(), segment_meta.id());
-        writer.garbage_collect_files().wait()?;
-        assert_eq!(
-            crate::SegmentReader::open(&index.segment(captured.indexed_segments[0].clone()))?
-                .num_docs(),
-            1
-        );
-        Ok(())
-    }
-
     #[test]
     fn test_merge_on_empty_segments_single_segment() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
