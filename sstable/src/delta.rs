@@ -143,6 +143,13 @@ where TValueReader: value::ValueReader
         }
     }
 
+    pub fn reset(&mut self, reader: OwnedBytes) {
+        self.idx = 0;
+        self.common_prefix_len = 0;
+        self.suffix_range = 0..0;
+        self.block_reader.reset(reader);
+    }
+
     pub fn empty() -> Self {
         DeltaReader::new(OwnedBytes::empty())
     }
@@ -222,6 +229,45 @@ where TValueReader: value::ValueReader
 mod tests {
     use super::DeltaReader;
     use crate::value::U64MonotonicValueReader;
+
+    #[test]
+    fn test_reset_discards_partial_block_state() {
+        use super::DeltaWriter;
+        use crate::value::U64MonotonicValueWriter;
+        use common::OwnedBytes;
+
+        let encode = |entries: &[(usize, &[u8], u64)]| {
+            let mut output = Vec::new();
+            let mut writer = DeltaWriter::<_, U64MonotonicValueWriter>::new(&mut output);
+            for (keep, suffix, value) in entries {
+                writer.write_suffix(*keep, suffix);
+                writer.write_value(value);
+            }
+            writer.flush_block().unwrap();
+            drop(writer.finish());
+            OwnedBytes::new(output)
+        };
+        let first = encode(&[(0, b"first", 10), (2, b"nal", 20)]);
+        let second = encode(&[(0, b"other", 3), (1, b"wl", 4)]);
+        let mut reader = DeltaReader::<U64MonotonicValueReader>::new(first);
+        assert!(reader.advance().unwrap());
+        assert!(reader.advance().unwrap());
+        assert_eq!(reader.common_prefix_len(), 2);
+        assert_eq!(*reader.value(), 20);
+        reader.reset(second);
+        assert_eq!(reader.common_prefix_len(), 0);
+        assert!(reader.suffix().is_empty());
+        assert!(reader.advance().unwrap());
+        assert_eq!(reader.suffix(), b"other");
+        assert_eq!(*reader.value(), 3);
+        reader.reset(OwnedBytes::empty());
+        assert!(!reader.advance().unwrap());
+        reader.reset(encode(&[(0, b"last", 1)]));
+        assert!(reader.advance().unwrap());
+        assert_eq!(reader.suffix(), b"last");
+        assert_eq!(*reader.value(), 1);
+        assert!(!reader.advance().unwrap());
+    }
 
     #[test]
     fn test_empty() {
