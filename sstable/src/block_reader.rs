@@ -21,7 +21,7 @@ impl BlockReader {
         }
     }
 
-    pub fn reset(&mut self, reader: OwnedBytes) {
+    pub(crate) fn reset(&mut self, reader: OwnedBytes) {
         self.buffer.clear();
         self.reader = reader;
         self.offset = 0;

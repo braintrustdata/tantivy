@@ -12,7 +12,8 @@ const VINT_MODE: u8 = 1u8;
 const BLOCK_LEN: usize = 4_000;
 
 pub struct DeltaWriter<W, TValueWriter>
-where W: io::Write
+where
+    W: io::Write,
 {
     block: Vec<u8>,
     write: CountingWriter<BufWriter<W>>,
@@ -122,6 +123,52 @@ where
     }
 }
 
+/// Reusable decoding storage for independent SSTable inputs.
+///
+/// Each call to `read` initializes the input and cursor state while retaining
+/// buffers and the decompression context. The returned reader borrows this
+/// decoder exclusively, so another input cannot be installed while it is in use.
+/// Partially consumed inputs may be discarded by ending the borrow.
+///
+/// ```
+/// use common::OwnedBytes;
+/// use tantivy_sstable::{DeltaDecoder, value::U64MonotonicValueReader};
+/// let mut decoder = DeltaDecoder::<U64MonotonicValueReader>::default();
+/// assert!(!decoder.read(OwnedBytes::empty()).advance().unwrap());
+/// assert!(!decoder.read(OwnedBytes::empty()).advance().unwrap());
+/// ```
+///
+/// ```compile_fail,E0499
+/// use common::OwnedBytes;
+/// use tantivy_sstable::{DeltaDecoder, value::U64MonotonicValueReader};
+/// let mut decoder = DeltaDecoder::<U64MonotonicValueReader>::default();
+/// let first = decoder.read(OwnedBytes::empty());
+/// let second = decoder.read(OwnedBytes::empty());
+/// first.advance().unwrap();
+/// ```
+pub struct DeltaDecoder<TValueReader> {
+    reader: DeltaReader<TValueReader>,
+}
+
+impl<TValueReader: value::ValueReader> Default for DeltaDecoder<TValueReader> {
+    fn default() -> Self {
+        Self {
+            reader: DeltaReader::empty(),
+        }
+    }
+}
+
+impl<TValueReader: value::ValueReader> DeltaDecoder<TValueReader> {
+    /// Starts an independent input, retaining allocations from previous inputs.
+    pub fn read(&mut self, input: OwnedBytes) -> &mut DeltaReader<TValueReader> {
+        self.reader.idx = 0;
+        self.reader.common_prefix_len = 0;
+        self.reader.suffix_range = 0..0;
+        self.reader.block_reader.reset(input);
+        &mut self.reader
+    }
+}
+
 pub struct DeltaReader<TValueReader> {
     common_prefix_len: usize,
     suffix_range: Range<usize>,
@@ -131,7 +178,8 @@ pub struct DeltaReader<TValueReader> {
 }
 
 impl<TValueReader> DeltaReader<TValueReader>
-where TValueReader: value::ValueReader
+where
+    TValueReader: value::ValueReader,
 {
     pub fn new(reader: OwnedBytes) -> Self {
         DeltaReader {
@@ -141,13 +189,6 @@ where TValueReader: value::ValueReader
             value_reader: TValueReader::default(),
             block_reader: BlockReader::new(reader),
         }
-    }
-
-    pub fn reset(&mut self, reader: OwnedBytes) {
-        self.idx = 0;
-        self.common_prefix_len = 0;
-        self.suffix_range = 0..0;
-        self.block_reader.reset(reader);
     }
 
     pub fn empty() -> Self {
@@ -227,11 +268,11 @@ where TValueReader: value::ValueReader
 
 #[cfg(test)]
 mod tests {
-    use super::DeltaReader;
+    use super::{DeltaDecoder, DeltaReader};
     use crate::value::U64MonotonicValueReader;
 
     #[test]
-    fn test_reset_discards_partial_block_state() {
+    fn test_decoder_discards_partial_block_state() {
         use super::DeltaWriter;
         use crate::value::U64MonotonicValueWriter;
         use common::OwnedBytes;
@@ -249,20 +290,21 @@ mod tests {
         };
         let first = encode(&[(0, b"first", 10), (2, b"nal", 20)]);
         let second = encode(&[(0, b"other", 3), (1, b"wl", 4)]);
-        let mut reader = DeltaReader::<U64MonotonicValueReader>::new(first);
+        let mut decoder = DeltaDecoder::<U64MonotonicValueReader>::default();
+        let reader = decoder.read(first);
         assert!(reader.advance().unwrap());
         assert!(reader.advance().unwrap());
         assert_eq!(reader.common_prefix_len(), 2);
         assert_eq!(*reader.value(), 20);
-        reader.reset(second);
+        let reader = decoder.read(second);
         assert_eq!(reader.common_prefix_len(), 0);
         assert!(reader.suffix().is_empty());
         assert!(reader.advance().unwrap());
         assert_eq!(reader.suffix(), b"other");
         assert_eq!(*reader.value(), 3);
-        reader.reset(OwnedBytes::empty());
+        let reader = decoder.read(OwnedBytes::empty());
         assert!(!reader.advance().unwrap());
-        reader.reset(encode(&[(0, b"last", 1)]));
+        let reader = decoder.read(encode(&[(0, b"last", 1)]));
         assert!(reader.advance().unwrap());
         assert_eq!(reader.suffix(), b"last");
         assert_eq!(*reader.value(), 1);
