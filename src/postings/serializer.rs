@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use common::{BinarySerializable, CountingWriter, VInt};
@@ -58,7 +58,7 @@ pub struct InvertedIndexSerializer {
 
 pub(crate) struct TempFieldWrite {
     path: PathBuf,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
 }
 
 impl TempFieldWrite {
@@ -83,7 +83,7 @@ impl TempFieldWrite {
                 Ok(file) => {
                     return Ok(Self {
                         path,
-                        file: Some(file),
+                        file: Some(BufWriter::new(file)),
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -98,7 +98,7 @@ impl TempFieldWrite {
         ))
     }
 
-    fn file_mut(&mut self) -> io::Result<&mut File> {
+    fn file_mut(&mut self) -> io::Result<&mut BufWriter<File>> {
         self.file
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "temp postings file closed"))
@@ -107,6 +107,7 @@ impl TempFieldWrite {
     pub(crate) fn copy_into<W: Write>(&mut self, output: &mut W) -> io::Result<u64> {
         let file = self.file_mut()?;
         file.flush()?;
+        let file = file.get_mut();
         file.rewind()?;
         io::copy(file, output)
     }
@@ -583,5 +584,51 @@ impl<W: Write> PostingsSerializer<W> {
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::{self, BufWriter, Write};
+
+    use common::CountingWriter;
+
+    use super::TempFieldWrite;
+
+    #[test]
+    fn test_temp_field_write_copy_flushes_and_rewinds() -> io::Result<()> {
+        for length in [17, 65_537] {
+            let directory = tempfile::tempdir()?;
+            let scratch = TempFieldWrite::create("test", Some(directory.path()))?;
+            let path = scratch.path.clone();
+            let mut writer = CountingWriter::wrap(scratch);
+            let expected: Vec<_> = (0u8..=255).cycle().take(length).collect();
+            for chunk in expected.chunks(3) {
+                writer.write_all(chunk)?;
+            }
+            assert_eq!(writer.written_bytes(), expected.len() as u64);
+            let mut scratch = writer.finish();
+            for _ in 0..2 {
+                let mut output = Vec::new();
+                assert_eq!(scratch.copy_into(&mut output)?, expected.len() as u64);
+                assert_eq!(output, expected);
+            }
+            drop(scratch);
+            assert!(!path.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_temp_field_write_copy_propagates_flush_error() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut scratch = TempFieldWrite::create("test", Some(directory.path()))?;
+        scratch.file = Some(BufWriter::new(File::open(&scratch.path)?));
+        scratch.write_all(b"pending")?;
+        let mut output = Vec::new();
+        assert!(scratch.copy_into(&mut output).is_err());
+        assert!(output.is_empty());
+        Ok(())
     }
 }
