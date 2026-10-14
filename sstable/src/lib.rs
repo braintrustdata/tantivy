@@ -22,7 +22,7 @@ mod block_reader;
 use common::{BinarySerializable, OwnedBytes};
 
 pub use self::block_reader::BlockReader;
-pub use self::delta::{DeltaReader, DeltaWriter};
+pub use self::delta::{DeltaDecoder, DeltaReader, DeltaWriter};
 pub use self::merge::VoidMerge;
 use self::value::{U64MonotonicValueReader, U64MonotonicValueWriter, ValueReader, ValueWriter};
 use crate::value::{RangeValueReader, RangeValueWriter};
