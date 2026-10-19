@@ -7,6 +7,7 @@ use std::{io, thread};
 use common::{BinarySerializable, CountingWriter, TerminatingWrite};
 
 use crate::directory::WritePtr;
+use crate::store::compressors::CompressorContext;
 use crate::store::footer::DocStoreFooter;
 use crate::store::index::{Checkpoint, SkipIndexBuilder};
 use crate::store::{Compressor, Decompressor, StoreReader};
@@ -28,7 +29,7 @@ impl BlockCompressor {
         dedicated_thread: bool,
         dictionary: Option<Arc<[u8]>>,
     ) -> io::Result<Self> {
-        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt, dictionary);
+        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt, dictionary)?;
         if dedicated_thread {
             let dedicated_thread_compressor =
                 DedicatedThreadBlockCompressorImpl::new(block_compressor_impl)?;
@@ -85,6 +86,7 @@ impl BlockCompressor {
 struct BlockCompressorImpl {
     compressor: Compressor,
     dictionary: Option<Arc<[u8]>>,
+    context: CompressorContext,
     first_doc_in_block: DocId,
     offset_index_writer: SkipIndexBuilder,
     intermediary_buffer: Vec<u8>,
@@ -92,25 +94,28 @@ struct BlockCompressorImpl {
 }
 
 impl BlockCompressorImpl {
-    fn new(compressor: Compressor, writer: WritePtr, dictionary: Option<Arc<[u8]>>) -> Self {
-        Self {
+    fn new(
+        compressor: Compressor,
+        writer: WritePtr,
+        dictionary: Option<Arc<[u8]>>,
+    ) -> io::Result<Self> {
+        let context = CompressorContext::new(&compressor, dictionary.as_deref())?;
+        Ok(Self {
             compressor,
             dictionary,
+            context,
             first_doc_in_block: 0,
             offset_index_writer: SkipIndexBuilder::new(),
             intermediary_buffer: Vec::new(),
             writer: CountingWriter::wrap(writer),
-        }
+        })
     }
 
     fn compress_block_and_write(&mut self, data: &[u8], num_docs_in_block: u32) -> io::Result<()> {
         assert!(num_docs_in_block > 0);
         self.intermediary_buffer.clear();
-        self.compressor.compress_into(
-            data,
-            &mut self.intermediary_buffer,
-            self.dictionary.as_deref(),
-        )?;
+        self.context
+            .compress_into(data, &mut self.intermediary_buffer)?;
 
         let start_offset = self.writer.written_bytes() as usize;
         self.writer.write_all(&self.intermediary_buffer)?;
