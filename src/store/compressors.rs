@@ -459,13 +459,35 @@ impl Default for Compressor {
     }
 }
 
-impl Compressor {
+pub(crate) enum CompressorContext {
+    None,
+    #[cfg(feature = "lz4-compression")]
+    Lz4,
+    #[cfg(feature = "zstd-compression")]
+    Zstd(zstd::bulk::Compressor<'static>),
+}
+
+impl CompressorContext {
+    pub(crate) fn new(compressor: &Compressor, dictionary: Option<&[u8]>) -> io::Result<Self> {
+        Ok(match compressor {
+            Compressor::None => Self::None,
+            #[cfg(feature = "lz4-compression")]
+            Compressor::Lz4 => Self::Lz4,
+            #[cfg(feature = "zstd-compression")]
+            Compressor::Zstd(settings) => {
+                Self::Zstd(super::compression_zstd_block::new_compressor(
+                    settings.compression_level,
+                    dictionary,
+                )?)
+            }
+        })
+    }
+
     #[inline]
     pub(crate) fn compress_into(
-        &self,
+        &mut self,
         uncompressed: &[u8],
         compressed: &mut Vec<u8>,
-        dictionary: Option<&[u8]>,
     ) -> io::Result<()> {
         match self {
             Self::None => {
@@ -476,15 +498,14 @@ impl Compressor {
             #[cfg(feature = "lz4-compression")]
             Self::Lz4 => super::compression_lz4_block::compress(uncompressed, compressed),
             #[cfg(feature = "zstd-compression")]
-            Self::Zstd(_zstd_compressor) => super::compression_zstd_block::compress(
-                uncompressed,
-                compressed,
-                _zstd_compressor.compression_level,
-                dictionary,
-            ),
+            Self::Zstd(compressor) => {
+                super::compression_zstd_block::compress(uncompressed, compressed, compressor)
+            }
         }
     }
+}
 
+impl Compressor {
     /// Whether this compressor is configured with a zstd dictionary. Merges use this to fall
     /// back from raw block-stacking (which never decompresses, and so never exercises the
     /// dictionary's own zstd checksum) to a decompress/recompress path -- see
