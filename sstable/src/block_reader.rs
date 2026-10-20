@@ -8,6 +8,7 @@ pub struct BlockReader {
     buffer: Vec<u8>,
     reader: OwnedBytes,
     offset: usize,
+    decompressor: Option<Decompressor<'static>>,
 }
 
 impl BlockReader {
@@ -16,6 +17,7 @@ impl BlockReader {
             buffer: Vec::new(),
             reader,
             offset: 0,
+            decompressor: None,
         }
     }
 
@@ -60,8 +62,11 @@ impl BlockReader {
             let required_capacity =
                 Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
             self.buffer.reserve(required_capacity);
-            Decompressor::new()?
-                .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
+            let decompressor = match &mut self.decompressor {
+                Some(decompressor) => decompressor,
+                slot @ None => slot.insert(Decompressor::new()?),
+            };
+            decompressor.decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
 
             self.reader.advance(block_len);
         } else {
@@ -106,5 +111,49 @@ impl io::Read for BlockReader {
         self.buffer().read_exact(buf)?;
         self.advance(buf.len());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_mixed_blocks_with_reused_decompressor() -> io::Result<()> {
+        let blocks = [
+            (b"raw".repeat(8), false),
+            (b"first compressed block".repeat(1024), true),
+            (b"raw middle".repeat(8), false),
+            (b"larger compressed block".repeat(4096), true),
+            (b"small compressed block".repeat(128), true),
+        ];
+        let mut encoded = Vec::new();
+        for (block, compressed) in &blocks {
+            let payload = if *compressed {
+                zstd::bulk::compress(block, 3)?
+            } else {
+                block.clone()
+            };
+            encoded.extend_from_slice(&(payload.len() as u32 + 1).to_le_bytes());
+            encoded.push(u8::from(*compressed));
+            encoded.extend_from_slice(&payload);
+        }
+
+        let mut reader = BlockReader::new(OwnedBytes::new(encoded));
+        assert!(reader.decompressor.is_none());
+        for (i, (block, _)) in blocks.iter().enumerate() {
+            assert!(reader.read_block()?);
+            assert_eq!(reader.buffer(), block);
+            assert_eq!(reader.decompressor.is_some(), i > 0);
+            reader.advance(block.len());
+        }
+        assert!(!reader.read_block()?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_compressed_block_returns_error() {
+        let mut reader = BlockReader::new(OwnedBytes::new(vec![4, 0, 0, 0, 1, 0, 0, 0]));
+        assert!(reader.read_block().is_err());
     }
 }

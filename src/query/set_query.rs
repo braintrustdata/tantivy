@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use once_cell::sync::OnceCell;
 use tantivy_fst::raw::CompiledAddr;
 use tantivy_fst::{Automaton, Map};
 
@@ -11,7 +13,13 @@ use crate::Term;
 /// A Term Set Query matches all of the documents containing any of the Term provided
 #[derive(Debug, Clone)]
 pub struct TermSetQuery {
-    terms_map: HashMap<Field, Vec<Term>>,
+    terms_map: Arc<HashMap<Field, FieldTerms>>,
+}
+
+#[derive(Debug)]
+struct FieldTerms {
+    terms: Vec<Term>,
+    automaton: OnceCell<Arc<SetDfaWrapper>>,
 }
 
 impl TermSetQuery {
@@ -27,7 +35,22 @@ impl TermSetQuery {
             terms.dedup();
         }
 
-        TermSetQuery { terms_map }
+        let terms_map = terms_map
+            .into_iter()
+            .map(|(field, terms)| {
+                (
+                    field,
+                    FieldTerms {
+                        terms,
+                        automaton: OnceCell::new(),
+                    },
+                )
+            })
+            .collect();
+
+        TermSetQuery {
+            terms_map: Arc::new(terms_map),
+        }
     }
 
     fn specialized_weight(
@@ -36,7 +59,7 @@ impl TermSetQuery {
     ) -> crate::Result<BooleanWeight<DoNothingCombiner>> {
         let mut sub_queries: Vec<(_, Box<dyn Weight>)> = Vec::with_capacity(self.terms_map.len());
 
-        for (&field, sorted_terms) in self.terms_map.iter() {
+        for (&field, field_terms) in self.terms_map.iter() {
             let field_entry = schema.get_field_entry(field);
             let field_type = field_entry.field_type();
             if !field_type.is_indexed() {
@@ -47,16 +70,23 @@ impl TermSetQuery {
             // In practice this won't fail because:
             // - we are writing to memory, so no IoError
             // - Terms are ordered
-            let map = Map::from_iter(
-                sorted_terms
-                    .iter()
-                    .map(|key| (key.serialized_value_bytes(), 0)),
-            )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let automaton = field_terms.automaton.get_or_try_init(|| {
+                let map = Map::from_iter(
+                    field_terms
+                        .terms
+                        .iter()
+                        .map(|key| (key.serialized_value_bytes(), 0)),
+                )
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                Ok::<_, std::io::Error>(Arc::new(SetDfaWrapper(map)))
+            })?;
 
             sub_queries.push((
                 Occur::Should,
-                Box::new(AutomatonWeight::new(field, SetDfaWrapper(map))),
+                Box::new(AutomatonWeight::<SetDfaWrapper>::new(
+                    field,
+                    automaton.clone(),
+                )),
             ));
         }
 
@@ -74,14 +104,15 @@ impl Query for TermSetQuery {
     }
 
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
-        for terms in self.terms_map.values() {
-            for term in terms {
+        for field_terms in self.terms_map.values() {
+            for term in &field_terms.terms {
                 visitor(term, false);
             }
         }
     }
 }
 
+#[derive(Debug)]
 struct SetDfaWrapper(Map<Vec<u8>>);
 
 impl Automaton for SetDfaWrapper {
@@ -113,10 +144,71 @@ impl Automaton for SetDfaWrapper {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::collector::TopDocs;
-    use crate::query::{QueryParser, TermSetQuery};
-    use crate::schema::{Schema, TEXT};
+    use crate::query::{EnableScoring, Query, QueryParser, TermSetQuery};
+    use crate::schema::{Schema, STORED, TEXT};
     use crate::{assert_nearly_equals, Index, IndexWriter, Term};
+
+    #[test]
+    fn test_term_set_query_clones_share_compiled_automata() {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("field", TEXT);
+        let schema = schema_builder.build();
+        let query = TermSetQuery::new(
+            (0..128).map(|i| Term::from_field_text(field, &format!("value-{i}"))),
+        );
+        let clones = vec![query.clone(); 8];
+        assert!(query.terms_map[&field].automaton.get().is_none());
+
+        std::thread::scope(|scope| {
+            for clone in &clones {
+                let schema = &schema;
+                scope.spawn(move || {
+                    clone
+                        .weight(EnableScoring::disabled_from_schema(schema))
+                        .unwrap();
+                });
+            }
+        });
+
+        let automaton = query.terms_map[&field].automaton.get().unwrap();
+        for clone in &clones {
+            assert!(Arc::ptr_eq(
+                automaton,
+                clone.terms_map[&field].automaton.get().unwrap()
+            ));
+        }
+        query
+            .weight(EnableScoring::disabled_from_schema(&schema))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            automaton,
+            query.terms_map[&field].automaton.get().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_term_set_query_cached_automaton_validates_schema() {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("field", TEXT);
+        let schema = schema_builder.build();
+        let query = TermSetQuery::new([Term::from_field_text(field, "value")]);
+        query
+            .weight(EnableScoring::disabled_from_schema(&schema))
+            .unwrap();
+
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("field", STORED);
+        let schema = schema_builder.build();
+        assert!(matches!(
+            query
+                .clone()
+                .weight(EnableScoring::disabled_from_schema(&schema)),
+            Err(crate::TantivyError::SchemaError(_))
+        ));
+    }
 
     #[test]
     pub fn test_term_set_query() -> crate::Result<()> {
