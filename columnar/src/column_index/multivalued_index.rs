@@ -199,7 +199,7 @@ impl MultiValueIndex {
     /// Returns `[start, end)` values range, such that the values associated with
     /// the given document are `start..end`.
     #[inline]
-    pub(crate) fn range(&self, doc_id: DocId) -> Range<RowId> {
+    pub fn range(&self, doc_id: DocId) -> Range<RowId> {
         match self {
             MultiValueIndex::MultiValueIndexV1(idx) => idx.range(doc_id),
             MultiValueIndex::MultiValueIndexV2(idx) => idx.range(doc_id),

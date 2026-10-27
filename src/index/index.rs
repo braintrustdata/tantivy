@@ -982,8 +982,8 @@ impl Index {
     pub fn validate_checksum(&self) -> crate::Result<HashSet<PathBuf>> {
         let managed_files = self.directory.list_managed_files();
         let metas = self.load_metas()?;
-        let active_segments_files =
-            self.list_segment_files_with_artifacts(&metas.segments, &metas.persisted_custom_extensions);
+        let active_segments_files = self
+            .list_segment_files_with_artifacts(&metas.segments, &metas.persisted_custom_extensions);
         let active_existing_files: HashSet<&PathBuf> =
             active_segments_files.intersection(&managed_files).collect();
 

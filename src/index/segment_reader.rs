@@ -263,7 +263,10 @@ impl SegmentReader {
         //
         // Only the path is captured here; the bytes are read on first doc store access (see
         // `store_dictionary`), so opening a segment stays free of dictionary I/O.
-        let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
+        let store_dictionary_path = segment
+            .meta()
+            .docstore_dictionary_path()
+            .map(str::to_string);
         let store_directory: Arc<dyn Directory> = Arc::new(segment.index().directory().clone());
 
         Ok(SegmentReader {
@@ -707,28 +710,6 @@ fn intersect_alive_bitset(
 impl fmt::Debug for SegmentReader {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SegmentReader({:?})", self.segment_id)
-    }
-}
-
-// This is a cheap trick to reference the segment in the `open_with_custom_alive_set_parallel`
-// function without having to copy the segment
-struct SegmentRef {
-    segment: &'static Segment,
-}
-
-impl SegmentRef {
-    fn new(segment: &Segment) -> Self {
-        let leaked_segment = unsafe { std::mem::transmute(segment) };
-        Self {
-            segment: leaked_segment,
-        }
-    }
-}
-
-impl std::ops::Deref for SegmentRef {
-    type Target = Segment;
-    fn deref(&self) -> &Self::Target {
-        self.segment
     }
 }
 

@@ -3,7 +3,9 @@ use std::net::Ipv6Addr;
 use std::{fmt, str};
 
 use columnar::MonotonicallyMappableToU128;
-use common::json_path_writer::{JSON_END_OF_PATH, JSON_PATH_SEGMENT_SEP_STR};
+use common::json_path_writer::{
+    JSON_END_OF_PATH, JSON_PATH_SEGMENT_SEP, JSON_PATH_SEGMENT_SEP_STR,
+};
 use common::JsonPathWriter;
 use serde::{Deserialize, Serialize};
 
@@ -258,6 +260,46 @@ impl Term {
         &mut self.serialized_value_bytes[len_before..]
     }
 
+    /// Appends json path bytes to the Term.
+    /// If the path contains 0 bytes, they are replaced by a "0" string.
+    /// The 0 byte is used to mark the end of the path.
+    ///
+    /// This function returns the segment that has just been added.
+    #[inline]
+    pub fn append_path(&mut self, bytes: &[u8]) -> &mut [u8] {
+        let len_before = self.serialized_value_bytes.len();
+        if bytes.contains(&0u8) {
+            self.serialized_value_bytes
+                .extend(bytes.iter().map(|&b| if b == 0 { b'0' } else { b }));
+        } else {
+            self.serialized_value_bytes.extend_from_slice(bytes);
+        }
+        &mut self.serialized_value_bytes[len_before..]
+    }
+
+    /// Appends a JSON_PATH_SEGMENT_SEP to the term.
+    /// Only used for JSON type.
+    #[inline]
+    pub fn add_json_path_separator(&mut self) {
+        self.serialized_value_bytes.push(JSON_PATH_SEGMENT_SEP);
+    }
+
+    /// Sets the current end to JSON_END_OF_PATH.
+    /// Only used for JSON type.
+    #[inline]
+    pub fn set_json_path_end(&mut self) {
+        let buffer_len = self.serialized_value_bytes.len();
+        self.serialized_value_bytes[buffer_len - 1] = JSON_END_OF_PATH;
+    }
+
+    /// Sets the current end to JSON_PATH_SEGMENT_SEP.
+    /// Only used for JSON type.
+    #[inline]
+    pub fn set_json_path_separator(&mut self) {
+        let buffer_len = self.serialized_value_bytes.len();
+        self.serialized_value_bytes[buffer_len - 1] = JSON_PATH_SEGMENT_SEP;
+    }
+
     /// Return the type of the term.
     pub fn typ(&self) -> Type {
         self.value().typ()
@@ -299,10 +341,12 @@ impl Term {
 /// The nested ValueBytes in JSON is never of type JSON. (there's no recursion)
 #[derive(Clone)]
 pub struct ValueBytes<B>(B)
-where B: AsRef<[u8]>;
+where
+    B: AsRef<[u8]>;
 
 impl<B> ValueBytes<B>
-where B: AsRef<[u8]>
+where
+    B: AsRef<[u8]>,
 {
     /// Wraps a object holding bytes
     pub fn wrap(data: B) -> ValueBytes<B> {

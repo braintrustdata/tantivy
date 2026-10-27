@@ -6,8 +6,8 @@ use std::net::Ipv6Addr;
 use std::ops::{Bound, RangeInclusive};
 
 use columnar::{
-    BytesColumn, Cardinality, Column, ColumnType, MonotonicallyMappableToU128,
-    MonotonicallyMappableToU64, NumericalType, StrColumn,
+    BytesColumn, Cardinality, Column, ColumnType, HasAssociatedColumnType,
+    MonotonicallyMappableToU128, MonotonicallyMappableToU64, NumericalType, StrColumn,
 };
 use common::bounds::{BoundsRange, TransformBound};
 
@@ -417,6 +417,76 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
     )
 }
 
+/// Range filter over the `u64` representation of a fast field.
+///
+/// Unlike [`FastFieldRangeWeight`], the bounds are raw `u64` values (as produced by
+/// [`MonotonicallyMappableToU64`]) and are not tied to a term. With
+/// [`U64FastFieldRangeWeight::new_u64_lenient`] the column may be of any `u64`-mapped type, e.g. a
+/// date column can be filtered by the `u64` encoding of its values.
+#[derive(Clone, Debug)]
+pub struct U64FastFieldRangeWeight {
+    field: String,
+    bounds: BoundsRange<u64>,
+    column_type_opt: Option<ColumnType>,
+}
+
+impl U64FastFieldRangeWeight {
+    /// Creates a range filter over the `u64` representation of any `u64`-mapped fast field.
+    pub fn new_u64_lenient(
+        field: String,
+        lower_bound: Bound<u64>,
+        upper_bound: Bound<u64>,
+    ) -> Self {
+        Self {
+            field,
+            bounds: BoundsRange::new(lower_bound, upper_bound),
+            column_type_opt: None,
+        }
+    }
+
+    /// Creates a range filter over a fast field of the column type associated with `T`.
+    pub fn new<T: HasAssociatedColumnType + MonotonicallyMappableToU64>(
+        field: String,
+        lower_bound: Bound<T>,
+        upper_bound: Bound<T>,
+    ) -> Self {
+        Self {
+            field,
+            bounds: BoundsRange::new(lower_bound, upper_bound).map_bound(|val| val.to_u64()),
+            column_type_opt: Some(T::column_type()),
+        }
+    }
+}
+
+impl Query for U64FastFieldRangeWeight {
+    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl Weight for U64FastFieldRangeWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let column_types = self.column_type_opt.map(|column_type| [column_type]);
+        let Some((column, _)) = reader
+            .fast_fields()
+            .u64_lenient_for_type(column_types.as_ref().map(|types| &types[..]), &self.field)?
+        else {
+            return Ok(Box::new(EmptyScorer));
+        };
+        search_on_u64_ff(column, boost, self.bounds.clone())
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) != doc {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Document #({doc}) does not match"
+            )));
+        }
+        Ok(Explanation::new("Const", scorer.score()))
+    }
+}
+
 fn search_on_u64_ff(
     column: Column<u64>,
     boost: Score,
@@ -460,9 +530,7 @@ pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
     match typ {
         Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
         Type::IpAddr => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom | Type::Artifact => {
-            false
-        }
+        Type::Str | Type::Facet | Type::Bytes | Type::Json | Type::Custom | Type::Artifact => false,
     }
 }
 
@@ -532,6 +600,51 @@ mod tests {
         TEXT,
     };
     use crate::{Index, IndexWriter, TantivyDocument, Term, TERMINATED};
+
+    #[test]
+    fn test_u64_fast_field_range_weight() -> crate::Result<()> {
+        use columnar::MonotonicallyMappableToU64;
+
+        use super::U64FastFieldRangeWeight;
+
+        let mut schema_builder = Schema::builder();
+        let date = schema_builder.add_date_field("date", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        for secs in [10, 20, 30] {
+            index_writer.add_document(doc!(date => DateTime::from_timestamp_secs(secs)))?;
+        }
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let raw = |secs| DateTime::from_timestamp_secs(secs).to_u64();
+        let query = U64FastFieldRangeWeight::new_u64_lenient(
+            "date".to_string(),
+            Bound::Included(raw(15)),
+            Bound::Excluded(raw(30)),
+        );
+        assert_eq!(searcher.search(&query, &Count)?, 1);
+        let missing = U64FastFieldRangeWeight::new_u64_lenient(
+            "missing".to_string(),
+            Bound::Unbounded,
+            Bound::Unbounded,
+        );
+        assert_eq!(searcher.search(&missing, &Count)?, 0);
+        // A typed weight only matches columns of its own type.
+        let typed_u64 = U64FastFieldRangeWeight::new::<u64>(
+            "date".to_string(),
+            Bound::Unbounded,
+            Bound::Unbounded,
+        );
+        assert_eq!(searcher.search(&typed_u64, &Count)?, 0);
+        let typed_date = U64FastFieldRangeWeight::new::<DateTime>(
+            "date".to_string(),
+            Bound::Included(DateTime::from_timestamp_secs(20)),
+            Bound::Unbounded,
+        );
+        assert_eq!(searcher.search(&typed_date, &Count)?, 2);
+        Ok(())
+    }
 
     #[test]
     fn test_text_field_ff_range_query() -> crate::Result<()> {
