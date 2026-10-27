@@ -87,7 +87,7 @@ impl<V: SymbolValue> ColumnOperation<V> {
         minibuf
     }
 
-    /// Deserialize a colummn operation.
+    /// Deserialize a column operation.
     /// Returns None if the buffer is empty.
     ///
     /// Panics if the payload is invalid:
@@ -122,7 +122,6 @@ impl<T> From<T> for ColumnOperation<T> {
 // In order to limit memory usage, and in order
 // to benefit from the stacker, we do this by serialization our data
 // as "Symbols".
-#[allow(clippy::from_over_into)]
 pub(super) trait SymbolValue: Clone + Copy {
     // Serializes the symbol into the given buffer.
     // Returns the number of bytes written into the buffer.
@@ -245,7 +244,7 @@ impl SymbolValue for UnorderedId {
 
 fn compute_num_bytes_for_u64(val: u64) -> usize {
     let msb = (64u32 - val.leading_zeros()) as usize;
-    (msb + 7) / 8
+    msb.div_ceil(8)
 }
 
 fn encode_zig_zag(n: i64) -> u64 {

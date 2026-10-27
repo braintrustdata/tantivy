@@ -1,9 +1,46 @@
+//! `tantivy_sstable` is a crate that provides a sorted string table data structure.
+//!
+//! It is used in `tantivy` to store the term dictionary.
+//!
+//! A `sstable` is a map of sorted `&[u8]` keys to values.
+//! The keys are encoded using incremental encoding.
+//!
+//! Values and keys are compressed using zstd with the default feature flag `zstd-compression`.
+//!
+//! # Example
+//!
+//! Here is an example of how to create and search an `sstable`:
+//!
+//! ```rust
+//! use common::OwnedBytes;
+//! use tantivy_sstable::{Dictionary, MonotonicU64SSTable};
+//!
+//! // Create a new sstable in memory.
+//! let mut builder = Dictionary::<MonotonicU64SSTable>::builder(Vec::new()).unwrap();
+//! builder.insert(b"apple", &1).unwrap();
+//! builder.insert(b"banana", &2).unwrap();
+//! builder.insert(b"orange", &3).unwrap();
+//! let sstable_bytes = builder.finish().unwrap();
+//!
+//! // Open the sstable.
+//! let sstable =
+//!     Dictionary::<MonotonicU64SSTable>::from_bytes(OwnedBytes::new(sstable_bytes)).unwrap();
+//!
+//! // Search for a key.
+//! let value = sstable.get(b"banana").unwrap();
+//! assert_eq!(value, Some(2));
+//!
+//! // Search for a non-existent key.
+//! let value = sstable.get(b"grape").unwrap();
+//! assert_eq!(value, None);
+//! ```
+
 use std::io::{self, Write};
 use std::ops::Range;
-use std::usize;
 
 use merge::ValueMerger;
 
+mod block_match_automaton;
 mod delta;
 mod dictionary;
 mod lazy_fst;
@@ -11,15 +48,16 @@ pub mod merge;
 mod streamer;
 pub mod value;
 
-mod sstable_index_v3;
-pub use sstable_index_v3::{BlockAddr, SSTableIndex, SSTableIndexBuilder, SSTableIndexV3};
-mod sstable_index_v2;
+mod index;
+pub use index::{BlockAddr, SSTableIndex, SSTableIndexBuilder};
 pub(crate) mod vint;
-pub use dictionary::Dictionary;
+pub use common::{KeyTracking, WithoutKeys};
+pub use dictionary::{Dictionary, TermOrdHit};
 pub use streamer::{Streamer, StreamerBuilder};
 
 mod block_reader;
 use common::{BinarySerializable, OwnedBytes};
+use value::{VecU32ValueReader, VecU32ValueWriter};
 
 pub use self::block_reader::BlockReader;
 pub use self::delta::{DeltaDecoder, DeltaReader, DeltaWriter};
@@ -34,7 +72,7 @@ const SSTABLE_VERSION: u32 = 3;
 
 /// Given two byte string returns the length of
 /// the longest common prefix.
-fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+pub(crate) fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
     left.iter()
         .cloned()
         .zip(right.iter().cloned())
@@ -87,7 +125,6 @@ pub trait SSTable: Sized {
     }
 }
 
-#[allow(dead_code)]
 pub struct VoidSSTable;
 
 impl SSTable for VoidSSTable {
@@ -102,7 +139,6 @@ impl SSTable for VoidSSTable {
 /// In other words, two keys `k1` and `k2`
 /// such that `k1` <= `k2`, are required to observe
 /// `range_sstable[k1] <= range_sstable[k2]`.
-#[allow(dead_code)]
 pub struct MonotonicU64SSTable;
 
 impl SSTable for MonotonicU64SSTable {
@@ -131,6 +167,15 @@ impl SSTable for RangeSSTable {
     type ValueReader = RangeValueReader;
 
     type ValueWriter = RangeValueWriter;
+}
+
+/// SSTable associating keys to Vec<u32>.
+pub struct VecU32ValueSSTable;
+
+impl SSTable for VecU32ValueSSTable {
+    type Value = Vec<u32>;
+    type ValueReader = VecU32ValueReader;
+    type ValueWriter = VecU32ValueWriter;
 }
 
 /// SSTable reader.
@@ -258,8 +303,9 @@ where
             || self.previous_key[keep_len] < key[keep_len];
         assert!(
             increasing_keys,
-            "Keys should be increasing. ({:?} > {key:?})",
-            self.previous_key
+            "Keys should be increasing. ({:?} > {:?})",
+            String::from_utf8_lossy(&self.previous_key),
+            String::from_utf8_lossy(key),
         );
         self.previous_key.resize(key.len(), 0u8);
         self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
@@ -325,7 +371,7 @@ mod test {
 
     use common::OwnedBytes;
 
-    use super::{common_prefix_len, MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable};
+    use super::{MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable, common_prefix_len};
 
     fn aux_test_common_prefix_len(left: &str, right: &str, expect_len: usize) {
         assert_eq!(
@@ -388,7 +434,7 @@ mod test {
                 16, 17, 33, 18, 19, 17, 20, // data block
                 0, 0, 0, 0, // no more block
                 // index
-                0, 0, 0, 0, 0, 0, 0, 0, // fst lenght
+                0, 0, 0, 0, 0, 0, 0, 0, // fst length
                 16, 0, 0, 0, 0, 0, 0, 0, // index start offset
                 3, 0, 0, 0, 0, 0, 0, 0, // num term
                 3, 0, 0, 0, // version

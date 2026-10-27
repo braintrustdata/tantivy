@@ -8,7 +8,7 @@ use columnar::{
 };
 use common::ByteCount;
 
-use crate::core::json_utils::encode_column_name;
+use crate::core::json_utils::{encode_column_name, json_path_sep_to_dot};
 use crate::directory::FileSlice;
 use crate::schema::{Field, FieldEntry, FieldType, Schema};
 use crate::space_usage::{FieldUsage, PerFieldSpaceUsage};
@@ -39,19 +39,15 @@ impl FastFieldReaders {
         self.resolve_column_name_given_default_field(column_name, default_field_opt)
     }
 
-    pub(crate) fn space_usage(&self, schema: &Schema) -> io::Result<PerFieldSpaceUsage> {
+    pub(crate) fn space_usage(&self) -> io::Result<PerFieldSpaceUsage> {
         let mut per_field_usages: Vec<FieldUsage> = Default::default();
-        for (field, field_entry) in schema.fields() {
-            let column_handles = self.columnar.read_columns(field_entry.name())?;
-            let num_bytes: ByteCount = column_handles
-                .iter()
-                .map(|column_handle| column_handle.num_bytes())
-                .sum();
-            let mut field_usage = FieldUsage::empty(field);
-            field_usage.add_field_idx(0, num_bytes);
+        for (mut field_name, column_handle) in self.columnar.iter_columns()? {
+            json_path_sep_to_dot(&mut field_name);
+            let space_usage = column_handle.space_usage()?;
+            let mut field_usage = FieldUsage::empty(field_name);
+            field_usage.set_column_usage(space_usage);
             per_field_usages.push(field_usage);
         }
-        // TODO fix space usage for JSON fields.
         Ok(PerFieldSpaceUsage::new(per_field_usages))
     }
 
@@ -70,13 +66,13 @@ impl FastFieldReaders {
     ///
     /// This function transforms `attributes.color` into a column key to be used in the `columnar`.
     ///
-    /// The logic works as follows, first we identify which field is targetted by calling
+    /// The logic works as follows, first we identify which field is targeted by calling
     /// `schema.find_field(..)`. This method will attempt to split the user splied fast field
     /// name by non-escaped dots, and find the longest matching schema field name.
     /// In our case, it would return the (attribute_field, "color").
     ///
     /// If no field is found, but a dynamic field is supplied, then we
-    /// will simply assuem the user is targetting the dynamic field. (This feature is used in
+    /// will simply assume the user is targeting the dynamic field. (This feature is used in
     /// Quickwit.)
     ///
     /// We then encode the `(field, path)` into the right `columnar_key`.
@@ -217,7 +213,7 @@ impl FastFieldReaders {
         Ok(dynamic_column.into())
     }
 
-    /// Returning a `dynamic_column_handle`.
+    /// Returns a `dynamic_column_handle`.
     pub fn dynamic_column_handle(
         &self,
         field_name: &str,
@@ -234,7 +230,7 @@ impl FastFieldReaders {
         Ok(dynamic_column_handle_opt)
     }
 
-    /// Returning all `dynamic_column_handle`.
+    /// Returns all `dynamic_column_handle` that match the given field name.
     pub fn dynamic_column_handles(
         &self,
         field_name: &str,
@@ -245,6 +241,22 @@ impl FastFieldReaders {
         let dynamic_column_handles = self
             .columnar
             .read_columns(&resolved_field_name)?
+            .into_iter()
+            .collect();
+        Ok(dynamic_column_handles)
+    }
+
+    /// Returns all `dynamic_column_handle` that are inner fields of the provided JSON path.
+    pub fn dynamic_subpath_column_handles(
+        &self,
+        root_path: &str,
+    ) -> crate::Result<Vec<DynamicColumnHandle>> {
+        let Some(resolved_field_name) = self.resolve_field(root_path)? else {
+            return Ok(Vec::new());
+        };
+        let dynamic_column_handles = self
+            .columnar
+            .read_subpath_columns(&resolved_field_name)?
             .into_iter()
             .collect();
         Ok(dynamic_column_handles)
@@ -261,6 +273,21 @@ impl FastFieldReaders {
         let columns = self
             .columnar
             .read_columns_async(&resolved_field_name)
+            .await?;
+        Ok(columns)
+    }
+
+    #[doc(hidden)]
+    pub async fn list_subpath_dynamic_column_handles(
+        &self,
+        root_path: &str,
+    ) -> crate::Result<Vec<DynamicColumnHandle>> {
+        let Some(resolved_field_name) = self.resolve_field(root_path)? else {
+            return Ok(Vec::new());
+        };
+        let columns = self
+            .columnar
+            .read_subpath_columns_async(&resolved_field_name)
             .await?;
         Ok(columns)
     }
@@ -357,6 +384,7 @@ mod tests {
     use columnar::ColumnType;
 
     use crate::schema::{JsonObjectOptions, Schema, FAST};
+    use crate::tokenizer::RAW_TOKENIZER_NAME;
     use crate::{Index, IndexWriter, TantivyDocument};
 
     #[test]
@@ -367,7 +395,7 @@ mod tests {
         schema_builder.add_json_field(
             "json_expand_dots_enabled",
             JsonObjectOptions::default()
-                .set_fast(None)
+                .set_fast(RAW_TOKENIZER_NAME)
                 .set_expand_dots_enabled(),
         );
         let dynamic_field = schema_builder.add_json_field("_dyna", FAST);
@@ -476,6 +504,15 @@ mod tests {
             .iter()
             .any(|column| column.column_type() == ColumnType::Str));
 
-        println!("*** {:?}", fast_fields.columnar().list_columns());
+        let json_columns = fast_fields.dynamic_column_handles("json").unwrap();
+        assert_eq!(json_columns.len(), 0);
+
+        let json_subcolumns = fast_fields.dynamic_subpath_column_handles("json").unwrap();
+        assert_eq!(json_subcolumns.len(), 3);
+
+        let foo_subcolumns = fast_fields
+            .dynamic_subpath_column_handles("json.foo")
+            .unwrap();
+        assert_eq!(foo_subcolumns.len(), 0);
     }
 }

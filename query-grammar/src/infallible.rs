@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 
 use nom::{AsChar, IResult, InputLength, InputTakeAtPosition};
+use serde::Serialize;
 
 pub(crate) type ErrorList = Vec<LenientErrorInternal>;
 pub(crate) type JResult<I, O> = IResult<I, (O, ErrorList), Infallible>;
@@ -15,7 +16,8 @@ pub(crate) struct LenientErrorInternal {
 }
 
 /// A recoverable error and the position it happened at
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub struct LenientError {
     pub pos: usize,
     pub message: String,
@@ -109,7 +111,25 @@ where F: nom::Parser<I, (O, ErrorList), Infallible> {
     move |input: I| match f.parse(input) {
         Ok((input, (output, _err))) => Ok((input, output)),
         Err(Err::Incomplete(needed)) => Err(Err::Incomplete(needed)),
+        // old versions don't understand this is uninhabited and need the empty match to help,
+        // newer versions warn because this arm is unreachable (which it is indeed).
         Err(Err::Error(val)) | Err(Err::Failure(val)) => match val {},
+    }
+}
+
+pub(crate) fn terminated_infallible<I, O1, O2, F, G>(
+    mut first: F,
+    mut second: G,
+) -> impl FnMut(I) -> JResult<I, O1>
+where
+    F: nom::Parser<I, (O1, ErrorList), Infallible>,
+    G: nom::Parser<I, (O2, ErrorList), Infallible>,
+{
+    move |input: I| {
+        let (input, (o1, mut err)) = first.parse(input)?;
+        let (input, (_, mut err2)) = second.parse(input)?;
+        err.append(&mut err2);
+        Ok((input, (o1, err)))
     }
 }
 
@@ -182,19 +202,19 @@ macro_rules! tuple_trait_impl(
 );
 
 macro_rules! tuple_trait_inner(
-  ($it:tt, $self:expr, $input:expr, (), $error_list:expr, $head:ident $($id:ident)+) => ({
+  ($it:tt, $self:expr_2021, $input:expr_2021, (), $error_list:expr_2021, $head:ident $($id:ident)+) => ({
     let (i, (o, mut err)) = $self.$it.parse($input.clone())?;
     $error_list.append(&mut err);
 
     succ!($it, tuple_trait_inner!($self, i, ( o ), $error_list, $($id)+))
   });
-  ($it:tt, $self:expr, $input:expr, ($($parsed:tt)*), $error_list:expr, $head:ident $($id:ident)+) => ({
+  ($it:tt, $self:expr_2021, $input:expr_2021, ($($parsed:tt)*), $error_list:expr_2021, $head:ident $($id:ident)+) => ({
     let (i, (o, mut err)) = $self.$it.parse($input.clone())?;
     $error_list.append(&mut err);
 
     succ!($it, tuple_trait_inner!($self, i, ($($parsed)* , o), $error_list, $($id)+))
   });
-  ($it:tt, $self:expr, $input:expr, ($($parsed:tt)*), $error_list:expr, $head:ident) => ({
+  ($it:tt, $self:expr_2021, $input:expr_2021, ($($parsed:tt)*), $error_list:expr_2021, $head:ident) => ({
     let (i, (o, mut err)) = $self.$it.parse($input.clone())?;
     $error_list.append(&mut err);
 
@@ -324,13 +344,13 @@ macro_rules! alt_trait_impl(
 );
 
 macro_rules! alt_trait_inner(
-  ($it:tt, $self:expr, $input:expr, $head_cond:ident $head:ident, $($id_cond:ident $id:ident),+) => (
+  ($it:tt, $self:expr_2021, $input:expr_2021, $head_cond:ident $head:ident, $($id_cond:ident $id:ident),+) => (
     match $self.$it.0.parse($input.clone()) {
       Err(_) => succ!($it, alt_trait_inner!($self, $input, $($id_cond $id),+)),
       Ok((input_left, _)) => Some($self.$it.1.parse(input_left)),
     }
   );
-  ($it:tt, $self:expr, $input:expr, $head_cond:ident $head:ident) => (
+  ($it:tt, $self:expr_2021, $input:expr_2021, $head_cond:ident $head:ident) => (
     None
   );
 );
@@ -350,4 +370,22 @@ where
     F: nom::Parser<I, (O, ErrorList), Infallible>,
 {
     move |i: I| l.choice(i.clone()).unwrap_or_else(|| default.parse(i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lenient_error_serialization() {
+        let error = LenientError {
+            pos: 42,
+            message: "test error message".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            "{\"pos\":42,\"message\":\"test error message\"}"
+        );
+    }
 }

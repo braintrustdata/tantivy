@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use common::{BitSet, CountingWriter, ReadOnlyBitSet};
 use sstable::{SSTable, Streamer, TermOrdinal, VoidSSTable};
 
-use super::term_merger::TermMerger;
+use super::term_merger::{TermMerger, TermsWithSegmentOrd};
 use crate::column::serialize_column_mappable_to_u64;
 use crate::column_index::SerializableColumnIndex;
 use crate::iterable::Iterable;
@@ -21,7 +21,13 @@ pub fn merge_bytes_or_str_column(
     let mut output = CountingWriter::wrap(output);
     // TODO !!! Remove useless terms.
     let term_ord_mapping = serialize_merged_dict(bytes_columns, merge_row_order, &mut output)?;
-    let dictionary_num_bytes: u32 = output.written_bytes() as u32;
+    if output.written_bytes() > u64::from(u32::MAX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "merged dictionary size exceeds u32::MAX bytes",
+        ));
+    }
+    let dictionary_num_bytes = output.written_bytes() as u32;
     let output = output.finish();
     let remapped_term_ordinals_values = RemappedTermOrdinalsValues {
         bytes_columns,
@@ -33,13 +39,32 @@ pub fn merge_bytes_or_str_column(
     Ok(())
 }
 
+/// Computes a per-segment mapping from old term ordinal to merged term ordinal.
+///
+/// Performs a streaming k-way merge of per-segment term dictionaries (SSTable-backed) to build
+/// a unified ordering. For each segment, the output is a `Vec<TermOrdinal>` where index `i`
+/// holds the merged global ordinal corresponding to segment-local ordinal `i`.
+///
+/// This is used by index sorting to compare terms from different segments without materializing
+/// term bytes in memory — only ordinals are compared.
+#[doc(hidden)]
+pub fn compute_merged_term_ord_mapping(
+    bytes_columns: &[BytesColumn],
+) -> io::Result<Vec<Vec<TermOrdinal>>> {
+    let bytes_columns_opt: Vec<Option<BytesColumn>> =
+        bytes_columns.iter().cloned().map(Some).collect();
+    let term_ord_mapping =
+        merge_dict_and_compute_term_ord_mapping(&bytes_columns_opt, |_| true, |_| Ok(()))?;
+    Ok(term_ord_mapping.into_per_segment_new_term_ordinals())
+}
+
 struct RemappedTermOrdinalsValues<'a> {
     bytes_columns: &'a [Option<BytesColumn>],
     term_ord_mapping: &'a TermOrdinalMapping,
     merge_row_order: &'a MergeRowOrder,
 }
 
-impl<'a> Iterable for RemappedTermOrdinalsValues<'a> {
+impl Iterable for RemappedTermOrdinalsValues<'_> {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         match self.merge_row_order {
             MergeRowOrder::Stack(_) => self.boxed_iter_stacked(),
@@ -50,7 +75,7 @@ impl<'a> Iterable for RemappedTermOrdinalsValues<'a> {
     }
 }
 
-impl<'a> RemappedTermOrdinalsValues<'a> {
+impl RemappedTermOrdinalsValues<'_> {
     fn boxed_iter_stacked(&self) -> Box<dyn Iterator<Item = u64> + '_> {
         let iter = self
             .bytes_columns
@@ -118,41 +143,56 @@ fn is_term_present(bitsets: &[Option<BitSet>], term_merger: &TermMerger) -> bool
     false
 }
 
+fn merge_dict_and_compute_term_ord_mapping(
+    bytes_columns: &[Option<BytesColumn>],
+    mut should_keep_term: impl FnMut(&TermMerger) -> bool,
+    mut emit_term: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<TermOrdinalMapping> {
+    let mut term_ord_mapping = TermOrdinalMapping::default();
+
+    let mut field_term_streams = Vec::with_capacity(bytes_columns.len());
+    for (segment_ord, column_opt) in bytes_columns.iter().enumerate() {
+        if let Some(column) = column_opt {
+            term_ord_mapping.add_segment(column.dictionary.num_terms());
+            let terms: Streamer<VoidSSTable> = column.dictionary.stream()?;
+            field_term_streams.push(TermsWithSegmentOrd { terms, segment_ord });
+        } else {
+            term_ord_mapping.add_segment(0);
+            field_term_streams.push(TermsWithSegmentOrd {
+                terms: Streamer::empty(),
+                segment_ord,
+            });
+        }
+    }
+
+    let mut merged_terms = TermMerger::new(field_term_streams);
+    let mut current_term_ord = 0;
+    while merged_terms.advance() {
+        if !should_keep_term(&merged_terms) {
+            continue;
+        }
+        emit_term(merged_terms.key())?;
+        for (segment_ord, from_term_ord) in merged_terms.matching_segments() {
+            term_ord_mapping.register_from_to(segment_ord, from_term_ord, current_term_ord);
+        }
+        current_term_ord += 1;
+    }
+
+    Ok(term_ord_mapping)
+}
+
 fn serialize_merged_dict(
     bytes_columns: &[Option<BytesColumn>],
     merge_row_order: &MergeRowOrder,
     output: &mut impl Write,
 ) -> io::Result<TermOrdinalMapping> {
-    let mut term_ord_mapping = TermOrdinalMapping::default();
-
-    let mut field_term_streams = Vec::new();
-    for column_opt in bytes_columns.iter() {
-        if let Some(column) = column_opt {
-            term_ord_mapping.add_segment(column.dictionary.num_terms());
-            let terms: Streamer<VoidSSTable> = column.dictionary.stream()?;
-            field_term_streams.push(terms);
-        } else {
-            term_ord_mapping.add_segment(0);
-            field_term_streams.push(Streamer::empty());
-        }
-    }
-
-    let mut merged_terms = TermMerger::new(field_term_streams);
     let mut sstable_builder = sstable::VoidSSTable::writer(output);
-
-    match merge_row_order {
-        MergeRowOrder::Stack(_) => {
-            let mut current_term_ord = 0;
-            while merged_terms.advance() {
-                let term_bytes: &[u8] = merged_terms.key();
-                sstable_builder.insert(term_bytes, &())?;
-                for (segment_ord, from_term_ord) in merged_terms.matching_segments() {
-                    term_ord_mapping.register_from_to(segment_ord, from_term_ord, current_term_ord);
-                }
-                current_term_ord += 1;
-            }
-            sstable_builder.finish()?;
-        }
+    let term_ord_mapping = match merge_row_order {
+        MergeRowOrder::Stack(_) => merge_dict_and_compute_term_ord_mapping(
+            bytes_columns,
+            |_| true,
+            |term_bytes| sstable_builder.insert(term_bytes, &()),
+        )?,
         MergeRowOrder::Shuffled(shuffle_merge_order) => {
             assert_eq!(shuffle_merge_order.alive_bitsets.len(), bytes_columns.len());
             let mut term_bitsets: Vec<Option<BitSet>> = Vec::with_capacity(bytes_columns.len());
@@ -171,26 +211,20 @@ fn serialize_merged_dict(
                     }
                 }
             }
-            let mut current_term_ord = 0;
-            while merged_terms.advance() {
-                let term_bytes: &[u8] = merged_terms.key();
-                if !is_term_present(&term_bitsets[..], &merged_terms) {
-                    continue;
-                }
-                sstable_builder.insert(term_bytes, &())?;
-                for (segment_ord, from_term_ord) in merged_terms.matching_segments() {
-                    term_ord_mapping.register_from_to(segment_ord, from_term_ord, current_term_ord);
-                }
-                current_term_ord += 1;
-            }
-            sstable_builder.finish()?;
+            merge_dict_and_compute_term_ord_mapping(
+                bytes_columns,
+                |merged_terms| is_term_present(&term_bitsets[..], merged_terms),
+                |term_bytes| sstable_builder.insert(term_bytes, &()),
+            )?
         }
-    }
+    };
+    sstable_builder.finish()?;
     Ok(term_ord_mapping)
 }
 
 #[derive(Default, Debug)]
 struct TermOrdinalMapping {
+    /// Contains the new term ordinals for each segment.
     per_segment_new_term_ordinals: Vec<Vec<TermOrdinal>>,
 }
 
@@ -205,6 +239,10 @@ impl TermOrdinalMapping {
     }
 
     fn get_segment(&self, segment_ord: u32) -> &[TermOrdinal] {
-        &(self.per_segment_new_term_ordinals[segment_ord as usize])[..]
+        &self.per_segment_new_term_ordinals[segment_ord as usize]
+    }
+
+    fn into_per_segment_new_term_ordinals(self) -> Vec<Vec<TermOrdinal>> {
+        self.per_segment_new_term_ordinals
     }
 }

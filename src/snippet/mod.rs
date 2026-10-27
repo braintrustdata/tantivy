@@ -1,5 +1,6 @@
 //! [`SnippetGenerator`]
 //! Generates a text snippet for a given document, and some highlighted parts inside it.
+//!
 //! Imagine you doing a text search in a document
 //! and want to show a preview of where in the document the search terms occur,
 //! along with some surrounding text to give context, and the search terms highlighted.
@@ -100,7 +101,7 @@ impl FragmentCandidate {
     /// if the token is one of the terms, the score
     /// and highlighted fields are updated in the fragment.
     fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, Score>) {
-        self.stop_offset = token.offset_to;
+        self.stop_offset = self.stop_offset.max(token.offset_to);
 
         if let Some(&score) = terms.get(&token.text.to_lowercase()) {
             self.score += score;
@@ -114,6 +115,7 @@ impl FragmentCandidate {
 #[derive(Debug)]
 pub struct Snippet {
     fragment: String,
+    fragment_range: Range<usize>,
     highlighted: Vec<Range<usize>>,
     snippet_prefix: String,
     snippet_postfix: String,
@@ -121,9 +123,10 @@ pub struct Snippet {
 
 impl Snippet {
     /// Create a new `Snippet`.
-    fn new(fragment: &str, highlighted: Vec<Range<usize>>) -> Self {
+    fn new(fragment: &str, fragment_range: Range<usize>, highlighted: Vec<Range<usize>>) -> Self {
         Self {
             fragment: fragment.to_string(),
+            fragment_range,
             highlighted,
             snippet_prefix: DEFAULT_SNIPPET_PREFIX.to_string(),
             snippet_postfix: DEFAULT_SNIPPET_POSTFIX.to_string(),
@@ -134,6 +137,7 @@ impl Snippet {
     pub fn empty() -> Snippet {
         Snippet {
             fragment: String::new(),
+            fragment_range: 0..0,
             highlighted: Vec::new(),
             snippet_prefix: String::new(),
             snippet_postfix: String::new(),
@@ -166,6 +170,15 @@ impl Snippet {
     /// Returns the fragment of text used in the  snippet.
     pub fn fragment(&self) -> &str {
         &self.fragment
+    }
+
+    /// Returns the byte range of the fragment within the text the snippet was
+    /// generated from.
+    ///
+    /// For [`SnippetGenerator::snippet_from_doc`], that text is the field's
+    /// values joined by a single space and trimmed.
+    pub fn fragment_range(&self) -> Range<usize> {
+        self.fragment_range.clone()
     }
 
     /// Returns a list of highlighted positions from the `Snippet`.
@@ -211,7 +224,11 @@ fn search_fragments(
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
     while let Some(next) = token_stream.next() {
-        if (next.offset_to - fragment.start_offset) > max_num_chars {
+        // Offsets are in bytes, and a char is at least one byte, so the chars
+        // only need to be counted once the fragment is longer than `max_num_chars` bytes.
+        if (next.offset_to - fragment.start_offset) > max_num_chars
+            && text[fragment.start_offset..next.offset_to].chars().count() > max_num_chars
+        {
             if fragment.score > 0.0 {
                 fragments.push(fragment)
             };
@@ -249,7 +266,11 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
             .iter()
             .map(|item| item.start - fragment.start_offset..item.end - fragment.start_offset)
             .collect();
-        Snippet::new(fragment_text, highlighted)
+        Snippet::new(
+            fragment_text,
+            fragment.start_offset..fragment.stop_offset,
+            highlighted,
+        )
     } else {
         // When there are no fragments to chose from,
         // for now create an empty snippet.
@@ -257,38 +278,66 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
     }
 }
 
-/// Returns ranges that are collapsed into non-overlapped ranges.
+/// Sorts and removes duplicate ranges from the input.
+///
+/// This function first sorts the ranges by their start position,
+/// then by their end position, and finally removes any duplicate ranges.
+///
+/// ## Examples
+/// - [0..3, 3..6, 0..3, 3..6] -> [0..3, 3..6]
+/// - [2..4, 1..3, 2..4, 0..2] -> [0..2, 1..3, 2..4]
+fn sort_and_deduplicate_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut sorted_ranges = ranges.to_vec();
+    sorted_ranges.sort_by_key(|range| (range.start, range.end));
+    sorted_ranges.dedup();
+    sorted_ranges
+}
+
+/// Merges overlapping or adjacent ranges into non-overlapping ranges.
+///
+/// This function assumes that the input ranges are already sorted
+/// and deduplicated. Use `sort_and_deduplicate_ranges` before calling
+/// this function if the input might contain unsorted or duplicate ranges.
 ///
 /// ## Examples
 /// - [0..1, 2..3] -> [0..1, 2..3]  # no overlap
-/// - [0..1, 1..2] -> [0..1, 1..2]  # no overlap
-/// - [0..2, 1..2] -> [0..2]  # collapsed
-/// - [0..2, 1..3] -> [0..3]  # collapsed
-/// - [0..3, 1..2] -> [0..3]  # second range's end is also inside of the first range
-///
-/// Note: This function assumes `ranges` is sorted by `Range.start` in ascending order.
-fn collapse_overlapped_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+/// - [0..1, 1..2] -> [0..2]  # adjacent, merged
+/// - [0..2, 1..3] -> [0..3]  # overlapping, merged
+/// - [0..3, 1..2] -> [0..3]  # second range is completely within the first
+fn merge_overlapping_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
     debug_assert!(is_sorted(ranges.iter().map(|range| range.start)));
-
-    let mut result = Vec::new();
-    let mut ranges_it = ranges.iter();
-
-    let mut current = match ranges_it.next() {
-        Some(range) => range.clone(),
-        None => return result,
-    };
-
+    let mut result = Vec::<Range<usize>>::new();
     for range in ranges {
-        if current.end > range.start {
-            current = current.start..std::cmp::max(current.end, range.end);
+        if let Some(last) = result.last_mut() {
+            if last.end > range.start {
+                // Only merge when there is a true overlap.
+                last.end = std::cmp::max(last.end, range.end);
+            } else {
+                // Do not overlap or only adjacent, add new scope.
+                result.push(range.clone());
+            }
         } else {
-            result.push(current);
-            current = range.clone();
+            // The first range
+            result.push(range.clone());
         }
     }
-
-    result.push(current);
     result
+}
+
+/// Collapses ranges into non-overlapped ranges.
+///
+/// This function first sorts and deduplicates the input ranges,
+/// then merges any overlapping or adjacent ranges.
+///
+/// ## Examples
+/// - [0..1, 2..3] -> [0..1, 2..3]  # no overlap
+/// - [0..1, 1..2] -> [0..2]  # adjacent, merged
+/// - [0..2, 1..3] -> [0..3]  # overlapping, merged
+/// - [0..3, 1..2] -> [0..3]  # second range is completely within the first
+/// - [0..3, 3..6, 0..3, 3..6] -> [0..6]  # duplicates removed, then merged
+pub fn collapse_overlapped_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let prepared = sort_and_deduplicate_ranges(ranges);
+    merge_overlapping_ranges(&prepared)
 }
 
 fn is_sorted(mut it: impl Iterator<Item = usize>) -> bool {
@@ -408,7 +457,7 @@ impl SnippetGenerator {
     }
 
     #[cfg(test)]
-    pub fn terms_text(&self) -> &BTreeMap<String, Score> {
+    pub(crate) fn terms_text(&self) -> &BTreeMap<String, Score> {
         &self.terms_text
     }
 
@@ -448,14 +497,15 @@ impl SnippetGenerator {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ops::Range;
 
     use maplit::btreemap;
 
     use super::{collapse_overlapped_ranges, search_fragments, select_best_fragment_combination};
     use crate::query::QueryParser;
-    use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, TEXT};
+    use crate::schema::{Schema, TEXT};
     use crate::snippet::SnippetGenerator;
-    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
+    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer, Token};
     use crate::Index;
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
@@ -504,6 +554,24 @@ Survey in 2016, 2017, and 2018."#;
     }
 
     #[test]
+    fn test_snippet_with_overlapping_tokens() {
+        let terms = btreemap! { "abc".to_string() => 1.0 };
+        let mut fragment = super::FragmentCandidate::new(0);
+        // A whole token followed by a shorter token at the same offset.
+        for text in ["abc", "a"] {
+            let token = Token {
+                text: text.to_string(),
+                offset_from: 0,
+                offset_to: text.len(),
+                ..Token::default()
+            };
+            fragment.try_add_token(&token, &terms);
+        }
+        let snippet = select_best_fragment_combination(&[fragment], "abc");
+        assert_eq!(snippet.to_html(), "<b>abc</b>");
+    }
+
+    #[test]
     fn test_snippet_scored_fragment() {
         {
             let terms = btreemap! {
@@ -547,6 +615,28 @@ Survey in 2016, 2017, and 2018."#;
     }
 
     #[test]
+    fn test_snippet_max_num_chars_counts_chars_not_bytes() {
+        // Every Cyrillic letter takes 2 bytes in UTF-8.
+        let text = "русский текст русский текст";
+        let terms = btreemap! { String::from("текст") => 1.0 };
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            text,
+            &terms,
+            20,
+        );
+        assert_eq!(fragments.len(), 2);
+        for fragment in &fragments {
+            let fragment_text = &text[fragment.start_offset..fragment.stop_offset];
+            assert!(fragment_text.chars().count() <= 20);
+        }
+        let snippet = select_best_fragment_combination(&fragments[..], text);
+        // "русский текст" is 13 chars (25 bytes), so it fits within 20 chars.
+        assert_eq!(snippet.fragment, "русский текст");
+        assert_eq!(snippet.to_html(), "русский <b>текст</b>");
+    }
+
+    #[test]
     fn test_snippet_in_second_fragment() {
         let text = "a b c d e f g";
 
@@ -566,6 +656,7 @@ Survey in 2016, 2017, and 2018."#;
 
         let snippet = select_best_fragment_combination(&fragments[..], text);
         assert_eq!(snippet.fragment, "c d");
+        assert_eq!(snippet.fragment_range(), 4..7);
         assert_eq!(snippet.to_html(), "<b>c</b> d");
     }
 
@@ -589,7 +680,28 @@ Survey in 2016, 2017, and 2018."#;
 
         let snippet = select_best_fragment_combination(&fragments[..], text);
         assert_eq!(snippet.fragment, "e f");
+        assert_eq!(snippet.fragment_range(), 8..11);
         assert_eq!(snippet.to_html(), "e <b>f</b>");
+    }
+
+    #[test]
+    fn test_snippet_fragment_range_with_repeated_text() {
+        // "a b" also occurs earlier, straddling a fragment boundary, so a
+        // text search for the fragment would locate the wrong occurrence.
+        let text = "x a b y a b";
+
+        let mut terms = BTreeMap::new();
+        terms.insert(String::from("a"), 1.0);
+        terms.insert(String::from("b"), 1.0);
+
+        let fragments =
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
+
+        let snippet = select_best_fragment_combination(&fragments[..], text);
+        assert_eq!(snippet.fragment, "a b");
+        assert_eq!(snippet.fragment_range(), 8..11);
+        assert_eq!(&text[snippet.fragment_range()], snippet.fragment());
+        assert_ne!(text.find(snippet.fragment()), Some(8));
     }
 
     #[test]
@@ -645,6 +757,7 @@ Survey in 2016, 2017, and 2018."#;
 
         let snippet = select_best_fragment_combination(&fragments[..], text);
         assert_eq!(snippet.fragment, "");
+        assert_eq!(snippet.fragment_range(), 0..0);
         assert_eq!(snippet.to_html(), "");
         assert!(snippet.is_empty());
     }
@@ -697,8 +810,10 @@ Survey in 2016, 2017, and 2018."#;
         Ok(())
     }
 
+    #[cfg(feature = "stemmer")]
     #[test]
     fn test_snippet_generator() -> crate::Result<()> {
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
         let mut schema_builder = Schema::builder();
         let text_options = TextOptions::default().set_indexing_options(
             TextFieldIndexing::default()
@@ -739,16 +854,6 @@ Survey in 2016, 2017, and 2018."#;
             );
         }
         Ok(())
-    }
-
-    #[test]
-    fn test_collapse_overlapped_ranges() {
-        #![allow(clippy::single_range_in_vec_init)]
-        assert_eq!(&collapse_overlapped_ranges(&[0..1, 2..3]), &[0..1, 2..3]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..1, 1..2]), &[0..1, 1..2]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..2]), &[0..2]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..3]), &[0..3]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..3, 1..2]), &[0..3]);
     }
 
     #[test]
@@ -800,5 +905,86 @@ Survey in 2016, 2017, and 2018."#;
             "<q class=\"super\">Rust</q> is a systems programming <q class=\"super\">language</q> \
              sponsored by\nMozilla which describes it as a &quot;safe"
         );
+    }
+
+    #[test]
+    fn test_collapse_overlapped_ranges() {
+        #![allow(clippy::single_range_in_vec_init)]
+        assert_eq!(&collapse_overlapped_ranges(&[0..1, 2..3]), &[0..1, 2..3]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..1, 1..2]), &[0..1, 1..2]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..2]), &[0..2]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..3]), &[0..3]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..3, 1..2]), &[0..3]);
+    }
+
+    #[test]
+    fn test_no_overlap() {
+        let ranges = vec![0..1, 2..3, 4..5];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..1, 2..3, 4..5]);
+    }
+
+    #[test]
+    fn test_adjacent_ranges() {
+        let ranges = vec![0..1, 1..2, 2..3];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn test_overlapping_ranges() {
+        let ranges = vec![0..2, 1..3, 2..4];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..4]);
+    }
+
+    #[test]
+    fn test_contained_ranges() {
+        let ranges = vec![0..5, 1..2, 3..4];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..5]);
+    }
+
+    #[test]
+    fn test_duplicate_ranges() {
+        let ranges = vec![0..2, 2..4, 0..2, 2..4];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..2, 2..4]);
+    }
+
+    #[test]
+    fn test_unsorted_ranges() {
+        let ranges = vec![2..4, 0..2, 1..3];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..4]);
+    }
+
+    #[test]
+    fn test_complex_scenario() {
+        let ranges = vec![0..2, 5..7, 1..3, 8..9, 2..4, 3..6, 8..10];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..7, 8..10]);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let ranges: Vec<Range<usize>> = vec![];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, ranges);
+    }
+
+    #[test]
+    fn test_single_range() {
+        #![allow(clippy::single_range_in_vec_init)]
+        let ranges = vec![0..5];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..5]);
+    }
+
+    #[test]
+    fn test_zero_length_ranges() {
+        let ranges = vec![0..0, 1..1, 2..2, 3..3];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..0, 1..1, 2..2, 3..3]);
     }
 }

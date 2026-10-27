@@ -4,12 +4,12 @@ use std::{io, iter};
 
 use common::{BinarySerializable, CountingWriter, DeserializeFrom, OwnedBytes};
 use fastdivide::DividerU64;
-use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
+use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
 
+use crate::MonotonicallyMappableToU64;
 use crate::column_values::u64_based::line::Line;
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::column_values::{ColumnValues, VecColumn};
-use crate::MonotonicallyMappableToU64;
 
 const BLOCK_SIZE: u32 = 512u32;
 
@@ -39,7 +39,7 @@ impl BinarySerializable for Block {
 }
 
 fn compute_num_blocks(num_vals: u32) -> u32 {
-    (num_vals + BLOCK_SIZE - 1) / BLOCK_SIZE
+    num_vals.div_ceil(BLOCK_SIZE)
 }
 
 pub struct BlockwiseLinearEstimator {
@@ -240,6 +240,28 @@ impl ColumnValues for BlockwiseLinearReader {
 mod tests {
     use super::*;
     use crate::column_values::u64_based::tests::create_and_validate;
+
+    // A block boundary where a high run ends and a low run begins: y0 ≈ 2^32, y511 ≈ 0.
+    // This large jump used to cause an overflow which made us render all value on 64b
+    // when 32 was enough.
+    fn large_descending_jump_vals() -> Vec<u64> {
+        let high_start: u64 = 4_294_967_039; // ≈ 2^32 - 257
+        (0u64..256)
+            .map(|i| high_start + i)
+            .chain(0u64..256)
+            .collect()
+    }
+
+    #[test]
+    fn test_blockwise_linear_large_descending_jump_uses_at_most_32bit() {
+        let vals = large_descending_jump_vals();
+        let (_, actual_rate) =
+            create_and_validate::<BlockwiseLinearCodec>(&vals, "large descending jump").unwrap();
+        assert!(
+            actual_rate <= 0.6,
+            "compression rate {actual_rate:.3} is too high (bug: 64-bit residuals)"
+        );
+    }
 
     #[test]
     fn test_with_codec_data_sets_simple() {

@@ -17,19 +17,13 @@
 //!       column.
 //!     - [column_values]: Stores the values of a column in a dense format.
 
-#![cfg_attr(all(feature = "unstable", test), feature(test))]
-
 #[cfg(test)]
 #[macro_use]
 extern crate more_asserts;
 
-#[cfg(all(test, feature = "unstable"))]
-extern crate test;
-
 use std::fmt::Display;
 use std::io;
 
-mod block_accessor;
 mod column;
 pub mod column_index;
 pub mod column_values;
@@ -40,20 +34,22 @@ mod iterable;
 pub(crate) mod utils;
 mod value;
 
-pub use block_accessor::ColumnBlockAccessor;
-pub use column::{BytesColumn, Column, StrColumn};
+pub use column::{
+    BytesColumn, Column, PlainBytesColumn, PlainStrColumn, PlainValueReader, StrColumn,
+};
 pub use column_index::ColumnIndex;
 pub use column_values::{
-    ColumnValues, EmptyColumnValues, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
+    ColumnValues, EmptyColumnValues, MonotonicallyMappableToU64, MonotonicallyMappableToU128,
 };
 pub use columnar::{
-    merge_columnar, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
-    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder,
+    CURRENT_VERSION, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
+    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder, StrColumnCodec, Version,
+    compute_merged_term_ord_mapping, merge_columnar,
 };
 use sstable::VoidSSTable;
 pub use value::{NumericalType, NumericalValue};
 
-pub use self::dynamic_column::{DynamicColumn, DynamicColumnHandle};
+pub use self::dynamic_column::{ColumnSpaceUsage, DynamicColumn, DynamicColumnHandle};
 
 pub type RowId = u32;
 pub type DocId = u32;
@@ -64,7 +60,7 @@ pub struct RowAddr {
     pub row_id: RowId,
 }
 
-pub use sstable::Dictionary;
+pub use sstable::{Dictionary, TermOrdHit};
 pub type Streamer<'a> = sstable::Streamer<'a, VoidSSTable>;
 
 pub use common::DateTime;
@@ -131,3 +127,6 @@ impl Cardinality {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod compat_tests;

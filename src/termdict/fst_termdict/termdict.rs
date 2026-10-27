@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use common::{BinarySerializable, CountingWriter};
 use once_cell::sync::Lazy;
@@ -12,7 +13,7 @@ use crate::postings::TermInfo;
 use crate::termdict::TermOrdinal;
 
 fn convert_fst_error(e: tantivy_fst::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
+    io::Error::other(e)
 }
 
 const FST_VERSION: u32 = 1;
@@ -93,7 +94,7 @@ fn open_fst_index(fst_file: FileSlice) -> io::Result<tantivy_fst::Map<OwnedBytes
     let fst = Fst::new(bytes).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Fst data is corrupted: {:?}", err),
+            format!("Fst data is corrupted: {err:?}"),
         )
     })?;
     Ok(tantivy_fst::Map::from(fst))
@@ -113,8 +114,9 @@ static EMPTY_TERM_DICT_FILE: Lazy<FileSlice> = Lazy::new(|| {
 /// The `Fst` crate is used to associate terms to their
 /// respective `TermOrdinal`. The `TermInfoStore` then makes it
 /// possible to fetch the associated `TermInfo`.
+#[derive(Clone)]
 pub struct TermDictionary {
-    fst_index: tantivy_fst::Map<OwnedBytes>,
+    fst_index: Arc<tantivy_fst::Map<OwnedBytes>>,
     term_info_store: TermInfoStore,
 }
 
@@ -126,17 +128,16 @@ impl TermDictionary {
         let footer_size = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
         if version != FST_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Unsuported fst version, expected {version}, found {FST_VERSION}",),
-            ));
+            return Err(io::Error::other(format!(
+                "Unsupported fst version, expected {version}, found {FST_VERSION}",
+            )));
         }
 
         let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
         let fst_index = open_fst_index(fst_file_slice)?;
         let term_info_store = TermInfoStore::open(values_file_slice)?;
         Ok(TermDictionary {
-            fst_index,
+            fst_index: Arc::new(fst_index),
             term_info_store,
         })
     }

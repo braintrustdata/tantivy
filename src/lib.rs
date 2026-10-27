@@ -17,6 +17,7 @@
 //!
 //! ```rust
 //! # use std::path::Path;
+//! # use std::fs;
 //! # use tempfile::TempDir;
 //! # use tantivy::collector::TopDocs;
 //! # use tantivy::query::QueryParser;
@@ -27,8 +28,11 @@
 //! #     // Let's create a temporary directory for the
 //! #     // sake of this example
 //! #     if let Ok(dir) = TempDir::new() {
-//! #         run_example(dir.path()).unwrap();
-//! #         dir.close().unwrap();
+//! #         let index_path = dir.path().join("index");
+//! #         // In case the directory already exists, we remove it
+//! #         let _ = fs::remove_dir_all(&index_path);
+//! #         fs::create_dir_all(&index_path).unwrap();
+//! #         run_example(&index_path).unwrap();
 //! #     }
 //! # }
 //! #
@@ -55,7 +59,7 @@
 //! // between indexing threads.
 //! let mut index_writer: IndexWriter = index.writer(100_000_000)?;
 //!
-//! // Let's index one documents!
+//! // Let's index a document!
 //! index_writer.add_document(doc!(
 //!     title => "The Old Man and the Sea",
 //!     body => "He was an old man who fished alone in a skiff in \
@@ -85,7 +89,7 @@
 //! // Perform search.
 //! // `topdocs` contains the 10 most relevant doc ids, sorted by decreasing scores...
 //! let top_docs: Vec<(Score, DocAddress)> =
-//!     searcher.search(&query, &TopDocs::with_limit(10))?;
+//!     searcher.search(&query, &TopDocs::with_limit(10).order_by_score())?;
 //!
 //! for (_score, doc_address) in top_docs {
 //!     // Retrieve the actual content of documents given its `doc_address`.
@@ -125,8 +129,8 @@
 //!
 //! - **Searching**: [Searcher] searches the segments with anything that implements
 //!   [Query](query::Query) and merges the results. The list of [supported
-//! queries](query::Query#implementors). Custom Queries are supported by implementing the
-//! [Query](query::Query) trait.
+//!   queries](query::Query#implementers). Custom Queries are supported by implementing the
+//!   [Query](query::Query) trait.
 //!
 //! - **[Directory](directory)**: Abstraction over the storage where the index data is stored.
 //!
@@ -165,8 +169,10 @@ mod macros;
 mod future_result;
 
 // Re-exports
-pub use common::DateTime;
-pub use {columnar, query_grammar, time};
+pub use columnar;
+pub use common::{BitSet, ByteCount, DateTime};
+pub use query_grammar;
+pub use time;
 
 pub use crate::error::TantivyError;
 pub use crate::future_result::FutureResult;
@@ -178,10 +184,8 @@ pub use crate::future_result::FutureResult;
 pub type Result<T> = std::result::Result<T, TantivyError>;
 
 mod core;
-#[allow(deprecated)] // Remove with index sorting
 pub mod indexer;
 
-#[allow(unused_doc_comments)]
 pub mod error;
 pub mod tokenizer;
 
@@ -191,11 +195,11 @@ pub mod collector;
 pub mod directory;
 pub mod fastfield;
 pub mod fieldnorm;
-#[allow(deprecated)] // Remove with index sorting
 pub mod index;
 pub mod positions;
 pub mod postings;
 
+pub mod plugin;
 /// Module containing the different query implementations.
 pub mod query;
 pub mod schema;
@@ -203,47 +207,40 @@ pub mod space_usage;
 pub mod store;
 pub mod termdict;
 
+mod docset;
 mod reader;
+
+#[cfg(test)]
+#[cfg(feature = "mmap")]
+mod compat_tests;
 
 pub use self::reader::{IndexReader, IndexReaderBuilder, ReloadPolicy, Warmer};
 pub mod snippet;
 
-mod docset;
 use std::fmt;
 
 pub use census::{Inventory, TrackedObject};
 pub use common::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64, HasLen};
+#[cfg(feature = "jitexpr")]
+pub use jitexpr;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
-pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
-#[deprecated(
-    since = "0.22.0",
-    note = "Will be removed in tantivy 0.23. Use export from snippet module instead"
-)]
-pub use self::snippet::{Snippet, SnippetGenerator};
-#[doc(hidden)]
-pub use crate::core::json_utils;
-pub use crate::core::{Executor, Searcher, SearcherGeneration};
+pub use self::docset::{DocSet, SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+pub use crate::core::{json_utils, Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
-#[allow(deprecated)] // Remove with index sorting
 pub use crate::index::{
     Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
-    Segment, SegmentComponent, SegmentId, SegmentMeta, SegmentReader,
+    Segment, SegmentMeta, SegmentReader,
 };
-#[deprecated(
-    since = "0.22.0",
-    note = "Will be removed in tantivy 0.23. Use export from indexer module instead"
-)]
-pub use crate::indexer::PreparedCommit;
 pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
-pub use crate::postings::Postings;
-pub use crate::schema::{DateOptions, DateTimePrecision, Document, TantivyDocument, Term};
+pub use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
+pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.
-const INDEX_FORMAT_VERSION: u32 = 6;
+pub const INDEX_FORMAT_VERSION: u32 = 7;
 /// Oldest index format version this tantivy version can read.
-const INDEX_FORMAT_OLDEST_SUPPORTED_VERSION: u32 = 4;
+pub const INDEX_FORMAT_OLDEST_SUPPORTED_VERSION: u32 = 4;
 
 /// Structure version for the index.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,7 +253,7 @@ pub struct Version {
 
 impl fmt::Debug for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -267,9 +264,10 @@ static VERSION: Lazy<Version> = Lazy::new(|| Version {
     index_format_version: INDEX_FORMAT_VERSION,
 });
 
-impl ToString for Version {
-    fn to_string(&self) -> String {
-        format!(
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
             "tantivy v{}.{}.{}, index_format v{}",
             self.major, self.minor, self.patch, self.index_format_version
         )
@@ -379,11 +377,14 @@ macro_rules! fail_point {
     }};
 }
 
+/// Common test utilities.
 #[cfg(test)]
 pub mod tests {
+    use std::collections::BTreeMap;
+
     use common::{BinarySerializable, FixedSize};
     use query_grammar::{UserInputAst, UserInputLeaf, UserInputLiteral};
-    use rand::distributions::{Bernoulli, Uniform};
+    use rand::distr::{Bernoulli, Uniform};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use time::OffsetDateTime;
@@ -392,10 +393,12 @@ pub mod tests {
     use crate::docset::{DocSet, TERMINATED};
     use crate::index::SegmentReader;
     use crate::merge_policy::NoMergePolicy;
-    use crate::query::BooleanQuery;
+    use crate::postings::Postings;
+    use crate::query::{BooleanQuery, QueryParser};
     use crate::schema::*;
-    use crate::{DateTime, DocAddress, Index, IndexWriter, Postings, ReloadPolicy};
+    use crate::{DateTime, DocAddress, Index, IndexWriter, ReloadPolicy};
 
+    /// Asserts that the serialized value is the value in the trait.
     pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
         let mut buffer = Vec::new();
         O::default().serialize(&mut buffer).unwrap();
@@ -407,16 +410,20 @@ pub mod tests {
     #[macro_export]
     macro_rules! assert_nearly_equals {
         ($left:expr, $right:expr) => {{
-            match (&$left, &$right) {
-                (left_val, right_val) => {
+            assert_nearly_equals!($left, $right, 0.0005);
+        }};
+        ($left:expr, $right:expr, $epsilon:expr) => {{
+            match (&$left, &$right, &$epsilon) {
+                (left_val, right_val, epsilon_val) => {
                     let diff = (left_val - right_val).abs();
-                    let add = left_val.abs() + right_val.abs();
-                    if diff > 0.0005 * add {
+
+                    if diff > *epsilon_val {
                         panic!(
-                            r#"assertion failed: `(left ~= right)`
-  left: `{:?}`,
- right: `{:?}`"#,
-                            &*left_val, &*right_val
+                            r#"assertion failed: `abs(left-right)>epsilon`
+    left: `{:?}`,
+    right: `{:?}`,
+    epsilon: `{:?}`"#,
+                            &*left_val, &*right_val, &*epsilon_val
                         )
                     }
                 }
@@ -424,14 +431,16 @@ pub mod tests {
         }};
     }
 
+    /// Generates random numbers
     pub fn generate_nonunique_unsorted(max_value: u32, n_elems: usize) -> Vec<u32> {
         let seed: [u8; 32] = [1; 32];
         StdRng::from_seed(seed)
-            .sample_iter(&Uniform::new(0u32, max_value))
+            .sample_iter(&Uniform::new(0u32, max_value).unwrap())
             .take(n_elems)
             .collect::<Vec<u32>>()
     }
 
+    /// Sample `n` elements with Bernoulli distribution.
     pub fn sample_with_seed(n: u32, ratio: f64, seed_val: u8) -> Vec<u32> {
         StdRng::from_seed([seed_val; 32])
             .sample_iter(&Bernoulli::new(ratio).unwrap())
@@ -441,12 +450,12 @@ pub mod tests {
             .collect()
     }
 
+    /// Sample `n` elements with Bernoulli distribution.
     pub fn sample(n: u32, ratio: f64) -> Vec<u32> {
         sample_with_seed(n, ratio, 4)
     }
 
     #[test]
-    #[cfg(not(feature = "lz4"))]
     fn test_version_string() {
         use regex::Regex;
         let regex_ptn = Regex::new(
@@ -946,7 +955,7 @@ pub mod tests {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", STORED | TEXT);
         let schema = schema_builder.build();
-        let json_val: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        let json_val: serde_json::Value = serde_json::from_str(
             r#"{
             "signed": 2,
             "float": 2.0,
@@ -1036,13 +1045,16 @@ pub mod tests {
                             text_field => "some other value",
                             other_text_field => "short");
         assert_eq!(document.len(), 3);
-        let values: Vec<&OwnedValue> = document.get_all(text_field).collect();
+        let values: Vec<OwnedValue> = document.get_all(text_field).map(OwnedValue::from).collect();
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0].as_str(), Some("tantivy"));
-        assert_eq!(values[1].as_str(), Some("some other value"));
-        let values: Vec<&OwnedValue> = document.get_all(other_text_field).collect();
+        assert_eq!(values[0].as_ref().as_str(), Some("tantivy"));
+        assert_eq!(values[1].as_ref().as_str(), Some("some other value"));
+        let values: Vec<OwnedValue> = document
+            .get_all(other_text_field)
+            .map(OwnedValue::from)
+            .collect();
         assert_eq!(values.len(), 1);
-        assert_eq!(values[0].as_str(), Some("short"));
+        assert_eq!(values[0].as_ref().as_str(), Some("short"));
     }
 
     #[test]
@@ -1109,9 +1121,9 @@ pub mod tests {
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
         use crate::collector::Count;
+        use crate::index::SegmentId;
         use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
-        use crate::SegmentId;
 
         const DOC_COUNT: u64 = 2u64;
 
@@ -1170,12 +1182,11 @@ pub mod tests {
 
     #[test]
     fn test_validate_checksum() -> crate::Result<()> {
-        let index_path = tempfile::tempdir().expect("dir");
         let mut builder = Schema::builder();
         let body = builder.add_text_field("body", TEXT | STORED);
         let schema = builder.build();
-        let index = Index::create_in_dir(&index_path, schema)?;
-        let mut writer: IndexWriter = index.writer(50_000_000)?;
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer_for_tests()?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for _ in 0..5000 {
             writer.add_document(doc!(body => "foo"))?;
@@ -1222,5 +1233,50 @@ pub mod tests {
             offset_dt.to_ordinal_date()
         );
         assert_eq!(dt_from_ts_nanos.to_hms_micro(), offset_dt.to_hms_micro());
+    }
+
+    #[test]
+    fn test_json_number_ambiguity() {
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("number", crate::schema::TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests().unwrap();
+        {
+            let mut doc = TantivyDocument::new();
+            let mut obj = BTreeMap::default();
+            obj.insert("key".to_string(), OwnedValue::I64(1i64));
+            doc.add_object(json_field, obj);
+            index_writer.add_document(doc).unwrap();
+        }
+        {
+            let mut doc = TantivyDocument::new();
+            let mut obj = BTreeMap::default();
+            obj.insert("key".to_string(), OwnedValue::U64(1u64));
+            doc.add_object(json_field, obj);
+            index_writer.add_document(doc).unwrap();
+        }
+        {
+            let mut doc = TantivyDocument::new();
+            let mut obj = BTreeMap::default();
+            obj.insert("key".to_string(), OwnedValue::F64(1.0f64));
+            doc.add_object(json_field, obj);
+            index_writer.add_document(doc).unwrap();
+        }
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        assert_eq!(searcher.num_docs(), 3);
+        {
+            let parser = QueryParser::for_index(&index, vec![]);
+            let query = parser.parse_query("number.key:1").unwrap();
+            let count = searcher.search(&query, &crate::collector::Count).unwrap();
+            assert_eq!(count, 3);
+        }
+        {
+            let parser = QueryParser::for_index(&index, vec![]);
+            let query = parser.parse_query("number.key:1.0").unwrap();
+            let count = searcher.search(&query, &crate::collector::Count).unwrap();
+            assert_eq!(count, 3);
+        }
     }
 }

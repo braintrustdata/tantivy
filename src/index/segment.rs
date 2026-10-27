@@ -46,7 +46,7 @@ impl Segment {
     ///
     /// This method is only used when updating `max_doc` from 0
     /// as we finalize a fresh new segment.
-    pub(crate) fn with_max_doc(self, max_doc: u32) -> Segment {
+    pub fn with_max_doc(self, max_doc: u32) -> Segment {
         Segment {
             index: self.index,
             meta: self.meta.with_max_doc(max_doc),
@@ -96,9 +96,9 @@ impl Segment {
     }
 
     /// Open one of the component file for *regular* write.
-    pub fn open_write(&mut self, component: SegmentComponent) -> Result<WritePtr, OpenWriteError> {
+    pub fn open_write(&self, component: SegmentComponent) -> Result<WritePtr, OpenWriteError> {
         let path = self.relative_path(component);
-        let write = self.index.directory_mut().open_write(&path)?;
+        let write = self.index.directory().open_write(&path)?;
         Ok(write)
     }
 
@@ -109,8 +109,8 @@ impl Segment {
     }
 
     /// Opens an artifact file for writing.
-    pub fn open_artifact_write(&mut self, extension: &str) -> Result<WritePtr, OpenWriteError> {
+    pub fn open_artifact_write(&self, extension: &str) -> Result<WritePtr, OpenWriteError> {
         let path = self.artifact_relative_path(extension);
-        self.index.directory_mut().open_write(&path)
+        self.index.directory().open_write(&path)
     }
 }

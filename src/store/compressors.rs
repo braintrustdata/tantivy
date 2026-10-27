@@ -20,9 +20,7 @@ pub enum Compressor {
 
 impl Serialize for Compressor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    where S: serde::Serializer {
         match self {
             Compressor::None => serializer.serialize_str("none"),
             #[cfg(feature = "lz4-compression")]
@@ -32,9 +30,8 @@ impl Serialize for Compressor {
                 if let Some(dictionary) = &zstd.dictionary {
                     if !ZstdDictionary::is_safe_and_encodable_relative_path(dictionary.path()) {
                         return Err(serde::ser::Error::custom(format!(
-                            "dictionary_path must be a plain path relative to the index \
-                             directory (no leading '/', no '..' components, and no ','), got \
-                             {:?}",
+                            "dictionary_path must be a plain path relative to the index directory \
+                             (no leading '/', no '..' components, and no ','), got {:?}",
                             dictionary.path()
                         )));
                     }
@@ -47,45 +44,44 @@ impl Serialize for Compressor {
 
 impl<'de> Deserialize<'de> for Compressor {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let buf = String::deserialize(deserializer)?;
-        let compressor =
-            match buf.as_str() {
-                "none" => Compressor::None,
-                #[cfg(feature = "lz4-compression")]
-                "lz4" => Compressor::Lz4,
-                #[cfg(not(feature = "lz4-compression"))]
-                "lz4" => return Err(serde::de::Error::custom(
+        let compressor = match buf.as_str() {
+            "none" => Compressor::None,
+            #[cfg(feature = "lz4-compression")]
+            "lz4" => Compressor::Lz4,
+            #[cfg(not(feature = "lz4-compression"))]
+            "lz4" => {
+                return Err(serde::de::Error::custom(
                     "unsupported variant `lz4`, please enable Tantivy's `lz4-compression` feature",
-                )),
-                #[cfg(feature = "zstd-compression")]
-                _ if buf.starts_with("zstd") => Compressor::Zstd(
-                    ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
-                ),
-                #[cfg(not(feature = "zstd-compression"))]
-                _ if buf.starts_with("zstd") => {
-                    return Err(serde::de::Error::custom(
-                        "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
+                ))
+            }
+            #[cfg(feature = "zstd-compression")]
+            _ if buf.starts_with("zstd") => Compressor::Zstd(
+                ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
+            ),
+            #[cfg(not(feature = "zstd-compression"))]
+            _ if buf.starts_with("zstd") => {
+                return Err(serde::de::Error::custom(
+                    "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
                      feature",
-                    ))
-                }
-                _ => {
-                    return Err(serde::de::Error::unknown_variant(
-                        &buf,
-                        &[
-                            "none",
-                            #[cfg(feature = "lz4-compression")]
-                            "lz4",
-                            #[cfg(feature = "zstd-compression")]
-                            "zstd",
-                            #[cfg(feature = "zstd-compression")]
-                            "zstd(compression_level=5)",
-                        ],
-                    ));
-                }
-            };
+                ))
+            }
+            _ => {
+                return Err(serde::de::Error::unknown_variant(
+                    &buf,
+                    &[
+                        "none",
+                        #[cfg(feature = "lz4-compression")]
+                        "lz4",
+                        #[cfg(feature = "zstd-compression")]
+                        "zstd",
+                        #[cfg(feature = "zstd-compression")]
+                        "zstd(compression_level=5)",
+                    ],
+                ));
+            }
+        };
 
         Ok(compressor)
     }
@@ -161,7 +157,8 @@ impl ZstdDictionary {
     /// `zstd(opt=val,...)`'s option separator). `ZstdDictionary` is the only thing that ever
     /// opens a dictionary file (`load`/`load_internal`/`seed`), so it's the natural place to own
     /// what counts as a safe path -- every other caller of this check (`Compressor::serialize`,
-    /// `ZstdCompressor::deser_from_str`) is validating a path *before* it becomes a `ZstdDictionary`.
+    /// `ZstdCompressor::deser_from_str`) is validating a path *before* it becomes a
+    /// `ZstdDictionary`.
     pub(crate) fn is_safe_and_encodable_relative_path(path: &str) -> bool {
         let as_path = std::path::Path::new(path);
         !as_path.is_absolute()
@@ -348,9 +345,7 @@ impl Eq for ZstdDictionary {}
 
 impl Serialize for ZstdDictionary {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    where S: serde::Serializer {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("ZstdDictionary", 1)?;
         state.serialize_field("path", self.path())?;
@@ -360,9 +355,7 @@ impl Serialize for ZstdDictionary {
 
 impl<'de> Deserialize<'de> for ZstdDictionary {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         #[derive(Deserialize)]
         struct Repr {
             path: String,
@@ -416,9 +409,8 @@ impl ZstdCompressor {
                 "dictionary_path" => {
                     if !ZstdDictionary::is_safe_and_encodable_relative_path(value) {
                         return Err(format!(
-                            "dictionary_path must be a plain path relative to the index \
-                             directory (no leading '/', no '..' components, and no ','), \
-                             got {value:?}"
+                            "dictionary_path must be a plain path relative to the index directory \
+                             (no leading '/', no '..' components, and no ','), got {value:?}"
                         ));
                     }
                     compressor.dictionary = Some(ZstdDictionary::Path(value.to_string()));
@@ -726,8 +718,9 @@ mod tests {
 
     #[test]
     fn resolve_dictionary_reads_and_decompresses_from_path() {
-        use crate::directory::RamDirectory;
         use std::sync::Arc;
+
+        use crate::directory::RamDirectory;
 
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
@@ -748,8 +741,9 @@ mod tests {
 
     #[test]
     fn zstd_dictionary_cache_shares_bytes_while_a_strong_ref_is_alive() {
-        use crate::directory::RamDirectory;
         use std::sync::Arc;
+
+        use crate::directory::RamDirectory;
 
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
@@ -768,8 +762,9 @@ mod tests {
 
     #[test]
     fn zstd_dictionary_cache_reloads_after_last_strong_ref_drops() {
-        use crate::directory::{Directory, RamDirectory};
         use std::sync::Arc;
+
+        use crate::directory::{Directory, RamDirectory};
 
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
@@ -877,8 +872,8 @@ mod tests {
         assert_eq!(
             dict.load(&directory_b).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData,
-            "index B's load must independently fail too -- it must never receive index A's \
-             bytes from the shared cache key, since nothing valid was ever cached there"
+            "index B's load must independently fail too -- it must never receive index A's bytes \
+             from the shared cache key, since nothing valid was ever cached there"
         );
     }
 
@@ -988,8 +983,10 @@ mod tests {
         fn get_file_handle(
             &self,
             path: &std::path::Path,
-        ) -> Result<std::sync::Arc<dyn crate::directory::FileHandle>, crate::directory::error::OpenReadError>
-        {
+        ) -> Result<
+            std::sync::Arc<dyn crate::directory::FileHandle>,
+            crate::directory::error::OpenReadError,
+        > {
             self.inner.get_file_handle(path)
         }
 
@@ -1106,8 +1103,7 @@ mod tests {
         // `load_async` has to work on it unchanged.
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
-        let raw_dict: Arc<[u8]> =
-            Arc::from(b"the blocking-default test's own dictionary".to_vec());
+        let raw_dict: Arc<[u8]> = Arc::from(b"the blocking-default test's own dictionary".to_vec());
         let path = ZstdDictionary::seed(&directory, raw_dict.clone())
             .unwrap()
             .path()

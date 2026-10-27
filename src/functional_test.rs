@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 
 use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
 use crate::schema::*;
+#[allow(deprecated)]
 use crate::{doc, schema, Index, IndexSettings, IndexSortByField, IndexWriter, Order, Searcher};
 
 fn check_index_content(searcher: &Searcher, vals: &[u64]) -> crate::Result<()> {
@@ -29,7 +30,7 @@ fn test_functional_store() -> crate::Result<()> {
     let index = Index::create_in_ram(schema);
     let reader = index.reader()?;
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
 
     let mut index_writer: IndexWriter =
         index.writer_with_num_threads(3, 3 * MEMORY_BUDGET_NUM_BYTES_MIN)?;
@@ -38,9 +39,9 @@ fn test_functional_store() -> crate::Result<()> {
 
     let mut doc_id = 0u64;
     for _iteration in 0..get_num_iterations() {
-        let num_docs: usize = rng.gen_range(0..4);
+        let num_docs: usize = rng.random_range(0..4);
         if !doc_set.is_empty() {
-            let doc_to_remove_id = rng.gen_range(0..doc_set.len());
+            let doc_to_remove_id = rng.random_range(0..doc_set.len());
             let removed_doc_id = doc_set.swap_remove(doc_to_remove_id);
             index_writer.delete_term(Term::from_field_u64(id_field, removed_doc_id));
         }
@@ -90,7 +91,7 @@ fn test_functional_indexing_sorted() -> crate::Result<()> {
 
     let reader = index.reader()?;
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
 
     let mut index_writer: IndexWriter =
         index.writer_with_num_threads(3, 3 * MEMORY_BUDGET_NUM_BYTES_MIN)?;
@@ -99,7 +100,7 @@ fn test_functional_indexing_sorted() -> crate::Result<()> {
     let mut uncommitted_docs: HashSet<u64> = HashSet::new();
 
     for _ in 0..get_num_iterations() {
-        let random_val = rng.gen_range(0..20);
+        let random_val = rng.random_range(0..20);
         if random_val == 0 {
             index_writer.commit()?;
             committed_docs.extend(&uncommitted_docs);
@@ -135,10 +136,10 @@ const LOREM: &str = "Doc Lorem ipsum dolor sit amet, consectetur adipiscing elit
                      cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat \
                      non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.";
 fn get_text() -> String {
-    use rand::seq::SliceRandom;
-    let mut rng = thread_rng();
+    use rand::seq::IndexedRandom;
+    let mut rng = rng();
     let tokens: Vec<_> = LOREM.split(' ').collect();
-    let random_val = rng.gen_range(0..20);
+    let random_val = rng.random_range(0..20);
 
     (0..random_val)
         .map(|_| tokens.choose(&mut rng).unwrap())
@@ -166,7 +167,7 @@ fn test_functional_indexing_unsorted() -> crate::Result<()> {
     let index = Index::create_from_tempdir(schema)?;
     let reader = index.reader()?;
 
-    let mut rng = thread_rng();
+    let mut rng = rng();
 
     let mut index_writer: IndexWriter =
         index.writer_with_num_threads(3, 3 * MEMORY_BUDGET_NUM_BYTES_MIN)?;
@@ -175,7 +176,7 @@ fn test_functional_indexing_unsorted() -> crate::Result<()> {
     let mut uncommitted_docs: HashSet<u64> = HashSet::new();
 
     for _ in 0..get_num_iterations() {
-        let random_val = rng.gen_range(0..20);
+        let random_val = rng.random_range(0..20);
         if random_val == 0 {
             index_writer.commit()?;
             committed_docs.extend(&uncommitted_docs);

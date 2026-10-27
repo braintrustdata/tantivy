@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{fieldnorm_to_id, id_to_fieldnorm};
 use crate::directory::{CompositeFile, FileSlice, OwnedBytes};
-use crate::schema::Field;
+use crate::schema::{Field, Schema};
 use crate::space_usage::PerFieldSpaceUsage;
 use crate::DocId;
 
@@ -37,8 +37,8 @@ impl FieldNormReaders {
     }
 
     /// Return a break down of the space usage per field.
-    pub fn space_usage(&self) -> PerFieldSpaceUsage {
-        self.data.space_usage()
+    pub fn space_usage(&self, schema: &Schema) -> PerFieldSpaceUsage {
+        self.data.space_usage(schema)
     }
 
     /// Returns a handle to inner file
@@ -149,7 +149,7 @@ impl FieldNormReader {
     }
 
     #[cfg(test)]
-    pub fn for_test(field_norms: &[u32]) -> FieldNormReader {
+    pub(crate) fn for_test(field_norms: &[u32]) -> FieldNormReader {
         let field_norms_id = field_norms
             .iter()
             .cloned()

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use common::file_slice::FileSlice;
 use common::OwnedBytes;
-use criterion::{criterion_group, criterion_main, Criterion};
+use common::file_slice::FileSlice;
+use criterion::{Criterion, criterion_group, criterion_main};
 use tantivy_sstable::{Dictionary, MonotonicU64SSTable};
 
 fn make_test_sstable(suffix: &str) -> FileSlice {
@@ -16,9 +16,7 @@ fn make_test_sstable(suffix: &str) -> FileSlice {
 
     let table = builder.finish().unwrap();
     let table = Arc::new(OwnedBytes::new(table));
-    let slice = common::file_slice::FileSlice::new(table.clone());
-
-    slice
+    common::file_slice::FileSlice::new(table.clone())
 }
 
 pub fn criterion_benchmark(c: &mut Criterion) {

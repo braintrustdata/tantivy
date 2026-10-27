@@ -227,19 +227,6 @@ impl BlockSegmentPostings {
         self.doc_decoder.output_array()
     }
 
-    /// Returns a full block, regardless of whether the block is complete or incomplete (
-    /// as it happens for the last block of the posting list).
-    ///
-    /// In the latter case, the block is guaranteed to be padded with the sentinel value:
-    /// `TERMINATED`. The array is also guaranteed to be aligned on 16 bytes = 128 bits.
-    ///
-    /// This method is useful to run SSE2 linear search.
-    #[inline]
-    pub(crate) fn full_block(&self) -> &[DocId; COMPRESSION_BLOCK_SIZE] {
-        debug_assert!(self.block_is_loaded());
-        self.doc_decoder.full_output()
-    }
-
     /// Return the document at index `idx` of the block.
     #[inline]
     pub fn doc(&self, idx: usize) -> u32 {
@@ -262,6 +249,12 @@ impl BlockSegmentPostings {
 
     /// Returns the length of the current block.
     ///
+    /// Returns the decoded term-frequency buffer for the current block.
+    #[inline]
+    pub(crate) fn freq_output_array(&self) -> &[u32] {
+        self.freq_decoder.output_array()
+    }
+
     /// All blocks have a length of `NUM_DOCS_PER_BLOCK`,
     /// except the last block that may have a length
     /// of any number between 1 and `NUM_DOCS_PER_BLOCK - 1`
@@ -275,26 +268,72 @@ impl BlockSegmentPostings {
     ///
     /// If all docs are smaller than target, the block loaded may be empty,
     /// or be the last an incomplete VInt block.
-    pub fn seek(&mut self, target_doc: DocId) {
-        self.shallow_seek(target_doc);
+    pub fn seek(&mut self, target_doc: DocId) -> usize {
+        // Move to the block that might contain our document.
+        self.seek_block(target_doc);
         self.load_block();
+
+        // At this point we are on the block that might contain our document.
+        let doc = self.doc_decoder.seek_within_block(target_doc);
+
+        // The last block is not full and padded with TERMINATED,
+        // so we are guaranteed to have at least one value (real or padding)
+        // that is >= target_doc.
+        debug_assert!(doc < COMPRESSION_BLOCK_SIZE);
+
+        // `doc` is now the first element >= `target_doc`.
+        // If all docs are smaller than target, the current block is incomplete and padded
+        // with TERMINATED. After the search, the cursor points to the first TERMINATED.
+        doc
+    }
+
+    /// Returns the number of documents with a doc id strictly smaller than `target`
+    /// (i.e. the *rank* of `target` in this posting list).
+    ///
+    /// This jumps to the block that may contain `target` through the skip list, so no
+    /// skipped block is decoded; a single block is then decoded to locate `target`
+    /// within it. The cost is therefore `O(number_of_skip_list_entries)` plus one block
+    /// decode, rather than `O(doc_freq)`.
+    ///
+    /// Like [`Self::seek`], the underlying cursor only ever moves forward. This method
+    /// must be called with **non-decreasing** `target` values (galloping); calling it
+    /// with a `target` smaller than a previous one yields an incorrect result. `target`
+    /// must be a valid doc id (i.e. `target <= TERMINATED`), exactly as for `seek`.
+    ///
+    /// Edge cases: returns `0` when `target` is smaller than every doc id, and
+    /// `doc_freq()` when `target` is larger than every doc id.
+    pub fn rank(&mut self, target: DocId) -> u32 {
+        if self.doc_freq == 0 {
+            return 0;
+        }
+        // `within` = number of docs in the landed block with a doc id < target.
+        let within = self.seek(target);
+        // `remaining_docs` counts the landed block and everything after it, so the
+        // difference is the number of docs in all blocks strictly before it.
+        let docs_before_block = self.doc_freq - self.skip_reader.remaining_docs();
+        docs_before_block + within as u32
     }
 
     pub(crate) fn position_offset(&self) -> u64 {
         self.skip_reader.position_offset()
     }
 
-    /// Dangerous API! This calls seek on the skip list,
+    /// Dangerous API! This calls seeks the next block on the skip list,
     /// but does not `.load_block()` afterwards.
     ///
     /// `.load_block()` needs to be called manually afterwards.
     /// If all docs are smaller than target, the block loaded may be empty,
     /// or be the last an incomplete VInt block.
-    pub(crate) fn shallow_seek(&mut self, target_doc: DocId) {
+    pub(crate) fn seek_block(&mut self, target_doc: DocId) {
         if self.skip_reader.seek(target_doc) {
             self.block_max_score_cache = None;
             self.block_loaded = false;
         }
+    }
+
+    #[inline]
+    pub(crate) fn has_remaining_docs(&self) -> bool {
+        self.skip_reader.has_remaining_docs()
     }
 
     pub(crate) fn block_is_loaded(&self) -> bool {
@@ -302,10 +341,10 @@ impl BlockSegmentPostings {
     }
 
     pub(crate) fn load_block(&mut self) {
-        let offset = self.skip_reader.byte_offset();
         if self.block_is_loaded() {
             return;
         }
+        let offset = self.skip_reader.byte_offset();
         match self.skip_reader.block_info() {
             BlockInfo::BitPacked {
                 doc_num_bits,
@@ -554,6 +593,40 @@ mod tests {
             inverted_index.reset_block_postings_from_terminfo(&term_info, &mut block_segments)?;
         }
         assert_eq!(block_segments.docs(), &[1, 3, 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_segment_postings_rank() -> crate::Result<()> {
+        // ~8 blocks worth of docs so the skip list is actually exercised.
+        let docs: Vec<DocId> = (0..1000u32).map(|i| i * 3).collect();
+        let mut block_postings = build_block_postings(&docs[..])?;
+        let doc_freq = block_postings.doc_freq();
+
+        // rank(target) must equal the number of docs strictly below target.
+        // Targets are queried in non-decreasing order, as the API requires.
+        // `target` values must be a valid doc id (<= TERMINATED) and non-decreasing.
+        let targets = [
+            0u32, 1, 2, 3, 4, 299, 300, 301, 1500, 2996, 2997, 3000, 10_000,
+        ];
+        for &target in &targets {
+            let expected = docs.iter().filter(|&&d| d < target).count() as u32;
+            assert_eq!(
+                block_postings.rank(target),
+                expected,
+                "rank({target}) mismatch"
+            );
+        }
+
+        // Edge cases: below the first doc -> 0, above the last doc -> doc_freq.
+        let mut fresh = build_block_postings(&docs[..])?;
+        assert_eq!(fresh.rank(0), 0);
+        let mut fresh = build_block_postings(&docs[..])?;
+        assert_eq!(fresh.rank(1_000_000), doc_freq);
+
+        // Empty postings: rank is always 0.
+        let mut empty = BlockSegmentPostings::empty();
+        assert_eq!(empty.rank(42), 0);
         Ok(())
     }
 }

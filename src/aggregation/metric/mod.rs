@@ -17,7 +17,9 @@
 //! - [Percentiles](PercentilesAggregationReq)
 
 mod average;
+mod cardinality;
 mod count;
+mod extended_stats;
 mod max;
 mod min;
 mod percentiles;
@@ -28,7 +30,9 @@ mod top_hits;
 use std::collections::HashMap;
 
 pub use average::*;
+pub use cardinality::*;
 pub use count::*;
+pub use extended_stats::*;
 pub use max::*;
 pub use min::*;
 pub use percentiles::*;
@@ -38,7 +42,33 @@ pub use stats::*;
 pub use sum::*;
 pub use top_hits::*;
 
+use crate::aggregation::value_source::ValueSource;
 use crate::schema::OwnedValue;
+
+/// Contains all information required by metric aggregations like avg, min, max, sum, stats,
+/// extended_stats, count, percentiles.
+#[repr(C)]
+pub(crate) struct MetricAggReqData {
+    /// True if the field is of number or date type.
+    pub(crate) is_number_or_date_type: bool,
+    /// The missing value normalized to the internal u64 representation of the field type.
+    pub(crate) missing_u64: Option<u64>,
+    /// The column accessor to access the fast field values.
+    pub(crate) accessor: Box<dyn ValueSource>,
+    /// Used when converting to intermediate result
+    pub(crate) collecting_for: StatsType,
+    /// The missing value
+    pub(crate) missing: Option<f64>,
+    /// The name of the aggregation.
+    pub(crate) name: String,
+}
+
+impl MetricAggReqData {
+    /// Estimate the memory consumption of this struct in bytes.
+    pub fn get_memory_consumption(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
 
 /// Single-metric aggregations use this common result structure.
 ///
@@ -75,8 +105,10 @@ pub enum PercentileValues {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// The entry when requesting percentiles with keyed: false
 pub struct PercentileValuesVecEntry {
-    key: f64,
-    value: f64,
+    /// The percentile key (e.g. 1.0, 5.0, 25.0).
+    pub key: f64,
+    /// The percentile value. `NaN` when there are no values.
+    pub value: f64,
 }
 
 /// Single-metric aggregations use this common result structure.

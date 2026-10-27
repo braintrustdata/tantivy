@@ -11,7 +11,7 @@ pub struct LayerCursor<'a> {
     cursor: usize,
 }
 
-impl<'a> Iterator for LayerCursor<'a> {
+impl Iterator for LayerCursor<'_> {
     type Item = Checkpoint;
 
     fn next(&mut self) -> Option<Checkpoint> {
@@ -94,13 +94,7 @@ impl SkipIndex {
             byte_range: 0..first_layer_len,
         };
         for layer in &self.layers {
-            if let Some(checkpoint) =
-                layer.seek_start_at_offset(target, cur_checkpoint.byte_range.start)
-            {
-                cur_checkpoint = checkpoint;
-            } else {
-                return None;
-            }
+            cur_checkpoint = layer.seek_start_at_offset(target, cur_checkpoint.byte_range.start)?;
         }
         Some(cur_checkpoint)
     }

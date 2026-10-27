@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
-use crate::indexer::SegmentWriter;
+use crate::indexer::{DocIdMapping, SegmentWriter};
 use crate::schema::document::Document;
 use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument};
 
@@ -15,7 +15,7 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 }
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
-    pub fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
+    pub(crate) fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
         Ok(Self {
@@ -41,29 +41,81 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     }
 
     pub fn finalize(self) -> crate::Result<Index> {
-        let max_doc = self.segment_writer.max_doc();
-        self.segment_writer.finalize()?;
-        let dictionary_path = self
-            .segment
+        let Self {
+            segment,
+            segment_writer,
+            ..
+        } = self;
+        let max_doc = segment_writer.max_doc();
+        segment_writer.finalize()?;
+        let did_remapping = segment.index().settings().sort_by_field.is_some();
+        Self::finalize_inner(segment, max_doc, did_remapping, false)
+    }
+
+    pub fn finalize_with_doc_id_mapping(self, mapping: &DocIdMapping) -> crate::Result<Index> {
+        let Self {
+            segment,
+            segment_writer,
+            ..
+        } = self;
+        let max_doc = segment_writer.max_doc();
+        segment_writer.finalize_with_doc_id_mapping(mapping)?;
+        Self::finalize_inner(segment, max_doc, true, true)
+    }
+
+    fn finalize_inner(
+        segment: Segment,
+        max_doc: u32,
+        did_remapping: bool,
+        clear_manual_doc_id_mapping: bool,
+    ) -> crate::Result<Index> {
+        let dictionary_path = segment
             .index()
             .settings()
             .docstore_compression
             .dictionary_path()
             .map(str::to_string);
-        let segment: Segment = self
-            .segment
+        let segment: Segment = segment
             .with_max_doc(max_doc)
             .with_docstore_dictionary_path(dictionary_path);
-        let index = segment.index();
+        let segment_meta = segment.meta();
+        let mut index = segment.index().clone();
+        if clear_manual_doc_id_mapping {
+            index.settings_mut().manual_doc_id_mapping = false;
+        }
+
+        if did_remapping {
+            // Untrack the temp docstore file from the segment metadata.
+            segment_meta.untrack_temp_docstore();
+        }
+
+        let persisted_custom_extensions: Vec<String> = index
+            .custom_plugins()
+            .iter()
+            .flat_map(|plugin| plugin.extensions().iter().copied())
+            .map(str::to_string)
+            .collect();
         let index_meta = IndexMeta {
             index_settings: index.settings().clone(),
-            segments: vec![segment.meta().clone()],
+            persisted_custom_extensions,
+            segments: vec![segment_meta.clone()],
             schema: index.schema(),
             opstamp: 0,
             payload: None,
         };
         save_metas(&index_meta, index.directory())?;
         index.directory().sync_directory()?;
-        Ok(segment.index().clone())
+
+        if did_remapping {
+            // Run the garbage collector to remove the temp docstore file from the directory.
+            let mut living_files = index.list_segment_files_with_artifacts(
+                std::slice::from_ref(segment_meta),
+                &index_meta.persisted_custom_extensions,
+            );
+            living_files.insert(crate::core::META_FILEPATH.to_path_buf());
+            index.directory_mut().garbage_collect(|| living_files)?;
+        }
+
+        Ok(index)
     }
 }

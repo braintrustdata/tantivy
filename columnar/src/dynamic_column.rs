@@ -1,14 +1,14 @@
 use std::net::Ipv6Addr;
-use std::sync::Arc;
 use std::{fmt, io};
 
 use common::file_slice::FileSlice;
-use common::{ByteCount, DateTime, HasLen, OwnedBytes};
+use common::{ByteCount, DateTime, OwnedBytes};
+use serde::{Deserialize, Serialize};
 
-use crate::column::{BytesColumn, Column, StrColumn};
-use crate::column_values::{monotonic_map_column, StrictlyMonotonicFn};
-use crate::columnar::ColumnType;
-use crate::{Cardinality, ColumnIndex, ColumnValues, NumericalType};
+use crate::column::{BytesColumn, Column, PlainBytesColumn, PlainStrColumn, StrColumn};
+use crate::column_values::{StrictlyMonotonicFn, monotonic_map_column};
+use crate::columnar::{ColumnType, StrColumnCodec};
+use crate::{Cardinality, ColumnIndex, ColumnValues, NumericalType, Version};
 
 #[derive(Clone)]
 pub enum DynamicColumn {
@@ -20,6 +20,10 @@ pub enum DynamicColumn {
     DateTime(Column<DateTime>),
     Bytes(BytesColumn),
     Str(StrColumn),
+    /// A `Bytes` column using the plain codec.
+    PlainBytes(PlainBytesColumn),
+    /// A `Str` column using the plain codec.
+    PlainStr(PlainStrColumn),
 }
 
 impl fmt::Debug for DynamicColumn {
@@ -34,6 +38,8 @@ impl fmt::Debug for DynamicColumn {
             DynamicColumn::DateTime(col) => write!(f, "{col:?}")?,
             DynamicColumn::Bytes(col) => write!(f, "{col:?}")?,
             DynamicColumn::Str(col) => write!(f, "{col:?}")?,
+            DynamicColumn::PlainBytes(col) => write!(f, "{col:?}")?,
+            DynamicColumn::PlainStr(col) => write!(f, "{col:?}")?,
         }
         write!(f, "]")
     }
@@ -50,6 +56,24 @@ impl DynamicColumn {
             DynamicColumn::DateTime(c) => &c.index,
             DynamicColumn::Bytes(c) => &c.ords().index,
             DynamicColumn::Str(c) => &c.ords().index,
+            DynamicColumn::PlainBytes(c) => c.column_index(),
+            DynamicColumn::PlainStr(c) => c.column_index(),
+        }
+    }
+
+    /// Consumes the dynamic column and returns its underlying column index.
+    pub fn into_column_index(self) -> ColumnIndex {
+        match self {
+            DynamicColumn::Bool(c) => c.index,
+            DynamicColumn::I64(c) => c.index,
+            DynamicColumn::U64(c) => c.index,
+            DynamicColumn::F64(c) => c.index,
+            DynamicColumn::IpAddr(c) => c.index,
+            DynamicColumn::DateTime(c) => c.index,
+            DynamicColumn::Bytes(c) => c.into_column_index(),
+            DynamicColumn::Str(c) => c.into_column_index(),
+            DynamicColumn::PlainBytes(c) => c.into_column_index(),
+            DynamicColumn::PlainStr(c) => PlainBytesColumn::from(c).into_column_index(),
         }
     }
 
@@ -67,6 +91,8 @@ impl DynamicColumn {
             DynamicColumn::DateTime(c) => c.values.num_vals(),
             DynamicColumn::Bytes(c) => c.ords().values.num_vals(),
             DynamicColumn::Str(c) => c.ords().values.num_vals(),
+            DynamicColumn::PlainBytes(c) => c.num_values(),
+            DynamicColumn::PlainStr(c) => c.num_values(),
         }
     }
 
@@ -80,6 +106,24 @@ impl DynamicColumn {
             DynamicColumn::DateTime(_) => ColumnType::DateTime,
             DynamicColumn::Bytes(_) => ColumnType::Bytes,
             DynamicColumn::Str(_) => ColumnType::Str,
+            DynamicColumn::PlainBytes(_) => ColumnType::Bytes,
+            DynamicColumn::PlainStr(_) => ColumnType::Str,
+        }
+    }
+
+    /// Returns the codec of `Str` and `Bytes` columns, and `None` for other column types.
+    pub fn str_codec(&self) -> Option<StrColumnCodec> {
+        match self {
+            DynamicColumn::Bytes(_) | DynamicColumn::Str(_) => Some(StrColumnCodec::Dictionary),
+            DynamicColumn::PlainBytes(_) | DynamicColumn::PlainStr(_) => {
+                Some(StrColumnCodec::Plain)
+            }
+            DynamicColumn::Bool(_)
+            | DynamicColumn::I64(_)
+            | DynamicColumn::U64(_)
+            | DynamicColumn::F64(_)
+            | DynamicColumn::IpAddr(_)
+            | DynamicColumn::DateTime(_) => None,
         }
     }
 
@@ -109,11 +153,11 @@ impl DynamicColumn {
         match self {
             DynamicColumn::I64(column) => Some(DynamicColumn::F64(Column {
                 index: column.index,
-                values: Arc::new(monotonic_map_column(column.values, MapI64ToF64)),
+                values: monotonic_map_column(column.values, MapI64ToF64),
             })),
             DynamicColumn::U64(column) => Some(DynamicColumn::F64(Column {
                 index: column.index,
-                values: Arc::new(monotonic_map_column(column.values, MapU64ToF64)),
+                values: monotonic_map_column(column.values, MapU64ToF64),
             })),
             DynamicColumn::F64(_) => Some(self),
             _ => None,
@@ -127,7 +171,7 @@ impl DynamicColumn {
                 }
                 Some(DynamicColumn::I64(Column {
                     index: column.index,
-                    values: Arc::new(monotonic_map_column(column.values, MapU64ToI64)),
+                    values: monotonic_map_column(column.values, MapU64ToI64),
                 }))
             }
             DynamicColumn::I64(_) => Some(self),
@@ -142,7 +186,7 @@ impl DynamicColumn {
                 }
                 Some(DynamicColumn::U64(Column {
                     index: column.index,
-                    values: Arc::new(monotonic_map_column(column.values, MapI64ToU64)),
+                    values: monotonic_map_column(column.values, MapI64ToU64),
                 }))
             }
             DynamicColumn::U64(_) => Some(self),
@@ -227,18 +271,51 @@ static_dynamic_conversions!(Column<DateTime>, DateTime);
 static_dynamic_conversions!(StrColumn, Str);
 static_dynamic_conversions!(BytesColumn, Bytes);
 static_dynamic_conversions!(Column<Ipv6Addr>, IpAddr);
+static_dynamic_conversions!(PlainStrColumn, PlainStr);
+static_dynamic_conversions!(PlainBytesColumn, PlainBytes);
 
 #[derive(Clone, Debug)]
 pub struct DynamicColumnHandle {
     pub(crate) file_slice: FileSlice,
     pub(crate) column_type: ColumnType,
+    /// Always `Dictionary` for columns other than `Str` and `Bytes`.
+    pub(crate) codec: StrColumnCodec,
+    pub(crate) format_version: Version,
+}
+
+fn plain_column_has_no_u64_representation() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "a plain-encoded column has no term ordinals and cannot be read as u64",
+    )
 }
 
 impl DynamicColumnHandle {
     // TODO rename load
     pub fn open(&self) -> io::Result<DynamicColumn> {
+        if self.codec == StrColumnCodec::Plain {
+            // Only the column metadata is read: the blocks are read lazily.
+            let plain_column =
+                PlainBytesColumn::open(self.file_slice.clone(), self.format_version)?;
+            return match self.column_type {
+                ColumnType::Str => Ok(DynamicColumn::PlainStr(PlainStrColumn::wrap(plain_column))),
+                ColumnType::Bytes => Ok(DynamicColumn::PlainBytes(plain_column)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the plain codec is only valid for str and bytes columns",
+                )),
+            };
+        }
         let column_bytes: OwnedBytes = self.file_slice.read_bytes()?;
         self.open_internal(column_bytes)
+    }
+
+    /// Returns the codec of `Str` and `Bytes` columns, and `None` for other column types.
+    pub fn str_codec(&self) -> Option<StrColumnCodec> {
+        match self.column_type {
+            ColumnType::Str | ColumnType::Bytes => Some(self.codec),
+            _ => None,
+        }
     }
 
     #[doc(hidden)]
@@ -256,15 +333,25 @@ impl DynamicColumnHandle {
     ///
     /// If not, the fastfield reader will returns the u64-value associated with the original
     /// FastValue.
+    ///
+    /// Plain-encoded columns have no `u64` representation: this method returns an
+    /// `InvalidInput` error for them.
     pub fn open_u64_lenient(&self) -> io::Result<Option<Column<u64>>> {
+        if self.codec == StrColumnCodec::Plain {
+            return Err(plain_column_has_no_u64_representation());
+        }
         let column_bytes = self.file_slice.read_bytes()?;
         match self.column_type {
             ColumnType::Str | ColumnType::Bytes => {
-                let column: BytesColumn = crate::column::open_column_bytes(column_bytes)?;
+                let column: BytesColumn =
+                    crate::column::open_column_bytes(column_bytes, self.format_version)?;
                 Ok(Some(column.term_ord_column))
             }
             ColumnType::IpAddr => {
-                let column = crate::column::open_column_u128_as_compact_u64(column_bytes)?;
+                let column = crate::column::open_column_u128_as_compact_u64(
+                    column_bytes,
+                    self.format_version,
+                )?;
                 Ok(Some(column))
             }
             ColumnType::Bool
@@ -272,7 +359,8 @@ impl DynamicColumnHandle {
             | ColumnType::U64
             | ColumnType::F64
             | ColumnType::DateTime => {
-                let column = crate::column::open_column_u64::<u64>(column_bytes)?;
+                let column =
+                    crate::column::open_column_u64::<u64>(column_bytes, self.format_version)?;
                 Ok(Some(column))
             }
         }
@@ -280,25 +368,120 @@ impl DynamicColumnHandle {
 
     fn open_internal(&self, column_bytes: OwnedBytes) -> io::Result<DynamicColumn> {
         let dynamic_column: DynamicColumn = match self.column_type {
-            ColumnType::Bytes => crate::column::open_column_bytes(column_bytes)?.into(),
-            ColumnType::Str => crate::column::open_column_str(column_bytes)?.into(),
-            ColumnType::I64 => crate::column::open_column_u64::<i64>(column_bytes)?.into(),
-            ColumnType::U64 => crate::column::open_column_u64::<u64>(column_bytes)?.into(),
-            ColumnType::F64 => crate::column::open_column_u64::<f64>(column_bytes)?.into(),
-            ColumnType::Bool => crate::column::open_column_u64::<bool>(column_bytes)?.into(),
-            ColumnType::IpAddr => crate::column::open_column_u128::<Ipv6Addr>(column_bytes)?.into(),
+            ColumnType::Bytes => {
+                crate::column::open_column_bytes(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::Str => {
+                crate::column::open_column_str(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::I64 => {
+                crate::column::open_column_u64::<i64>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::U64 => {
+                crate::column::open_column_u64::<u64>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::F64 => {
+                crate::column::open_column_u64::<f64>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::Bool => {
+                crate::column::open_column_u64::<bool>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::IpAddr => {
+                crate::column::open_column_u128::<Ipv6Addr>(column_bytes, self.format_version)?
+                    .into()
+            }
             ColumnType::DateTime => {
-                crate::column::open_column_u64::<DateTime>(column_bytes)?.into()
+                crate::column::open_column_u64::<DateTime>(column_bytes, self.format_version)?
+                    .into()
             }
         };
         Ok(dynamic_column)
     }
 
     pub fn num_bytes(&self) -> ByteCount {
-        self.file_slice.len().into()
+        self.file_slice.num_bytes()
+    }
+
+    /// Legacy helper returning the column space usage.
+    pub fn column_and_dictionary_num_bytes(&self) -> io::Result<ColumnSpaceUsage> {
+        self.space_usage()
+    }
+
+    /// Return the space usage of the column, optionally broken down by dictionary and column
+    /// values.
+    ///
+    /// For dictionary encoded columns (strings and bytes), this splits the total footprint into
+    /// the dictionary and the remaining column data (including index and values).
+    /// For all other column types, the dictionary size is `None` and the column size
+    /// equals the total bytes.
+    pub fn space_usage(&self) -> io::Result<ColumnSpaceUsage> {
+        let total_num_bytes = self.num_bytes();
+        let dynamic_column = self.open()?;
+        let dictionary_num_bytes = match &dynamic_column {
+            DynamicColumn::Bytes(bytes_column) => bytes_column.dictionary().num_bytes(),
+            DynamicColumn::Str(str_column) => str_column.dictionary().num_bytes(),
+            _ => {
+                return Ok(ColumnSpaceUsage::new(self.num_bytes(), None));
+            }
+        };
+        assert!(dictionary_num_bytes <= total_num_bytes);
+        let column_num_bytes =
+            ByteCount::from(total_num_bytes.get_bytes() - dictionary_num_bytes.get_bytes());
+        Ok(ColumnSpaceUsage::new(
+            column_num_bytes,
+            Some(dictionary_num_bytes),
+        ))
     }
 
     pub fn column_type(&self) -> ColumnType {
         self.column_type
+    }
+}
+
+/// Represents space usage of a column.
+///
+/// `column_num_bytes` tracks the column payload (index, values and footer).
+/// For dictionary encoded columns, `dictionary_num_bytes` captures the dictionary footprint.
+/// [`ColumnSpaceUsage::total_num_bytes`] returns the sum of both parts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnSpaceUsage {
+    column_num_bytes: ByteCount,
+    dictionary_num_bytes: Option<ByteCount>,
+}
+
+impl ColumnSpaceUsage {
+    pub(crate) fn new(
+        column_num_bytes: ByteCount,
+        dictionary_num_bytes: Option<ByteCount>,
+    ) -> Self {
+        ColumnSpaceUsage {
+            column_num_bytes,
+            dictionary_num_bytes,
+        }
+    }
+
+    pub fn column_num_bytes(&self) -> ByteCount {
+        self.column_num_bytes
+    }
+
+    pub fn dictionary_num_bytes(&self) -> Option<ByteCount> {
+        self.dictionary_num_bytes
+    }
+
+    pub fn total_num_bytes(&self) -> ByteCount {
+        self.column_num_bytes + self.dictionary_num_bytes.unwrap_or_default()
+    }
+
+    /// Merge two space usage values by summing their components.
+    pub fn merge(&self, other: &ColumnSpaceUsage) -> ColumnSpaceUsage {
+        let dictionary_num_bytes = match (self.dictionary_num_bytes, other.dictionary_num_bytes) {
+            (Some(lhs), Some(rhs)) => Some(lhs + rhs),
+            (Some(val), None) | (None, Some(val)) => Some(val),
+            (None, None) => None,
+        };
+        ColumnSpaceUsage {
+            column_num_bytes: self.column_num_bytes + other.column_num_bytes,
+            dictionary_num_bytes,
+        }
     }
 }

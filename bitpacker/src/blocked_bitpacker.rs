@@ -1,6 +1,6 @@
 use super::bitpacker::BitPacker;
 use super::compute_num_bits;
-use crate::{minmax, BitUnpacker};
+use crate::{BitUnpacker, minmax};
 
 const BLOCK_SIZE: usize = 128;
 
@@ -34,7 +34,7 @@ struct BlockedBitpackerEntryMetaData {
 
 impl BlockedBitpackerEntryMetaData {
     fn new(offset: u64, num_bits: u8, base_value: u64) -> Self {
-        let encoded = offset | (num_bits as u64) << (64 - 8);
+        let encoded = offset | (u64::from(num_bits) << (64 - 8));
         Self {
             encoded,
             base_value,
@@ -140,10 +140,10 @@ impl BlockedBitpacker {
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         // todo performance: we could decompress a whole block and cache it instead
         let bitpacked_elems = self.offset_and_bits.len() * BLOCK_SIZE;
-        let iter = (0..bitpacked_elems)
+
+        (0..bitpacked_elems)
             .map(move |idx| self.get(idx))
-            .chain(self.buffer.iter().cloned());
-        iter
+            .chain(self.buffer.iter().cloned())
     }
 }
 

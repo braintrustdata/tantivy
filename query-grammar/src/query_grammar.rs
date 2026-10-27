@@ -1,5 +1,8 @@
+use std::borrow::Cow;
 use std::iter::once;
 
+use fnv::FnvHashSet;
+use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{
@@ -9,17 +12,16 @@ use nom::combinator::{eof, map, map_res, opt, peek, recognize, value, verify};
 use nom::error::{Error, ErrorKind};
 use nom::multi::{many0, many1, separated_list0};
 use nom::sequence::{delimited, preceded, separated_pair, terminated, tuple};
-use nom::IResult;
 
 use super::user_input_ast::{UserInputAst, UserInputBound, UserInputLeaf, UserInputLiteral};
+use crate::Occur;
 use crate::infallible::*;
 use crate::user_input_ast::Delimiter;
-use crate::Occur;
 
 // Note: '-' char is only forbidden at the beginning of a field name, would be clearer to add it to
 // special characters.
 const SPECIAL_CHARS: &[char] = &[
-    '+', '^', '`', ':', '{', '}', '"', '[', ']', '(', ')', '!', '\\', '*', ' ',
+    '+', '^', '`', ':', '{', '}', '"', '\'', '[', ']', '(', ')', '!', '\\', '*', ' ',
 ];
 
 /// consume a field name followed by colon. Return the field name with escape sequence
@@ -35,42 +37,98 @@ fn field_name(inp: &str) -> IResult<&str, String> {
                 alt((first_char, escape_sequence())),
                 many0(alt((simple_char, escape_sequence(), char('\\')))),
             )),
-            char(':'),
+            tuple((multispace0, char(':'), multispace0)),
         ),
         |(first_char, next)| once(first_char).chain(next).collect(),
     )(inp)
 }
 
+const ESCAPE_IN_WORD: &[char] = &['^', '`', ':', '{', '}', '"', '\'', '[', ']', '(', ')', '\\'];
+
+fn interpret_escape(source: &str) -> String {
+    let mut res = String::with_capacity(source.len());
+    let mut in_escape = false;
+    let require_escape = |c: char| c.is_whitespace() || ESCAPE_IN_WORD.contains(&c) || c == '-';
+
+    for c in source.chars() {
+        if in_escape {
+            if !require_escape(c) {
+                // we re-add the escape sequence
+                res.push('\\');
+            }
+            res.push(c);
+            in_escape = false;
+        } else if c == '\\' {
+            in_escape = true;
+        } else {
+            res.push(c);
+        }
+    }
+    res
+}
+
 /// Consume a word outside of any context.
 // TODO should support escape sequences
-fn word(inp: &str) -> IResult<&str, &str> {
+fn word(inp: &str) -> IResult<&str, Cow<'_, str>> {
     map_res(
         recognize(tuple((
-            satisfy(|c| {
-                !c.is_whitespace()
-                    && !['-', '^', '`', ':', '{', '}', '"', '[', ']', '(', ')'].contains(&c)
-            }),
-            many0(satisfy(|c: char| {
-                !c.is_whitespace() && ![':', '^', '{', '}', '"', '[', ']', '(', ')'].contains(&c)
-            })),
+            alt((
+                preceded(char('\\'), anychar),
+                satisfy(|c| !c.is_whitespace() && !ESCAPE_IN_WORD.contains(&c) && c != '-'),
+            )),
+            many0(alt((
+                preceded(char('\\'), anychar),
+                satisfy(|c: char| !c.is_whitespace() && !ESCAPE_IN_WORD.contains(&c)),
+            ))),
         ))),
         |s| match s {
             "OR" | "AND" | "NOT" | "IN" => Err(Error::new(inp, ErrorKind::Tag)),
-            _ => Ok(s),
+            s if s.contains('\\') => Ok(Cow::Owned(interpret_escape(s))),
+            s => Ok(Cow::Borrowed(s)),
         },
     )(inp)
 }
 
-fn word_infallible(delimiter: &str) -> impl Fn(&str) -> JResult<&str, Option<&str>> + '_ {
-    |inp| {
-        opt_i_err(
-            preceded(
-                multispace0,
-                recognize(many1(satisfy(|c| {
-                    !c.is_whitespace() && !delimiter.contains(c)
-                }))),
+fn word_infallible(
+    delimiter: &str,
+    emit_error: bool,
+) -> impl Fn(&str) -> JResult<&str, Option<Cow<str>>> + '_ {
+    // emit error is set when receiving an unescaped `:` should emit an error
+
+    move |inp| {
+        map(
+            opt_i_err(
+                preceded(
+                    multispace0,
+                    recognize(many1(alt((
+                        preceded(char::<&str, _>('\\'), anychar),
+                        satisfy(|c| !c.is_whitespace() && !delimiter.contains(c)),
+                    )))),
+                ),
+                "expected word",
             ),
-            "expected word",
+            |(opt_s, mut errors)| match opt_s {
+                Some(s) => {
+                    if emit_error
+                        && (s
+                            .as_bytes()
+                            .windows(2)
+                            .any(|window| window[0] != b'\\' && window[1] == b':')
+                            || s.starts_with(':'))
+                    {
+                        errors.push(LenientErrorInternal {
+                            pos: inp.len(),
+                            message: "parsed possible invalid field as term".to_string(),
+                        });
+                    }
+                    if s.contains('\\') {
+                        (Some(Cow::Owned(interpret_escape(s))), errors)
+                    } else {
+                        (Some(Cow::Borrowed(s)), errors)
+                    }
+                }
+                None => (None, errors),
+            },
         )(inp)
     }
 }
@@ -159,7 +217,7 @@ fn simple_term_infallible(
                 (value((), char('\'')), simple_quotes),
             ),
             // numbers are parsed with words in this case, as we allow string starting with a -
-            map(word_infallible(delimiter), |(text, errors)| {
+            map(word_infallible(delimiter, true), |(text, errors)| {
                 (text.map(|text| (Delimiter::None, text.to_string())), errors)
             }),
         )(inp)
@@ -218,27 +276,14 @@ fn term_or_phrase_infallible(inp: &str) -> JResult<&str, Option<UserInputLeaf>> 
 }
 
 fn term_group(inp: &str) -> IResult<&str, UserInputAst> {
-    let occur_symbol = alt((
-        value(Occur::MustNot, char('-')),
-        value(Occur::Must, char('+')),
-    ));
-
     map(
         tuple((
             terminated(field_name, multispace0),
-            delimited(
-                tuple((char('('), multispace0)),
-                separated_list0(multispace1, tuple((opt(occur_symbol), term_or_phrase))),
-                char(')'),
-            ),
+            delimited(tuple((char('('), multispace0)), ast, char(')')),
         )),
-        |(field_name, terms)| {
-            UserInputAst::Clause(
-                terms
-                    .into_iter()
-                    .map(|(occur, leaf)| (occur, leaf.set_field(Some(field_name.clone())).into()))
-                    .collect(),
-            )
+        |(field_name, mut ast)| {
+            ast.set_default_field(field_name);
+            ast
         },
     )(inp)
 }
@@ -258,46 +303,17 @@ fn term_group_precond(inp: &str) -> IResult<&str, (), ()> {
 }
 
 fn term_group_infallible(inp: &str) -> JResult<&str, UserInputAst> {
-    let (mut inp, (field_name, _, _, _)) =
+    let (inp, (field_name, _, _, _)) =
         tuple((field_name, multispace0, char('('), multispace0))(inp).expect("precondition failed");
 
-    let mut terms = Vec::new();
-    let mut errs = Vec::new();
-
-    let mut first_round = true;
-    loop {
-        let mut space_error = if first_round {
-            first_round = false;
-            Vec::new()
-        } else {
-            let (rest, (_, err)) = space1_infallible(inp)?;
-            inp = rest;
-            err
-        };
-        if inp.is_empty() {
-            errs.push(LenientErrorInternal {
-                pos: inp.len(),
-                message: "missing )".to_string(),
-            });
-            break Ok((inp, (UserInputAst::Clause(terms), errs)));
-        }
-        if let Some(inp) = inp.strip_prefix(')') {
-            break Ok((inp, (UserInputAst::Clause(terms), errs)));
-        }
-        // only append missing space error if we did not reach the end of group
-        errs.append(&mut space_error);
-
-        // here we do the assumption term_or_phrase_infallible always consume something if the
-        // first byte is not `)` or ' '. If it did not, we would end up looping.
-
-        let (rest, ((occur, leaf), mut err)) =
-            tuple_infallible((occur_symbol, term_or_phrase_infallible))(inp)?;
-        errs.append(&mut err);
-        if let Some(leaf) = leaf {
-            terms.push((occur, leaf.set_field(Some(field_name.clone())).into()));
-        }
-        inp = rest;
-    }
+    delimited_infallible(
+        nothing,
+        map(ast_infallible, |(mut ast, errors)| {
+            ast.set_default_field(field_name.to_string());
+            (ast, errors)
+        }),
+        opt_i_err(char(')'), "expected ')'"),
+    )(inp)
 }
 
 fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
@@ -305,7 +321,18 @@ fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
         UserInputLeaf::Exists {
             field: String::new(),
         },
-        tuple((multispace0, char('*'))),
+        tuple((
+            multispace0,
+            char('*'),
+            peek(alt((
+                value("", multispace1),
+                value(
+                    "",
+                    satisfy(|c: char| ESCAPE_IN_WORD.contains(&c) && c != '\\'),
+                ),
+                eof,
+            ))),
+        )),
     )(inp)
 }
 
@@ -315,7 +342,15 @@ fn exists_precond(inp: &str) -> IResult<&str, (), ()> {
         peek(tuple((
             field_name,
             multispace0,
-            char('*'), // when we are here, we know it can't be anything but a exists
+            char('*'),
+            peek(alt((
+                value("", multispace1),
+                value(
+                    "",
+                    satisfy(|c: char| ESCAPE_IN_WORD.contains(&c) && c != '\\'),
+                ),
+                eof,
+            ))), // we need to check this isn't a wildcard query
         ))),
     )(inp)
     .map_err(|e| e.map(|_| ()))
@@ -334,7 +369,10 @@ fn literal(inp: &str) -> IResult<&str, UserInputAst> {
     // something (a field name) got parsed before
     alt((
         map(
-            tuple((opt(field_name), alt((range, set, exists, term_or_phrase)))),
+            tuple((
+                opt(field_name),
+                alt((range, set, exists, regex, term_or_phrase)),
+            )),
             |(field_name, leaf): (Option<String>, UserInputLeaf)| leaf.set_field(field_name).into(),
         ),
         term_group,
@@ -356,6 +394,10 @@ fn literal_no_group_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>>
                         value((), peek(one_of("{[><"))),
                         map(range_infallible, |(range, errs)| (Some(range), errs)),
                     ),
+                    (
+                        value((), peek(one_of("/"))),
+                        map(regex_infallible, |(regex, errs)| (Some(regex), errs)),
+                    ),
                 ),
                 delimited_infallible(space0_infallible, term_or_phrase_infallible, nothing),
             ),
@@ -363,15 +405,6 @@ fn literal_no_group_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>>
         |((field_name, _, leaf), mut errors)| {
             (
                 leaf.map(|leaf| {
-                    if matches!(&leaf, UserInputLeaf::Literal(literal)
-                            if literal.phrase.contains(':') && literal.delimiter == Delimiter::None)
-                        && field_name.is_none()
-                    {
-                        errors.push(LenientErrorInternal {
-                            pos: inp.len(),
-                            message: "parsed possible invalid field as term".to_string(),
-                        });
-                    }
                     if matches!(&leaf, UserInputLeaf::Literal(literal)
                             if literal.phrase == "NOT" && literal.delimiter == Delimiter::None)
                         && field_name.is_none()
@@ -490,20 +523,20 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
         tuple_infallible((
             opt_i(anychar),
             space0_infallible,
-            word_infallible("]}"),
+            word_infallible("]}", false),
             space1_infallible,
             opt_i_err(
                 terminated(tag("TO"), alt((value((), multispace1), value((), eof)))),
                 "missing keyword TO",
             ),
-            word_infallible("]}"),
+            word_infallible("]}", false),
             opt_i_err(one_of("]}"), "missing range delimiter"),
         )),
         |(
             (lower_bound_kind, _multispace0, lower, _multispace1, to, upper, upper_bound_kind),
             errs,
         )| {
-            let lower_bound = match (lower_bound_kind, lower) {
+            let lower_bound = match (lower_bound_kind, lower.as_deref()) {
                 (_, Some("*")) => UserInputBound::Unbounded,
                 (_, None) => UserInputBound::Unbounded,
                 // if it is some, TO was actually the bound (i.e. [TO TO something])
@@ -512,7 +545,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 (Some('{'), Some(bound)) => UserInputBound::Exclusive(bound.to_string()),
                 _ => unreachable!("precondition failed, range did not start with [ or {{"),
             };
-            let upper_bound = match (upper_bound_kind, upper) {
+            let upper_bound = match (upper_bound_kind, upper.as_deref()) {
                 (_, Some("*")) => UserInputBound::Unbounded,
                 (_, None) => UserInputBound::Unbounded,
                 (Some(']'), Some(bound)) => UserInputBound::Inclusive(bound.to_string()),
@@ -529,7 +562,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
             (
                 (
                     value((), tag(">=")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -543,7 +576,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<=")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -557,7 +590,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag(">")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -571,7 +604,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<")),
-                    map(word_infallible(""), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -652,16 +685,89 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
             return Ok((inp, (res, errs)));
         }
         errs.append(&mut space_error);
-        // TODO
-        // here we do the assumption term_or_phrase_infallible always consume something if the
-        // first byte is not `)` or ' '. If it did not, we would end up looping.
 
         let (rest, (delim_term, mut err)) = simple_term_infallible("]")(inp)?;
         errs.append(&mut err);
+        if rest.len() == inp.len() {
+            errs.push(LenientErrorInternal {
+                pos: inp.len(),
+                message: "missing ]".to_string(),
+            });
+            let res = UserInputLeaf::Set {
+                field: None,
+                elements,
+            };
+            return Ok((inp, (res, errs)));
+        }
         if let Some((_, term)) = delim_term {
             elements.push(term);
         }
         inp = rest;
+    }
+}
+
+fn regex(inp: &str) -> IResult<&str, UserInputLeaf> {
+    map(
+        terminated(
+            delimited(
+                char('/'),
+                many1(alt((preceded(char('\\'), char('/')), none_of("/")))),
+                char('/'),
+            ),
+            peek(alt((
+                value((), multispace1),
+                value((), char(')')),
+                value((), char('^')),
+                value((), eof),
+            ))),
+        ),
+        |elements| UserInputLeaf::Regex {
+            field: None,
+            pattern: elements.into_iter().collect::<String>(),
+        },
+    )(inp)
+}
+
+fn regex_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
+    match terminated_infallible(
+        delimited_infallible(
+            opt_i_err(char('/'), "missing delimiter /"),
+            opt_i(many1(alt((preceded(char('\\'), char('/')), none_of("/"))))),
+            opt_i_err(char('/'), "missing delimiter /"),
+        ),
+        opt_i_err(
+            peek(alt((
+                value((), multispace1),
+                value((), char(')')),
+                value((), char('^')),
+                value((), eof),
+            ))),
+            "expected whitespace, closing parenthesis, boost, or end of input",
+        ),
+    )(inp)
+    {
+        Ok((rest, (elements_part, errors))) => {
+            let pattern = match elements_part {
+                Some(elements_part) => elements_part.into_iter().collect(),
+                None => String::new(),
+            };
+            let res = UserInputLeaf::Regex {
+                field: None,
+                pattern,
+            };
+            Ok((rest, (res, errors)))
+        }
+        Err(e) => {
+            let errs = vec![LenientErrorInternal {
+                pos: inp.len(),
+                message: e.to_string(),
+            }];
+            let res = UserInputLeaf::Regex {
+                field: None,
+                pattern: String::new(),
+            };
+            Ok((inp, (res, errs)))
+        }
     }
 }
 
@@ -672,7 +778,21 @@ fn negate(expr: UserInputAst) -> UserInputAst {
 fn leaf(inp: &str) -> IResult<&str, UserInputAst> {
     alt((
         delimited(char('('), ast, char(')')),
-        map(char('*'), |_| UserInputAst::from(UserInputLeaf::All)),
+        map(
+            terminated(
+                char('*'),
+                peek(alt((
+                    value((), multispace1),
+                    value((), char(')')),
+                    value((), eof),
+                    value(
+                        (),
+                        satisfy(|c: char| ESCAPE_IN_WORD.contains(&c) && c != '\\'),
+                    ),
+                ))),
+            ),
+            |_| UserInputAst::from(UserInputLeaf::All),
+        ),
         map(preceded(tuple((tag("NOT"), multispace1)), leaf), negate),
         literal,
     ))(inp)
@@ -693,7 +813,21 @@ fn leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
                 ),
             ),
             (
-                value((), char('*')),
+                value(
+                    (),
+                    terminated(
+                        char('*'),
+                        peek(alt((
+                            value((), multispace1),
+                            value((), char(')')),
+                            value((), eof),
+                            value(
+                                (),
+                                satisfy(|c: char| ESCAPE_IN_WORD.contains(&c) && c != '\\'),
+                            ),
+                        ))),
+                    ),
+                ),
                 map(nothing, |_| {
                     (Some(UserInputAst::from(UserInputLeaf::All)), Vec::new())
                 }),
@@ -729,7 +863,7 @@ fn boosted_leaf(inp: &str) -> IResult<&str, UserInputAst> {
         tuple((leaf, fallible(boost))),
         |(leaf, boost_opt)| match boost_opt {
             Some(boost) if (boost - 1.0).abs() > f64::EPSILON => {
-                UserInputAst::Boost(Box::new(leaf), boost)
+                UserInputAst::Boost(Box::new(leaf), boost.into())
             }
             _ => leaf,
         },
@@ -741,7 +875,7 @@ fn boosted_leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
         tuple_infallible((leaf_infallible, boost)),
         |((leaf, boost_opt), error)| match boost_opt {
             Some(boost) if (boost - 1.0).abs() > f64::EPSILON => (
-                leaf.map(|leaf| UserInputAst::Boost(Box::new(leaf), boost)),
+                leaf.map(|leaf| UserInputAst::Boost(Box::new(leaf), boost.into())),
                 error,
             ),
             _ => (leaf, error),
@@ -760,7 +894,7 @@ fn occur_leaf(inp: &str) -> IResult<&str, (Option<Occur>, UserInputAst)> {
     tuple((fallible(occur_symbol), boosted_leaf))(inp)
 }
 
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn operand_occur_leaf_infallible(
     inp: &str,
 ) -> JResult<&str, (Option<BinaryOperand>, Option<Occur>, Option<UserInputAst>)> {
@@ -826,7 +960,7 @@ fn aggregate_infallible_expressions(
     if early_operand {
         err.push(LenientErrorInternal {
             pos: 0,
-            message: "Found unexpeted boolean operator before term".to_string(),
+            message: "Found unexpected boolean operator before term".to_string(),
         });
     }
 
@@ -849,7 +983,7 @@ fn aggregate_infallible_expressions(
                     _ => Some(Occur::Should),
                 };
                 if occur == &Some(Occur::MustNot) && default_op == Some(Occur::Should) {
-                    // if occur is MustNot *and* operation is OR, we synthetize a ShouldNot
+                    // if occur is MustNot *and* operation is OR, we synthesize a ShouldNot
                     clauses.push(vec![(
                         Some(Occur::Should),
                         ast.clone().unary(Occur::MustNot),
@@ -865,7 +999,7 @@ fn aggregate_infallible_expressions(
                     None => None,
                 };
                 if occur == &Some(Occur::MustNot) && default_op == Some(Occur::Should) {
-                    // if occur is MustNot *and* operation is OR, we synthetize a ShouldNot
+                    // if occur is MustNot *and* operation is OR, we synthesize a ShouldNot
                     clauses.push(vec![(
                         Some(Occur::Should),
                         ast.clone().unary(Occur::MustNot),
@@ -890,7 +1024,7 @@ fn aggregate_infallible_expressions(
         }
         Some(BinaryOperand::Or) => {
             if last_occur == Some(Occur::MustNot) {
-                // if occur is MustNot *and* operation is OR, we synthetize a ShouldNot
+                // if occur is MustNot *and* operation is OR, we synthesize a ShouldNot
                 clauses.push(vec![(Some(Occur::Should), last_ast.unary(Occur::MustNot))]);
             } else {
                 clauses.push(vec![(last_occur.or(Some(Occur::Should)), last_ast)]);
@@ -931,18 +1065,43 @@ fn operand_leaf(inp: &str) -> IResult<&str, (Option<BinaryOperand>, Option<Occur
 }
 
 fn ast(inp: &str) -> IResult<&str, UserInputAst> {
-    let boolean_expr = map_res(
-        separated_pair(occur_leaf, multispace1, many1(operand_leaf)),
-        |(left, right)| aggregate_binary_expressions(left, right),
-    );
-    let single_leaf = map(occur_leaf, |(occur, ast)| {
-        if occur == Some(Occur::MustNot) {
-            ast.unary(Occur::MustNot)
-        } else {
-            ast
-        }
-    });
-    delimited(multispace0, alt((boolean_expr, single_leaf)), multispace0)(inp)
+    // Parse `occur_leaf` once, then conditionally extend into a boolean
+    // expression. The previous implementation used `alt((boolean_expr,
+    // single_leaf))` which, when the input was a single leaf with no
+    // following operand, would parse `occur_leaf` once for `boolean_expr`,
+    // fail at `multispace1`, backtrack, then re-parse `occur_leaf` for
+    // `single_leaf`. With recursively-nested groups like `(+(+(+a)))`, that
+    // doubling at every level produced O(2^n) parse time. Parsing once and
+    // peeking ahead for the operand keeps it O(n).
+    delimited(
+        multispace0,
+        |inp| {
+            let (rest, first) = occur_leaf(inp)?;
+            // Only fall back on `Err::Error` (recoverable), mirroring
+            // `alt`'s behaviour. `Err::Failure` and `Err::Incomplete`
+            // must propagate so cut points and streaming needs are not
+            // accidentally swallowed if they are ever introduced in the
+            // operand parsers.
+            match preceded(multispace1, many1(operand_leaf))(rest) {
+                Ok((rest, more)) => {
+                    let combined = aggregate_binary_expressions(first, more)
+                        .map_err(|_| nom::Err::Error(Error::new(inp, ErrorKind::MapRes)))?;
+                    Ok((rest, combined))
+                }
+                Err(nom::Err::Error(_)) => {
+                    let (occur, ast) = first;
+                    let single = if occur == Some(Occur::MustNot) {
+                        ast.unary(Occur::MustNot)
+                    } else {
+                        ast
+                    };
+                    Ok((rest, single))
+                }
+                Err(e) => Err(e),
+            }
+        },
+        multispace0,
+    )(inp)
 }
 
 fn ast_infallible(inp: &str) -> JResult<&str, UserInputAst> {
@@ -972,11 +1131,14 @@ pub fn parse_to_ast(inp: &str) -> IResult<&str, UserInputAst> {
 }
 
 pub fn parse_to_ast_lenient(query_str: &str) -> (UserInputAst, Vec<LenientError>) {
-    if query_str.trim().is_empty() {
+    if query_str
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+    {
         return (UserInputAst::Clause(Vec::new()), Vec::new());
     }
     let (left, (res, mut errors)) = ast_infallible(query_str).unwrap();
-    if !left.trim().is_empty() {
+    if !left.is_empty() {
         errors.push(LenientErrorInternal {
             pos: left.len(),
             message: "unparsed end of query".to_string(),
@@ -992,12 +1154,25 @@ pub fn parse_to_ast_lenient(query_str: &str) -> (UserInputAst, Vec<LenientError>
     (rewrite_ast(res), errors)
 }
 
-/// Removes unnecessary children clauses in AST
-///
-/// Motivated by [issue #1433](https://github.com/quickwit-oss/tantivy/issues/1433)
 fn rewrite_ast(mut input: UserInputAst) -> UserInputAst {
-    if let UserInputAst::Clause(terms) = &mut input {
-        for term in terms {
+    if let UserInputAst::Clause(sub_clauses) = &mut input {
+        // call rewrite_ast recursively on children clauses if applicable
+        let mut new_clauses = Vec::with_capacity(sub_clauses.len());
+        for (occur, clause) in sub_clauses.drain(..) {
+            let rewritten_clause = rewrite_ast(clause);
+            new_clauses.push((occur, rewritten_clause));
+        }
+        *sub_clauses = new_clauses;
+
+        // remove duplicate child clauses
+        // e.g. (+a +b) OR (+c +d) OR (+a +b)  => (+a +b) OR (+c +d)
+        let mut seen = FnvHashSet::default();
+        sub_clauses.retain(|term| seen.insert(term.clone()));
+
+        // Removes unnecessary children clauses in AST
+        //
+        // Motivated by [issue #1433](https://github.com/quickwit-oss/tantivy/issues/1433)
+        for term in sub_clauses {
             rewrite_ast_clause(term);
         }
     }
@@ -1006,7 +1181,7 @@ fn rewrite_ast(mut input: UserInputAst) -> UserInputAst {
 
 fn rewrite_ast_clause(input: &mut (Option<Occur>, UserInputAst)) {
     match input {
-        (None, UserInputAst::Clause(ref mut clauses)) if clauses.len() == 1 => {
+        (None, UserInputAst::Clause(clauses)) if clauses.len() == 1 => {
             *input = clauses.pop().unwrap(); // safe because clauses.len() == 1
         }
         _ => {}
@@ -1050,7 +1225,7 @@ mod test {
         valid_parse("1", 1.0, "");
         valid_parse("0.234234 aaa", 0.234234f64, " aaa");
         error_parse(".3332");
-        // TODO trinity-1686a: I disagree that it should fail, I think it should succeeed,
+        // TODO trinity-1686a: I disagree that it should fail, I think it should succeed,
         // consuming only "1", and leave "." for the next thing (which will likely fail then)
         // error_parse("1.");
         error_parse("-1.");
@@ -1198,6 +1373,20 @@ mod test {
         test_parse_query_to_ast_helper("weight: <= 70", "\"weight\":{\"*\" TO \"70\"]");
 
         test_parse_query_to_ast_helper("weight: <= 70.5", "\"weight\":{\"*\" TO \"70.5\"]");
+
+        test_parse_query_to_ast_helper(">a", "{\"a\" TO \"*\"}");
+        test_parse_query_to_ast_helper(">=a", "[\"a\" TO \"*\"}");
+        test_parse_query_to_ast_helper("<a", "{\"*\" TO \"a\"}");
+        test_parse_query_to_ast_helper("<=a", "{\"*\" TO \"a\"]");
+        test_parse_query_to_ast_helper("<=bsd", "{\"*\" TO \"bsd\"]");
+
+        test_parse_query_to_ast_helper("(<=42)", "{\"*\" TO \"42\"]");
+        test_parse_query_to_ast_helper("(<=42 )", "{\"*\" TO \"42\"]");
+        test_parse_query_to_ast_helper("(age:>5)", "\"age\":{\"5\" TO \"*\"}");
+        test_parse_query_to_ast_helper(
+            "(title:bar AND age:>12)",
+            "(+\"title\":bar +\"age\":{\"12\" TO \"*\"})",
+        );
     }
 
     #[test]
@@ -1252,6 +1441,10 @@ mod test {
         assert_eq!(
             super::field_name("~my~field:a"),
             Ok(("a", "~my~field".to_string()))
+        );
+        assert_eq!(
+            super::field_name(".my.field.name : a"),
+            Ok(("a", ".my.field.name".to_string()))
         );
         for special_char in SPECIAL_CHARS.iter() {
             let query = &format!("\\{special_char}my\\{special_char}field:a");
@@ -1346,7 +1539,7 @@ mod test {
 
     #[test]
     fn test_range_parser_lenient() {
-        let literal = |query| literal_infallible(query).unwrap().1 .0.unwrap();
+        let literal = |query| literal_infallible(query).unwrap().1.0.unwrap();
 
         // same tests as non-lenient
         let res = literal("title: <hello");
@@ -1454,7 +1647,7 @@ mod test {
     }
 
     #[test]
-    fn test_parse_query_to_triming_spaces() {
+    fn test_parse_query_to_trimming_spaces() {
         test_parse_query_to_ast_helper("   abc", "abc");
         test_parse_query_to_ast_helper("abc ", "abc");
         test_parse_query_to_ast_helper("(  a OR abc)", "(?a ?abc)");
@@ -1468,10 +1661,25 @@ mod test {
 
     #[test]
     fn test_parse_query_term_group() {
-        test_parse_query_to_ast_helper(r#"field:(abc)"#, r#"(*"field":abc)"#);
+        test_parse_query_to_ast_helper(r#"field:(abc)"#, r#""field":abc"#);
         test_parse_query_to_ast_helper(r#"field:(+a -"b c")"#, r#"(+"field":a -"field":"b c")"#);
+        test_parse_query_to_ast_helper(r#"field:(a AND "b c")"#, r#"(+"field":a +"field":"b c")"#);
+        test_parse_query_to_ast_helper(r#"field:(a OR "b c")"#, r#"(?"field":a ?"field":"b c")"#);
+        test_parse_query_to_ast_helper(
+            r#"field:(a OR (b AND c))"#,
+            r#"(?"field":a ?(+"field":b +"field":c))"#,
+        );
+        test_parse_query_to_ast_helper(
+            r#"field:(a [b TO c])"#,
+            r#"(*"field":a *"field":["b" TO "c"])"#,
+        );
 
         test_is_parse_err(r#"field:(+a -"b c""#, r#"(+"field":a -"field":"b c")"#);
+    }
+
+    #[test]
+    fn field_re_specification() {
+        test_parse_query_to_ast_helper(r#"field:(abc AND b:cde)"#, r#"(+"field":abc +"b":cde)"#);
     }
 
     #[test]
@@ -1547,6 +1755,27 @@ mod test {
         test_parse_query_to_ast_helper("abc:a b", "(*\"abc\":a *b)");
         test_parse_query_to_ast_helper("abc:\"a b\"", "\"abc\":\"a b\"");
         test_parse_query_to_ast_helper("foo:[1 TO 5]", "\"foo\":[\"1\" TO \"5\"]");
+
+        // Phrase prefixed with *
+        test_parse_query_to_ast_helper("foo:(*A)", "\"foo\":*A");
+        test_parse_query_to_ast_helper("*A", "*A");
+        test_parse_query_to_ast_helper("(*A)", "*A");
+        test_parse_query_to_ast_helper("foo:(A OR B)", "(?\"foo\":A ?\"foo\":B)");
+        test_parse_query_to_ast_helper("foo:(A* OR B*)", "(?\"foo\":A* ?\"foo\":B*)");
+        test_parse_query_to_ast_helper("foo:(*A OR *B)", "(?\"foo\":*A ?\"foo\":*B)");
+
+        // Regexes between parentheses
+        test_parse_query_to_ast_helper("foo:(/A.*/)", "\"foo\":/A.*/");
+        test_parse_query_to_ast_helper("foo:(/A.*/ OR /B.*/)", "(?\"foo\":/A.*/ ?\"foo\":/B.*/)");
+    }
+
+    #[test]
+    fn test_parse_query_all() {
+        test_parse_query_to_ast_helper("*", "*");
+        test_parse_query_to_ast_helper("(*)", "*");
+        test_parse_query_to_ast_helper("(* )", "*");
+        // All query with boost
+        test_parse_query_to_ast_helper("*^2", "(*)^2");
     }
 
     #[test]
@@ -1596,13 +1825,20 @@ mod test {
 
     #[test]
     fn test_exist_query() {
-        test_parse_query_to_ast_helper("a:*", "\"a\":*");
-        test_parse_query_to_ast_helper("a: *", "\"a\":*");
-        // an exist followed by default term being b
-        test_is_parse_err("a:*b", "(*\"a\":* *b)");
+        test_parse_query_to_ast_helper("a:*", "$exists(\"a\")");
+        test_parse_query_to_ast_helper("a: *", "$exists(\"a\")");
 
-        // this is a term query (not a phrase prefix)
+        test_parse_query_to_ast_helper(
+            "(hello AND toto:*) OR happy",
+            "(?(+hello +$exists(\"toto\")) ?happy)",
+        );
+        test_parse_query_to_ast_helper("(a:*)", "$exists(\"a\")");
+
+        // these are term/wildcard query (not a phrase prefix)
         test_parse_query_to_ast_helper("a:b*", "\"a\":b*");
+        test_parse_query_to_ast_helper("a:*b", "\"a\":*b");
+        test_parse_query_to_ast_helper(r#"a:*def*"#, "\"a\":*def*");
+        test_parse_query_to_ast_helper("a:*\\:foo", "\"a\":*:foo");
     }
 
     #[test]
@@ -1621,5 +1857,110 @@ mod test {
             r#"myfield:'hello\"happy\'tax'"#,
             r#""myfield":'hello"happy'tax'"#,
         );
+        // we don't process escape sequence for chars which don't require it
+        test_parse_query_to_ast_helper(r#"abc\*"#, r#"abc\*"#);
+    }
+
+    #[test]
+    fn test_queries_with_colons() {
+        test_parse_query_to_ast_helper(r#""abc:def""#, r#""abc:def""#);
+        test_parse_query_to_ast_helper(r#"'abc:def'"#, r#"'abc:def'"#);
+        test_parse_query_to_ast_helper(r#"abc\:def"#, r#"abc:def"#);
+        test_parse_query_to_ast_helper(r#""abc\:def""#, r#""abc:def""#);
+        test_parse_query_to_ast_helper(r#"'abc\:def'"#, r#"'abc:def'"#);
+    }
+
+    #[test]
+    fn test_invalid_field() {
+        test_is_parse_err(r#"!bc:def"#, "!bc:def");
+    }
+
+    #[test]
+    fn test_regex_parser() {
+        let r = parse_to_ast(r#"a:/joh?n(ath[oa]n)/"#);
+        assert!(r.is_ok(), "Failed to parse custom query: {r:?}");
+        let (_, input) = r.unwrap();
+        match input {
+            UserInputAst::Leaf(leaf) => match leaf.as_ref() {
+                UserInputLeaf::Regex { field, pattern } => {
+                    assert_eq!(field, &Some("a".to_string()));
+                    assert_eq!(pattern, "joh?n(ath[oa]n)");
+                }
+                _ => panic!("Expected a regex leaf, got {leaf:?}"),
+            },
+            _ => panic!("Expected a leaf"),
+        }
+        let r = parse_to_ast(r#"a:/\\/cgi-bin\\/luci.*/"#);
+        assert!(r.is_ok(), "Failed to parse custom query: {r:?}");
+        let (_, input) = r.unwrap();
+        match input {
+            UserInputAst::Leaf(leaf) => match leaf.as_ref() {
+                UserInputLeaf::Regex { field, pattern } => {
+                    assert_eq!(field, &Some("a".to_string()));
+                    assert_eq!(pattern, "\\/cgi-bin\\/luci.*");
+                }
+                _ => panic!("Expected a regex leaf, got {leaf:?}"),
+            },
+            _ => panic!("Expected a leaf"),
+        }
+        // Regex followed by `^boost`
+        test_parse_query_to_ast_helper(r#"foo:/bar/^2"#, r#"("foo":/bar/)^2"#);
+    }
+
+    #[test]
+    fn test_regex_parser_lenient() {
+        let literal = |query| literal_infallible(query).unwrap().1;
+
+        let (res, errs) = literal(r#"a:/joh?n(ath[oa]n)/"#);
+        let expected = UserInputLeaf::Regex {
+            field: Some("a".to_string()),
+            pattern: "joh?n(ath[oa]n)".to_string(),
+        }
+        .into();
+        assert_eq!(res.unwrap(), expected);
+        assert!(errs.is_empty(), "Expected no errors, got: {errs:?}");
+
+        let (res, errs) = literal("title:/joh?n(ath[oa]n)");
+        let expected = UserInputLeaf::Regex {
+            field: Some("title".to_string()),
+            pattern: "joh?n(ath[oa]n)".to_string(),
+        }
+        .into();
+        assert_eq!(res.unwrap(), expected);
+        assert_eq!(errs.len(), 1, "Expected 1 error, got: {errs:?}");
+        assert_eq!(
+            errs[0].message, "missing delimiter /",
+            "Unexpected error message",
+        );
+    }
+
+    #[test]
+    fn test_space_before_value() {
+        test_parse_query_to_ast_helper("field : a", r#""field":a"#);
+        test_parse_query_to_ast_helper("field:    a", r#""field":a"#);
+        test_parse_query_to_ast_helper("field         :a", r#""field":a"#);
+        test_parse_query_to_ast_helper(
+            "field : 'happy tax payer' AND other_field  : 1",
+            r#"(+"field":'happy tax payer' +"other_field":1)"#,
+        );
+    }
+
+    // Regression test for https://github.com/quickwit-oss/tantivy/issues/2498:
+    // deeply nested parenthesized queries used to take O(2^n) time because the
+    // top-level `ast()` parser tried `boolean_expr` first and re-parsed the
+    // inner `occur_leaf` when it backtracked to `single_leaf`. Depth 60 would
+    // take ~10^18 operations under the regression; with the fix it parses
+    // instantly. We use `test_parse_query_to_ast_helper` so this test would
+    // never finish if the regression returned.
+    #[test]
+    fn test_parse_deeply_nested_query() {
+        let depth = 60;
+        let leading: String = "(".repeat(depth);
+        let trailing: String = ")".repeat(depth);
+        let query = format!("{leading}title:test{trailing}");
+        test_parse_query_to_ast_helper(&query, r#""title":test"#);
+
+        let query_with_plus = format!("+{leading}title:test{trailing}");
+        test_parse_query_to_ast_helper(&query_with_plus, r#""title":test"#);
     }
 }

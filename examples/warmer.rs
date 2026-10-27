@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, Weak};
 
 use tantivy::collector::TopDocs;
+use tantivy::index::SegmentId;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, FAST, TEXT};
 use tantivy::{
-    doc, DocAddress, DocId, Index, IndexWriter, Opstamp, Searcher, SearcherGeneration, SegmentId,
+    doc, DocAddress, DocId, Index, IndexWriter, Opstamp, Searcher, SearcherGeneration,
     SegmentReader, Warmer,
 };
 
@@ -163,7 +164,7 @@ fn main() -> tantivy::Result<()> {
         move |doc_id: DocId| Reverse(price[doc_id as usize])
     };
 
-    let most_expensive_first = TopDocs::with_limit(10).custom_score(score_by_price);
+    let most_expensive_first = TopDocs::with_limit(10).order_by(score_by_price);
 
     let hits = searcher.search(&query, &most_expensive_first)?;
     assert_eq!(

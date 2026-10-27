@@ -1,20 +1,22 @@
-use std::collections::HashMap;
-use std::ops::BitOrAssign;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
+use common::{ByteCount, HasLen};
 use fnv::FnvHashMap;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 
+use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
+use crate::index::{Index, InvertedIndexReader, Segment, SegmentComponent, SegmentId};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
-use crate::space_usage::SegmentSpaceUsage;
+use crate::space_usage::{ComponentSpaceUsage, SegmentSpaceUsage};
 use crate::store::StoreReader;
 use crate::termdict::TermDictionary;
 use crate::{DocId, Executor, Opstamp};
@@ -31,6 +33,7 @@ use crate::{DocId, Executor, Opstamp};
 /// as close to all of the memory data is mmapped.
 #[derive(Clone)]
 pub struct SegmentReader {
+    index: Index,
     inv_idx_reader_cache: Arc<RwLock<HashMap<Field, Arc<InvertedIndexReader>>>>,
 
     segment_id: SegmentId,
@@ -82,6 +85,11 @@ impl SegmentReader {
     /// Returns the schema of the index this segment belongs to.
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Returns the index this segment belongs to.
+    pub fn index(&self) -> &Index {
+        &self.index
     }
 
     /// Return the number of documents that have been
@@ -219,12 +227,10 @@ impl SegmentReader {
         let postings_file = segment.open_read(SegmentComponent::Postings)?;
         let postings_composite = CompositeFile::open(&postings_file)?;
 
-        let positions_composite = {
-            if let Ok(positions_file) = segment.open_read(SegmentComponent::Positions) {
-                CompositeFile::open(&positions_file)?
-            } else {
-                CompositeFile::empty()
-            }
+        let positions_composite = match segment.open_read(SegmentComponent::Positions) {
+            Ok(positions_file) => CompositeFile::open(&positions_file)?,
+            Err(OpenReadError::FileDoesNotExist(_)) => CompositeFile::empty(),
+            Err(open_read_error) => return Err(open_read_error.into()),
         };
 
         let schema = segment.schema();
@@ -257,10 +263,14 @@ impl SegmentReader {
         //
         // Only the path is captured here; the bytes are read on first doc store access (see
         // `store_dictionary`), so opening a segment stays free of dictionary I/O.
-        let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
+        let store_dictionary_path = segment
+            .meta()
+            .docstore_dictionary_path()
+            .map(str::to_string);
         let store_directory: Arc<dyn Directory> = Arc::new(segment.index().directory().clone());
 
         Ok(SegmentReader {
+            index: segment.index().clone(),
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -392,12 +402,16 @@ impl SegmentReader {
         for (field, field_entry) in self.schema().fields() {
             let field_name = field_entry.name().to_string();
             let is_indexed = field_entry.is_indexed();
-
             if is_indexed {
                 let is_json = field_entry.field_type().value_type() == Type::Json;
                 if is_json {
+                    let term_dictionary_json_field_num_bytes: u64 = self
+                        .termdict_composite
+                        .open_read(field)
+                        .map(|file_slice| file_slice.len() as u64)
+                        .unwrap_or(0u64);
                     let inv_index = self.inverted_index(field)?;
-                    let encoded_fields_in_index = inv_index.list_encoded_fields()?;
+                    let encoded_fields_in_index = inv_index.list_encoded_json_fields()?;
                     let mut build_path = |field_name: &str, mut json_path: String| {
                         // In this case we need to map the potential fast field to the field name
                         // accepted by the query parser.
@@ -406,68 +420,101 @@ impl SegmentReader {
                         if create_canonical {
                             // Without expand dots enabled dots need to be escaped.
                             let escaped_json_path = json_path.replace('.', "\\.");
-                            let full_path = format!("{}.{}", field_name, escaped_json_path);
-                            let full_path_unescaped = format!("{}.{}", field_name, &json_path);
+                            let full_path = format!("{field_name}.{escaped_json_path}");
+                            let full_path_unescaped = format!("{}.{}", field_name, json_path);
                             map_to_canonical.insert(full_path_unescaped, full_path.to_string());
                             full_path
                         } else {
                             // With expand dots enabled, we can use '.' instead of '\u{1}'.
                             json_path_sep_to_dot(&mut json_path);
-                            format!("{}.{}", field_name, json_path)
+                            format!("{field_name}.{json_path}")
                         }
                     };
-                    indexed_fields.extend(
-                        encoded_fields_in_index
-                            .into_iter()
-                            .map(|(name, typ)| (build_path(&field_name, name), typ))
-                            .map(|(field_name, typ)| FieldMetadata {
-                                indexed: true,
-                                stored: false,
-                                field_name,
-                                fast: false,
-                                typ,
-                            }),
-                    );
+                    let total_num_terms = encoded_fields_in_index
+                        .iter()
+                        .map(|field_space| field_space.num_terms)
+                        .sum();
+                    indexed_fields.extend(encoded_fields_in_index.into_iter().map(|field_space| {
+                        let field_name = build_path(&field_name, field_space.field_name);
+                        // It is complex to attribute the exact amount of bytes required by specific
+                        // field in the json field. Instead, as a proxy, we
+                        // attribute the total amount of bytes for the entire json field,
+                        // proportionally to the number of terms in each
+                        // fields.
+                        let term_dictionary_size = (term_dictionary_json_field_num_bytes
+                            * field_space.num_terms)
+                            .checked_div(total_num_terms)
+                            .unwrap_or(0);
+                        FieldMetadata {
+                            postings_size: Some(field_space.postings_size),
+                            positions_size: Some(field_space.positions_size),
+                            term_dictionary_size: Some(ByteCount::from(term_dictionary_size)),
+                            fast_size: None,
+                            // The stored flag will be set at the end of this function!
+                            stored: field_entry.is_stored(),
+                            field_name,
+                            typ: field_space.field_type,
+                        }
+                    }));
                 } else {
+                    let postings_size: ByteCount = self
+                        .postings_composite
+                        .open_read(field)
+                        .map(|posting_fileslice| posting_fileslice.len())
+                        .unwrap_or(0)
+                        .into();
+                    let positions_size: ByteCount = self
+                        .positions_composite
+                        .open_read(field)
+                        .map(|positions_fileslice| positions_fileslice.len())
+                        .unwrap_or(0)
+                        .into();
+                    let term_dictionary_size: ByteCount = self
+                        .termdict_composite
+                        .open_read(field)
+                        .map(|term_dictionary_fileslice| term_dictionary_fileslice.len())
+                        .unwrap_or(0)
+                        .into();
                     indexed_fields.push(FieldMetadata {
-                        indexed: true,
-                        stored: false,
                         field_name: field_name.to_string(),
-                        fast: false,
                         typ: field_entry.field_type().value_type(),
+                        // The stored flag will be set at the end of this function!
+                        stored: field_entry.is_stored(),
+                        fast_size: None,
+                        term_dictionary_size: Some(term_dictionary_size),
+                        postings_size: Some(postings_size),
+                        positions_size: Some(positions_size),
                     });
                 }
             }
         }
-        let mut fast_fields: Vec<FieldMetadata> = self
+        let fast_fields: Vec<FieldMetadata> = self
             .fast_fields()
             .columnar()
             .iter_columns()?
             .map(|(mut field_name, handle)| {
                 json_path_sep_to_dot(&mut field_name);
                 // map to canonical path, to avoid similar but different entries.
-                // Eventually we should just accept '.' seperated for all cases.
+                // Eventually we should just accept '.' separated for all cases.
                 let field_name = map_to_canonical
                     .get(&field_name)
                     .unwrap_or(&field_name)
                     .to_string();
+                let stored = is_field_stored(&field_name, &self.schema);
                 FieldMetadata {
-                    indexed: false,
-                    stored: false,
                     field_name,
-                    fast: true,
                     typ: Type::from(handle.column_type()),
+                    stored,
+                    fast_size: Some(handle.num_bytes()),
+                    term_dictionary_size: None,
+                    postings_size: None,
+                    positions_size: None,
                 }
             })
             .collect();
-        // Since the type is encoded differently in the fast field and in the inverted index,
-        // the order of the fields is not guaranteed to be the same. Therefore, we sort the fields.
-        // If we are sure that the order is the same, we can remove this sort.
-        indexed_fields.sort_unstable();
-        fast_fields.sort_unstable();
-        let merged = merge_field_meta_data(vec![indexed_fields, fast_fields], &self.schema);
-
-        Ok(merged)
+        let merged_field_metadatas: Vec<FieldMetadata> =
+            merge_field_meta_data(vec![indexed_fields, fast_fields]);
+        Ok(merged_field_metadatas)
     }
 
     /// Returns the segment id
@@ -494,7 +541,7 @@ impl SegmentReader {
     }
 
     /// Returns an iterator that will iterate over the alive document ids
-    pub fn doc_ids_alive(&self) -> Box<dyn Iterator<Item = DocId> + '_> {
+    pub fn doc_ids_alive(&self) -> Box<dyn Iterator<Item = DocId> + Send + '_> {
         if let Some(alive_bitset) = &self.alive_bitset_opt {
             Box::new(alive_bitset.iter_alive())
         } else {
@@ -503,20 +550,53 @@ impl SegmentReader {
     }
 
     /// Summarize total space usage of this segment.
+    ///
+    /// The per-component usage is assembled from each registered plugin's
+    /// [`SegmentPlugin::space_usage`](crate::plugin::SegmentPlugin::space_usage), plus
+    /// the non-plugin `deletes` entry (the alive bitset).
     pub fn space_usage(&self) -> io::Result<SegmentSpaceUsage> {
-        Ok(SegmentSpaceUsage::new(
+        let mut components: BTreeMap<String, ComponentSpaceUsage> = BTreeMap::new();
+        for plugin in self.index.all_plugins() {
+            let plugin_usage = plugin
+                .space_usage(self)
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            components.extend(plugin_usage);
+        }
+        let deletes = self
+            .alive_bitset_opt
+            .as_ref()
+            .map(AliveBitSet::space_usage)
+            .unwrap_or_default();
+        components.insert(
+            crate::space_usage::DELETES.to_string(),
+            ComponentSpaceUsage::Basic(deletes),
+        );
+        Ok(SegmentSpaceUsage::from_components(
             self.num_docs(),
-            self.termdict_composite.space_usage(),
-            self.postings_composite.space_usage(),
-            self.positions_composite.space_usage(),
-            self.fast_fields_readers.space_usage(self.schema())?,
-            self.fieldnorm_readers.space_usage(),
-            self.get_store_reader(0)?.space_usage(),
-            self.alive_bitset_opt
-                .as_ref()
-                .map(AliveBitSet::space_usage)
-                .unwrap_or_default(),
+            components,
         ))
+    }
+
+    fn relative_path(&self, component: SegmentComponent) -> PathBuf {
+        let mut path = self.segment_id().uuid_string();
+        path.push_str(&match component {
+            SegmentComponent::Postings => ".idx".to_string(),
+            SegmentComponent::Positions => ".pos".to_string(),
+            SegmentComponent::Terms => ".term".to_string(),
+            SegmentComponent::Store => ".store".to_string(),
+            SegmentComponent::TempStore => ".store.temp".to_string(),
+            SegmentComponent::FastFields => ".fast".to_string(),
+            SegmentComponent::FieldNorms => ".fieldnorm".to_string(),
+            SegmentComponent::Delete => format!(".{}.del", self.delete_opstamp().unwrap_or(0)),
+            SegmentComponent::Custom(ext) => format!(".{ext}"),
+        });
+        PathBuf::from(path)
+    }
+
+    /// Opens one of the component files for reading.
+    pub fn open_read(&self, component: SegmentComponent) -> Result<FileSlice, OpenReadError> {
+        let path = self.relative_path(component);
+        self.index.directory().open_read(&path)
     }
 }
 
@@ -531,20 +611,47 @@ pub struct FieldMetadata {
     // Notice: Don't reorder the declaration of 1.field_name 2.typ, as it is used for ordering by
     // field_name then typ.
     pub typ: Type,
-    /// Is the field indexed for search
-    pub indexed: bool,
     /// Is the field stored in the doc store
     pub stored: bool,
-    /// Is the field stored in the columnar storage
-    pub fast: bool,
+    /// Size occupied in the columnar storage (None if not fast)
+    pub fast_size: Option<ByteCount>,
+    /// term_dictionary
+    pub term_dictionary_size: Option<ByteCount>,
+    /// Size occupied in the index postings storage (None if not indexed)
+    pub postings_size: Option<ByteCount>,
+    /// Size occupied in the index postings storage (None if positions are not recorded)
+    pub positions_size: Option<ByteCount>,
 }
-impl BitOrAssign for FieldMetadata {
-    fn bitor_assign(&mut self, rhs: Self) {
-        assert!(self.field_name == rhs.field_name);
-        assert!(self.typ == rhs.typ);
-        self.indexed |= rhs.indexed;
+
+fn merge_options(left: Option<ByteCount>, right: Option<ByteCount>) -> Option<ByteCount> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(l + r),
+        (None, right) => right,
+        (left, None) => left,
+    }
+}
+
+impl FieldMetadata {
+    /// Returns true if and only if the field is indexed.
+    pub fn is_indexed(&self) -> bool {
+        self.postings_size.is_some()
+    }
+
+    /// Returns true if and only if the field is a fast field (i.e.: recorded in  columnar format).
+    pub fn is_fast(&self) -> bool {
+        self.fast_size.is_some()
+    }
+
+    /// Merges two field metadata.
+    pub fn merge(&mut self, rhs: Self) {
+        assert_eq!(self.field_name, rhs.field_name);
+        assert_eq!(self.typ, rhs.typ);
         self.stored |= rhs.stored;
-        self.fast |= rhs.fast;
+        self.fast_size = merge_options(self.fast_size, rhs.fast_size);
+        self.term_dictionary_size =
+            merge_options(self.term_dictionary_size, rhs.term_dictionary_size);
+        self.postings_size = merge_options(self.postings_size, rhs.postings_size);
+        self.positions_size = merge_options(self.positions_size, rhs.positions_size);
     }
 }
 
@@ -557,23 +664,29 @@ fn is_field_stored(field_name: &str, schema: &Schema) -> bool {
 }
 
 /// Helper to merge the field metadata from multiple segments.
-pub fn merge_field_meta_data(
-    field_metadatas: Vec<Vec<FieldMetadata>>,
-    schema: &Schema,
-) -> Vec<FieldMetadata> {
+pub fn merge_field_meta_data(mut field_metadatas: Vec<Vec<FieldMetadata>>) -> Vec<FieldMetadata> {
+    // READ BEFORE REMOVING THIS!
+    //
+    // Because we replace field sep by `.`, fields are not always sorted.
+    // Also, to enforce such an implicit contract, we would have to add
+    // assert here.
+    //
+    // Sorting is linear time on pre-sorted data, so we are simply better off sorting data here.
+    for field_metadatas in &mut field_metadatas {
+        field_metadatas.sort_unstable();
+    }
     let mut merged_field_metadata = Vec::new();
     for (_key, mut group) in &field_metadatas
         .into_iter()
-        .kmerge_by(|left, right| left < right)
+        .kmerge()
         // TODO: Remove allocation
-        .group_by(|el| (el.field_name.to_string(), el.typ))
+        .chunk_by(|el| (el.field_name.to_string(), el.typ))
     {
         let mut merged: FieldMetadata = group.next().unwrap();
         for el in group {
-            merged |= el;
+            merged.merge(el);
         }
         // Currently is_field_stored is maybe too slow for the high cardinality case
-        merged.stored = is_field_stored(&merged.field_name, schema);
         merged_field_metadata.push(merged);
     }
     merged_field_metadata
@@ -595,30 +708,8 @@ fn intersect_alive_bitset(
 }
 
 impl fmt::Debug for SegmentReader {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "SegmentReader({:?})", self.segment_id)
-    }
-}
-
-// This is a cheap trick to reference the segment in the `open_with_custom_alive_set_parallel`
-// function without having to copy the segment
-struct SegmentRef {
-    segment: &'static Segment,
-}
-
-impl SegmentRef {
-    fn new(segment: &Segment) -> Self {
-        let leaked_segment = unsafe { std::mem::transmute(segment) };
-        Self {
-            segment: leaked_segment,
-        }
-    }
-}
-
-impl std::ops::Deref for SegmentRef {
-    type Target = Segment;
-    fn deref(&self) -> &Self::Target {
-        self.segment
     }
 }
 
@@ -626,122 +717,168 @@ impl std::ops::Deref for SegmentRef {
 mod test {
     use super::*;
     use crate::index::Index;
-    use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
+    use crate::schema::{Term, STORED, TEXT};
     use crate::IndexWriter;
 
+    #[track_caller]
+    fn assert_merge(fields_metadatas: &[Vec<FieldMetadata>], expected: &[FieldMetadata]) {
+        use itertools::Itertools;
+        let num_els = fields_metadatas.len();
+        for permutation in fields_metadatas.iter().cloned().permutations(num_els) {
+            let res = merge_field_meta_data(permutation);
+            assert_eq!(&res, &expected);
+        }
+    }
+
     #[test]
-    fn test_merge_field_meta_data_same() {
-        let schema = SchemaBuilder::new().build();
+    fn test_merge_field_meta_data_same_field() {
         let field_metadata1 = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: true,
             stored: false,
-            fast: true,
+            term_dictionary_size: Some(ByteCount::from(100u64)),
+            postings_size: Some(ByteCount::from(1_000u64)),
+            positions_size: Some(ByteCount::from(2_000u64)),
+            fast_size: Some(ByteCount::from(1_000u64)),
         };
         let field_metadata2 = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: true,
             stored: false,
-            fast: true,
+            term_dictionary_size: Some(ByteCount::from(80u64)),
+            postings_size: Some(ByteCount::from(1_500u64)),
+            positions_size: Some(ByteCount::from(2_500u64)),
+            fast_size: Some(ByteCount::from(3_000u64)),
         };
-        let res = merge_field_meta_data(
-            vec![vec![field_metadata1.clone()], vec![field_metadata2]],
-            &schema,
+        let expected = FieldMetadata {
+            field_name: "a".to_string(),
+            typ: crate::schema::Type::Str,
+            stored: false,
+            term_dictionary_size: Some(ByteCount::from(180u64)),
+            postings_size: Some(ByteCount::from(2_500u64)),
+            positions_size: Some(ByteCount::from(4_500u64)),
+            fast_size: Some(ByteCount::from(4_000u64)),
+        };
+        assert_merge(
+            &[vec![field_metadata1.clone()], vec![field_metadata2]],
+            &[expected],
         );
-        assert_eq!(res, vec![field_metadata1]);
     }
+
+    #[track_caller]
     #[test]
     fn test_merge_field_meta_data_different() {
-        let schema = SchemaBuilder::new().build();
         let field_metadata1 = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: false,
             stored: false,
-            fast: true,
+            fast_size: Some(1_000u64.into()),
+            term_dictionary_size: Some(100u64.into()),
+            postings_size: Some(2_000u64.into()),
+            positions_size: Some(4_000u64.into()),
         };
         let field_metadata2 = FieldMetadata {
             field_name: "b".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: false,
             stored: false,
-            fast: true,
+            fast_size: Some(1_002u64.into()),
+            term_dictionary_size: None,
+            postings_size: None,
+            positions_size: None,
         };
         let field_metadata3 = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: true,
+            term_dictionary_size: Some(101u64.into()),
+            postings_size: Some(2_001u64.into()),
+            positions_size: Some(4_001u64.into()),
             stored: false,
-            fast: false,
+            fast_size: None,
         };
-        let res = merge_field_meta_data(
-            vec![
+        let expected = vec![
+            FieldMetadata {
+                field_name: "a".to_string(),
+                typ: crate::schema::Type::Str,
+                stored: false,
+                term_dictionary_size: Some(201u64.into()),
+                postings_size: Some(4_001u64.into()),
+                positions_size: Some(8_001u64.into()),
+                fast_size: Some(1_000u64.into()),
+            },
+            FieldMetadata {
+                field_name: "b".to_string(),
+                typ: crate::schema::Type::Str,
+                stored: false,
+                term_dictionary_size: None,
+                postings_size: None,
+                positions_size: None,
+                fast_size: Some(1_002u64.into()),
+            },
+        ];
+        assert_merge(
+            &[
                 vec![field_metadata1.clone(), field_metadata2.clone()],
                 vec![field_metadata3],
             ],
-            &schema,
+            &expected,
         );
-        let field_metadata_expected1 = FieldMetadata {
-            field_name: "a".to_string(),
-            typ: crate::schema::Type::Str,
-            indexed: true,
-            stored: false,
-            fast: true,
-        };
-        assert_eq!(res, vec![field_metadata_expected1, field_metadata2.clone()]);
     }
+
     #[test]
     fn test_merge_field_meta_data_merge() {
-        use pretty_assertions::assert_eq;
         let get_meta_data = |name: &str, typ: Type| FieldMetadata {
             field_name: name.to_string(),
             typ,
-            indexed: false,
+            term_dictionary_size: None,
+            postings_size: None,
+            positions_size: None,
             stored: false,
-            fast: true,
+            fast_size: Some(1u64.into()),
         };
-        let schema = SchemaBuilder::new().build();
-        let mut metas = vec![get_meta_data("d", Type::Str), get_meta_data("e", Type::U64)];
-        metas.sort();
-        let res = merge_field_meta_data(vec![vec![get_meta_data("e", Type::Str)], metas], &schema);
-        assert_eq!(
-            res,
-            vec![
+        let metas = vec![get_meta_data("d", Type::Str), get_meta_data("e", Type::U64)];
+        assert_merge(
+            &[vec![get_meta_data("e", Type::Str)], metas],
+            &[
                 get_meta_data("d", Type::Str),
                 get_meta_data("e", Type::Str),
                 get_meta_data("e", Type::U64),
-            ]
+            ],
         );
     }
+
     #[test]
     fn test_merge_field_meta_data_bitxor() {
         let field_metadata1 = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: false,
+            term_dictionary_size: None,
+            postings_size: None,
+            positions_size: None,
             stored: false,
-            fast: true,
+            fast_size: Some(10u64.into()),
         };
         let field_metadata2 = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: true,
+            term_dictionary_size: Some(10u64.into()),
+            postings_size: Some(11u64.into()),
+            positions_size: Some(12u64.into()),
             stored: false,
-            fast: false,
+            fast_size: None,
         };
         let field_metadata_expected = FieldMetadata {
             field_name: "a".to_string(),
             typ: crate::schema::Type::Str,
-            indexed: true,
+            term_dictionary_size: Some(10u64.into()),
+            postings_size: Some(11u64.into()),
+            positions_size: Some(12u64.into()),
             stored: false,
-            fast: true,
+            fast_size: Some(10u64.into()),
         };
         let mut res1 = field_metadata1.clone();
-        res1 |= field_metadata2.clone();
+        res1.merge(field_metadata2.clone());
         let mut res2 = field_metadata2.clone();
-        res2 |= field_metadata1;
+        res2.merge(field_metadata1);
         assert_eq!(res1, field_metadata_expected);
         assert_eq!(res2, field_metadata_expected);
     }
@@ -772,6 +909,7 @@ mod test {
         assert_eq!(4, searcher.segment_reader(0).max_doc());
         Ok(())
     }
+
     #[test]
     fn test_alive_docs_iterator() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();

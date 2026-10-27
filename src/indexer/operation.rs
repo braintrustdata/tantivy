@@ -6,7 +6,11 @@ use crate::Opstamp;
 
 /// Timestamped Delete operation.
 pub struct DeleteOperation {
+    /// Operation stamp.
+    /// It is used to check whether the delete operation
+    /// applies to an added document operation.
     pub opstamp: Opstamp,
+    /// Weight is used to define the set of documents to be deleted.
     pub target: Box<dyn Weight>,
 }
 

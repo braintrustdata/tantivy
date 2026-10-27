@@ -31,7 +31,7 @@ restriction on 50% of the values (e.g. a 64-bit hash). On the other hand, a lot 
 # Columnar format
 
 This columnar format may have more than one column (with different types) associated to the same `column_name` (see [Coercion rules](#coercion-rules) above).
-The `(column_name, columne_type)` couple however uniquely identifies a column.
+The `(column_name, column_type)` couple however uniquely identifies a column.
 That couple is serialized as a column `column_key`.  The format of that key is:
 `[column_name][ZERO_BYTE][column_type_header: u8]`
 
@@ -73,7 +73,7 @@ The crate introduces the following concepts.
 `Columnar` is an equivalent of a dataframe.
 It maps `column_key` to `Column`.
 
-A `Column<T>` asssociates a `RowId` (u32) to any
+A `Column<T>` associates a `RowId` (u32) to any
 number of values.
 
 This is made possible by wrapping a `ColumnIndex` and a `ColumnValue` object.

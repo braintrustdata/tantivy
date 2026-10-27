@@ -52,7 +52,7 @@ macro_rules! doc(
         {
             let mut document = $crate::TantivyDocument::default();
             $(
-                document.add_field_value($field, $value);
+                document.add_field_value($field, &$value);
             )*
             document
         }

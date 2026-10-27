@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use common::BinarySerializable;
 
-use crate::column_index::optional_index::{SelectCursor, Set, SetCodec, ELEMENTS_PER_BLOCK};
+use crate::column_index::optional_index::{ELEMENTS_PER_BLOCK, SelectCursor, Set, SetCodec};
 
 #[inline(always)]
 fn get_bit_at(input: u64, n: u16) -> bool {
@@ -23,7 +23,6 @@ fn set_bit_at(input: &mut u64, n: u16) {
 ///
 /// When translating a dense index to the original index, we can use the offset to find the correct
 /// block. Direct computation is not possible, but we can employ a linear or binary search.
-
 const ELEMENTS_PER_MINI_BLOCK: u16 = 64;
 const MINI_BLOCK_BITVEC_NUM_BYTES: usize = 8;
 const MINI_BLOCK_OFFSET_NUM_BYTES: usize = 2;
@@ -109,7 +108,7 @@ pub struct DenseBlockSelectCursor<'a> {
     dense_block: DenseBlock<'a>,
 }
 
-impl<'a> SelectCursor<u16> for DenseBlockSelectCursor<'a> {
+impl SelectCursor<u16> for DenseBlockSelectCursor<'_> {
     #[inline]
     fn select(&mut self, rank: u16) -> u16 {
         self.block_id = self
@@ -123,7 +122,9 @@ impl<'a> SelectCursor<u16> for DenseBlockSelectCursor<'a> {
 }
 
 impl<'a> Set<u16> for DenseBlock<'a> {
-    type SelectCursor<'b> = DenseBlockSelectCursor<'a> where Self: 'b;
+    type SelectCursor<'b>
+        = DenseBlockSelectCursor<'a>
+    where Self: 'b;
 
     #[inline(always)]
     fn contains(&self, el: u16) -> bool {
@@ -173,7 +174,7 @@ impl<'a> Set<u16> for DenseBlock<'a> {
     }
 }
 
-impl<'a> DenseBlock<'a> {
+impl DenseBlock<'_> {
     #[inline]
     fn mini_block(&self, mini_block_id: u16) -> DenseMiniBlock {
         let data_start_pos = mini_block_id as usize * MINI_BLOCK_NUM_BYTES;
@@ -190,11 +191,13 @@ impl<'a> DenseBlock<'a> {
         from_block_id: u16,
     ) -> impl Iterator<Item = (u16, DenseMiniBlock)> + '_ {
         self.0
-            .chunks_exact(MINI_BLOCK_NUM_BYTES)
+            .as_chunks::<MINI_BLOCK_NUM_BYTES>()
+            .0
+            .iter()
             .enumerate()
             .skip(from_block_id as usize)
-            .map(|(block_id, bytes)| {
-                let mini_block = DenseMiniBlock::from_bytes(bytes.try_into().unwrap());
+            .map(|(block_id, &bytes)| {
+                let mini_block = DenseMiniBlock::from_bytes(bytes);
                 (block_id as u16, mini_block)
             })
     }

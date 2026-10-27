@@ -2,22 +2,22 @@ use std::net::{AddrParseError, IpAddr};
 use std::num::{ParseFloatError, ParseIntError};
 use std::ops::Bound;
 use std::str::{FromStr, ParseBoolError};
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use itertools::Itertools;
 use query_grammar::{UserInputAst, UserInputBound, UserInputLeaf, UserInputLiteral};
 use rustc_hash::FxHashMap;
+use tantivy_fst::Regex;
 
 use super::logical_ast::*;
-use crate::core::json_utils::{
-    convert_to_fast_value_and_get_term, set_string_and_get_terms, JsonTermWriter,
-};
 use crate::index::Index;
+use crate::json_utils::convert_to_fast_value_and_append_to_json_term;
 use crate::query::range_query::{is_type_valid_for_fastfield_range_query, RangeQuery};
 use crate::query::{
-    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery,
-    PhraseQuery, Query, TermQuery, TermSetQuery,
+    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, ExistsQuery, FuzzyTermQuery, Occur,
+    PhrasePrefixQuery, PhraseQuery, Query, RegexQuery, TermQuery, TermSetQuery,
 };
 use crate::schema::{
     Facet, FacetParseError, Field, FieldType, IndexRecordOption, IntoIpv6Addr, JsonObjectOptions,
@@ -60,7 +60,7 @@ pub enum QueryParserError {
     #[error("Invalid query: Only excluding terms given")]
     AllButQueryForbidden,
     /// If no default field is declared, running a query without any
-    /// field specified is forbbidden.
+    /// field specified is forbidden.
     #[error("No default field declared and no field specified in query")]
     NoDefaultFieldDeclared,
     /// The field searched for is not declared
@@ -139,7 +139,7 @@ fn trim_ast(logical_ast: LogicalAst) -> Option<LogicalAst> {
 ///   so-called default fields (as set up in the constructor).
 ///
 ///   Assuming that the default fields are `body` and `title`, and the query parser is set with
-/// conjunction   as a default, our query will be interpreted as.
+///   conjunction as a default, our query will be interpreted as.
 ///   `(body:Barack OR title:Barack) AND (title:Obama OR body:Obama)`.
 ///   By default, all tokenized and indexed fields are default fields.
 ///
@@ -150,8 +150,7 @@ fn trim_ast(logical_ast: LogicalAst) -> Option<LogicalAst> {
 ///   `body:Barack OR (body:Barack OR text:Obama)` .
 ///
 /// * boolean operators `AND`, `OR`. `AND` takes precedence over `OR`, so that `a AND b OR c` is
-///   interpreted
-/// as `(a AND b) OR c`.
+///   interpreted as `(a AND b) OR c`.
 ///
 /// * In addition to the boolean operators, the `-`, `+` can help define. These operators are
 ///   sufficient to express all queries using boolean operators. For instance `x AND y OR z` can be
@@ -182,6 +181,10 @@ fn trim_ast(logical_ast: LogicalAst) -> Option<LogicalAst> {
 ///   `"2002-10-02T15:00:00.05Z"` or `some_date_field:[2002-10-02T15:00:00Z TO
 ///   2002-10-02T18:00:00Z}`
 ///
+/// * exists query: `field:*` will match documents that contain a non-null value in the specified
+///   field. The field must be configured as a fast field. For JSON fields, values in subpaths also
+///   count as existing.
+///
 /// * all docs query: A plain `*` will match all documents in the index.
 ///
 /// Parts of the queries can be boosted by appending `^boostfactor`.
@@ -209,6 +212,7 @@ pub struct QueryParser {
     tokenizer_manager: TokenizerManager,
     boost: FxHashMap<Field, Score>,
     fuzzy: FxHashMap<Field, Fuzzy>,
+    regexes_allowed: bool,
 }
 
 #[derive(Clone)]
@@ -263,6 +267,7 @@ impl QueryParser {
             conjunction_by_default: false,
             boost: Default::default(),
             fuzzy: Default::default(),
+            regexes_allowed: false,
         }
     }
 
@@ -274,8 +279,7 @@ impl QueryParser {
 
     /// Creates a `QueryParser`, given
     ///  * an index
-    ///  * a set of default fields used to search if no field is specifically defined
-    ///   in the query.
+    ///  * a set of default fields used to search if no field is specifically defined in the query.
     pub fn for_index(index: &Index, default_fields: Vec<Field>) -> QueryParser {
         QueryParser::new(index.schema(), default_fields, index.tokenizers().clone())
     }
@@ -322,6 +326,11 @@ impl QueryParser {
                 transpose_cost_one,
             },
         );
+    }
+
+    /// Allow regexes in queries
+    pub fn allow_regexes(&mut self) {
+        self.regexes_allowed = true;
     }
 
     /// Parse a query
@@ -381,7 +390,7 @@ impl QueryParser {
         if !err.is_empty() {
             return Err(err.swap_remove(0));
         }
-        Ok(ast)
+        Ok(ast.simplify())
     }
 
     /// Parse the user query into an AST.
@@ -448,7 +457,7 @@ impl QueryParser {
                 let val: u64 = u64::from_str(phrase)?;
                 Ok(Term::from_field_u64(field, val))
             }
-            FieldType::I64(_) => {
+            FieldType::I64(_) | FieldType::TieBreaker => {
                 let val: i64 = i64::from_str(phrase)?;
                 Ok(Term::from_field_i64(field, val))
             }
@@ -484,16 +493,26 @@ impl QueryParser {
                 });
                 if terms.len() != 1 {
                     return Err(QueryParserError::UnsupportedQuery(format!(
-                        "Range query boundary cannot have multiple tokens: {phrase:?}."
+                        "Range query boundary cannot have multiple tokens: {phrase:?} [{terms:?}]."
                     )));
                 }
                 Ok(terms.into_iter().next().unwrap())
             }
-            FieldType::JsonObject(_) => {
-                // Json range are not supported.
-                Err(QueryParserError::UnsupportedQuery(
-                    "Range query are not supported on json field.".to_string(),
-                ))
+            FieldType::JsonObject(ref json_options) => {
+                let mut term = Term::from_field_json_path(
+                    field,
+                    json_path,
+                    json_options.is_expand_dots_enabled(),
+                );
+                if let Some(term) =
+                    // Try to convert the phrase to a fast value
+                    convert_to_fast_value_and_append_to_json_term(&term, phrase, false)
+                {
+                    Ok(term)
+                } else {
+                    term.append_type_and_str(phrase);
+                    Ok(term)
+                }
             }
             FieldType::Facet(_) => match Facet::from_text(phrase) {
                 Ok(facet) => Ok(Term::from_facet(field, &facet)),
@@ -513,6 +532,11 @@ impl QueryParser {
                 Err(QueryParserError::UnsupportedQuery(
                     "Artifact fields cannot be queried with text queries.".to_string(),
                 ))
+            }
+            // Custom fields are neither indexed nor fast, so the guard above returns
+            // `FieldNotIndexed` before this match.
+            FieldType::Custom(_) => {
+                unreachable!("the query parser does not support custom field types")
             }
         }
     }
@@ -560,7 +584,7 @@ impl QueryParser {
             }
             FieldType::Date(_) => {
                 let dt = OffsetDateTime::parse(phrase, &Rfc3339)?;
-                let dt_term = Term::from_field_date(field, DateTime::from_utc(dt));
+                let dt_term = Term::from_field_date_for_search(field, DateTime::from_utc(dt));
                 Ok(vec![LogicalLiteral::Term(dt_term)])
             }
             FieldType::Str(ref str_options) => {
@@ -592,6 +616,8 @@ impl QueryParser {
                 field,
                 json_path,
                 phrase,
+                slop,
+                prefix,
                 &self.tokenizer_manager,
                 json_options,
             ),
@@ -618,6 +644,11 @@ impl QueryParser {
                 Err(QueryParserError::UnsupportedQuery(
                     "Artifact fields cannot be queried with text queries.".to_string(),
                 ))
+            }
+            // These fields are not indexed, so the `is_indexed()` guard above returns
+            // `FieldNotIndexed` before this match.
+            FieldType::TieBreaker | FieldType::Custom(_) => {
+                unreachable!("the query parser does not support this field type")
             }
         }
     }
@@ -667,7 +698,7 @@ impl QueryParser {
             }
             UserInputAst::Boost(ast, boost) => {
                 let (ast, errors) = self.compute_logical_ast_with_occur_lenient(*ast);
-                (ast.boost(boost as Score), errors)
+                (ast.boost(boost.into_inner() as Score), errors)
             }
             UserInputAst::Leaf(leaf) => {
                 let (ast, errors) = self.compute_logical_ast_from_leaf_lenient(*leaf);
@@ -697,8 +728,8 @@ impl QueryParser {
     ///
     /// The terms are identified by a triplet:
     /// - tantivy field
-    /// - field_path: tantivy has JSON fields. It is possible to target a member of a JSON
-    /// object by naturally extending the json field name with a "." separated field_path
+    /// - field_path: tantivy has JSON fields. It is possible to target a member of a JSON object by
+    ///   naturally extending the json field name with a "." separated field_path
     /// - field_phrase: the phrase that is being searched.
     ///
     /// The literal identifies the targeted field by a so-called *full field path*,
@@ -775,6 +806,12 @@ impl QueryParser {
                         asts.push(LogicalAst::Leaf(Box::new(ast)).boost(boost));
                     }
                 }
+                if !asts.is_empty() {
+                    // if some fields failed but other succeeded, we consider this a success, it
+                    // probably means the default_fields contains
+                    // text and non-text fields, and the non-text ones failed
+                    errors.clear();
+                }
                 let result_ast: LogicalAst = if asts.len() == 1 {
                     asts.into_iter().next().unwrap()
                 } else {
@@ -802,8 +839,6 @@ impl QueryParser {
                 let (field, json_path) = try_tuple!(self
                     .split_full_path(&full_path)
                     .ok_or_else(|| QueryParserError::FieldDoesNotExist(full_path.clone())));
-                let field_entry = self.schema.get_field_entry(field);
-                let value_type = field_entry.field_type().value_type();
                 let mut errors = Vec::new();
                 let lower = match self.resolve_bound(field, json_path, &lower) {
                     Ok(bound) => bound,
@@ -821,15 +856,11 @@ impl QueryParser {
                 };
                 if lower == Bound::Unbounded && upper == Bound::Unbounded {
                     // this range is useless, either because a user requested [* TO *], or because
-                    // we failed to parse something. Either way, there is no point emiting it
+                    // we failed to parse something. Either way, there is no point emitting it
                     return (None, errors);
                 }
-                let logical_ast = LogicalAst::Leaf(Box::new(LogicalLiteral::Range {
-                    field: self.schema.get_field_name(field).to_string(),
-                    value_type,
-                    lower,
-                    upper,
-                }));
+                let logical_ast =
+                    LogicalAst::Leaf(Box::new(LogicalLiteral::Range { lower, upper }));
                 (Some(logical_ast), errors)
             }
             UserInputLeaf::Set {
@@ -844,25 +875,62 @@ impl QueryParser {
                 let (field, json_path) = try_tuple!(self
                     .split_full_path(&full_path)
                     .ok_or_else(|| QueryParserError::FieldDoesNotExist(full_path.clone())));
-                let field_entry = self.schema.get_field_entry(field);
-                let value_type = field_entry.field_type().value_type();
                 let (elements, errors) = elements
                     .into_iter()
                     .map(|element| self.compute_boundary_term(field, json_path, &element))
                     .partition_result();
-                let logical_ast = LogicalAst::Leaf(Box::new(LogicalLiteral::Set {
-                    elements,
-                    field,
-                    value_type,
-                }));
+                let logical_ast = LogicalAst::Leaf(Box::new(LogicalLiteral::Set { elements }));
                 (Some(logical_ast), errors)
             }
-            UserInputLeaf::Exists { .. } => (
-                None,
-                vec![QueryParserError::UnsupportedQuery(
-                    "Range query need to target a specific field.".to_string(),
-                )],
+            UserInputLeaf::Exists { field } => (
+                Some(LogicalAst::Leaf(Box::new(LogicalLiteral::Exists { field }))),
+                Vec::new(),
             ),
+            UserInputLeaf::Regex { field, pattern } => {
+                if !self.regexes_allowed {
+                    return (
+                        None,
+                        vec![QueryParserError::UnsupportedQuery(
+                            "Regex queries are not allowed.".to_string(),
+                        )],
+                    );
+                }
+                let full_path = try_tuple!(field.ok_or_else(|| {
+                    QueryParserError::UnsupportedQuery(
+                        "Regex query need to target a specific field.".to_string(),
+                    )
+                }));
+                let (field, json_path) = try_tuple!(self
+                    .split_full_path(&full_path)
+                    .ok_or_else(|| QueryParserError::FieldDoesNotExist(full_path.clone())));
+                if !json_path.is_empty() {
+                    return (
+                        None,
+                        vec![QueryParserError::UnsupportedQuery(
+                            "Regex query does not support json paths.".to_string(),
+                        )],
+                    );
+                }
+                if !matches!(
+                    self.schema.get_field_entry(field).field_type(),
+                    FieldType::Str(_)
+                ) {
+                    return (
+                        None,
+                        vec![QueryParserError::UnsupportedQuery(
+                            "Regex query only supported on text fields".to_string(),
+                        )],
+                    );
+                }
+                let pattern = try_tuple!(Regex::new(&pattern).map_err(|e| {
+                    QueryParserError::UnsupportedQuery(format!("Invalid regex: {e}"))
+                }));
+                let logical_ast = LogicalAst::Leaf(Box::new(LogicalLiteral::Regex {
+                    pattern: Arc::new(pattern),
+                    field,
+                }));
+                (Some(logical_ast), Vec::new())
+            }
         }
     }
 }
@@ -902,16 +970,13 @@ fn convert_literal_to_query(
                 Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop))
             }
         }
-        LogicalLiteral::Range {
-            field,
-            value_type,
-            lower,
-            upper,
-        } => Box::new(RangeQuery::new_term_bounds(
-            field, value_type, &lower, &upper,
-        )),
+        LogicalLiteral::Range { lower, upper } => Box::new(RangeQuery::new(lower, upper)),
         LogicalLiteral::Set { elements, .. } => Box::new(TermSetQuery::new(elements)),
         LogicalLiteral::All => Box::new(AllQuery),
+        LogicalLiteral::Regex { pattern, field } => {
+            Box::new(RegexQuery::from_regex(pattern, field))
+        }
+        LogicalLiteral::Exists { field } => Box::new(ExistsQuery::new(field, true)),
     }
 }
 
@@ -955,11 +1020,14 @@ fn generate_literals_for_str(
     }))
 }
 
+#[expect(clippy::too_many_arguments)]
 fn generate_literals_for_json_object(
     field_name: &str,
     field: Field,
     json_path: &str,
     phrase: &str,
+    slop: u32,
+    prefix: bool,
     tokenizer_manager: &TokenizerManager,
     json_options: &JsonObjectOptions,
 ) -> Result<Vec<LogicalLiteral>, QueryParserError> {
@@ -975,20 +1043,34 @@ fn generate_literals_for_json_object(
         })?;
     let index_record_option = text_options.index_option();
     let mut logical_literals = Vec::new();
-    let mut term = Term::with_capacity(100);
-    let mut json_term_writer = JsonTermWriter::from_field_and_json_path(
-        field,
-        json_path,
-        json_options.is_expand_dots_enabled(),
-        &mut term,
-    );
-    if let Some(term) = convert_to_fast_value_and_get_term(&mut json_term_writer, phrase) {
+
+    let get_term_with_path =
+        || Term::from_field_json_path(field, json_path, json_options.is_expand_dots_enabled());
+
+    // Try to convert the phrase to a fast value
+    if let Some(term) =
+        convert_to_fast_value_and_append_to_json_term(&get_term_with_path(), phrase, true)
+    {
         logical_literals.push(LogicalLiteral::Term(term));
     }
-    let terms = set_string_and_get_terms(&mut json_term_writer, phrase, &mut text_analyzer);
-    drop(json_term_writer);
-    if terms.len() <= 1 {
-        for (_, term) in terms {
+
+    // Try to tokenize the phrase and create Terms.
+    let mut positions_and_terms = Vec::<(usize, Term)>::new();
+    let mut token_stream = text_analyzer.token_stream(phrase);
+    token_stream.process(&mut |token| {
+        let mut term = get_term_with_path();
+        term.append_type_and_str(&token.text);
+        positions_and_terms.push((token.position, term.clone()));
+    });
+
+    if positions_and_terms.len() <= 1 {
+        if prefix {
+            return Err(QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
+                phrase: phrase.to_owned(),
+                tokenizer: text_options.tokenizer().to_owned(),
+            });
+        }
+        for (_, term) in positions_and_terms {
             logical_literals.push(LogicalLiteral::Term(term));
         }
         return Ok(logical_literals);
@@ -999,9 +1081,9 @@ fn generate_literals_for_json_object(
         ));
     }
     logical_literals.push(LogicalLiteral::Phrase {
-        terms,
-        slop: 0,
-        prefix: false,
+        terms: positions_and_terms,
+        slop,
+        prefix,
     });
     Ok(logical_literals)
 }
@@ -1034,9 +1116,11 @@ fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) ->
 #[cfg(test)]
 mod test {
     use matches::assert_matches;
+    use proptest::prelude::*;
 
     use super::super::logical_ast::*;
     use super::{QueryParser, QueryParserError};
+    use crate::collector::Count;
     use crate::query::Query;
     use crate::schema::{
         FacetOptions, Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, FAST,
@@ -1098,25 +1182,89 @@ mod test {
         make_query_parser_with_default_fields(&["title", "text"])
     }
 
-    fn parse_query_to_logical_ast(
+    proptest! {
+        #[test]
+        fn test_query_parser_does_not_panic_after_match_all(
+            suffix in prop::sample::select(vec!['\u{b}', '\u{c}', '\u{85}'])
+        ) {
+            let query_parser = make_query_parser();
+            let query = format!("*{suffix}");
+            prop_assert!(query_parser.parse_query(&query).is_err());
+            let (_, errors) = query_parser.parse_query_lenient(&query);
+            prop_assert!(!errors.is_empty());
+        }
+
+        #[test]
+        fn test_lenient_query_parser_makes_progress_in_invalid_sets(
+            field in proptest::option::of("[a-z]{1,4}"),
+            invalid_char in prop::sample::select(vec!['\0', '\u{b}', '\u{c}', '\u{7f}']),
+        ) {
+            let query_parser = make_query_parser();
+            let field = field.map(|field| format!("{field}:")).unwrap_or_default();
+            let query = format!("{field}IN [{invalid_char}");
+            let (_, errors) = query_parser.parse_query_lenient(&query);
+            prop_assert!(!errors.is_empty());
+        }
+    }
+
+    fn parse_query_to_logical_ast_with_default_fields(
         query: &str,
         default_conjunction: bool,
+        default_fields: &[&'static str],
+        allow_regexes: bool,
     ) -> Result<LogicalAst, QueryParserError> {
-        let mut query_parser = make_query_parser();
+        let mut query_parser = make_query_parser_with_default_fields(default_fields);
         if default_conjunction {
             query_parser.set_conjunction_by_default();
+        }
+        if allow_regexes {
+            query_parser.allow_regexes();
         }
         query_parser.parse_query_to_logical_ast(query)
     }
 
+    fn parse_query_to_logical_ast(
+        query: &str,
+        default_conjunction: bool,
+    ) -> Result<LogicalAst, QueryParserError> {
+        parse_query_to_logical_ast_with_default_fields(
+            query,
+            default_conjunction,
+            &["title", "text"],
+            true,
+        )
+    }
+
+    #[track_caller]
+    fn test_parse_query_to_logical_ast_helper_with_default_fields(
+        query: &str,
+        expected: &str,
+        default_conjunction: bool,
+        default_fields: &[&'static str],
+    ) {
+        let query = parse_query_to_logical_ast_with_default_fields(
+            query,
+            default_conjunction,
+            default_fields,
+            true,
+        )
+        .unwrap();
+        let query_str = format!("{query:?}");
+        assert_eq!(query_str, expected);
+    }
+
+    #[track_caller]
     fn test_parse_query_to_logical_ast_helper(
         query: &str,
         expected: &str,
         default_conjunction: bool,
     ) {
-        let query = parse_query_to_logical_ast(query, default_conjunction).unwrap();
-        let query_str = format!("{query:?}");
-        assert_eq!(query_str, expected);
+        test_parse_query_to_logical_ast_helper_with_default_fields(
+            query,
+            expected,
+            default_conjunction,
+            &["title", "text"],
+        )
     }
 
     #[test]
@@ -1147,8 +1295,8 @@ mod test {
         let query = make_query_parser().parse_query("title:[A TO B]").unwrap();
         assert_eq!(
             format!("{query:?}"),
-            "RangeQuery { field: \"title\", value_type: Str, lower_bound: Included([97]), \
-             upper_bound: Included([98]), limit: None }"
+            "RangeQuery { bounds: BoundsRange { lower_bound: Included(Term(field=0, type=Str, \
+             \"a\")), upper_bound: Included(Term(field=0, type=Str, \"b\")) } }"
         );
     }
 
@@ -1315,7 +1463,7 @@ mod test {
     }
 
     #[test]
-    fn test_json_field_query_with_espaced_dot() {
+    fn test_json_field_query_with_escaped_dot() {
         assert_eq!(
             extract_query_term_json_path(r#"json.k8s.node.name:hello"#),
             "k8s\u{1}node\u{1}name\0shello"
@@ -1354,7 +1502,7 @@ mod test {
     fn test_json_field_possibly_a_date() {
         test_parse_query_to_logical_ast_helper(
             r#"json.date:"2019-10-12T07:20:50.52Z""#,
-            r#"(Term(field=14, type=Json, path=date, type=Date, 2019-10-12T07:20:50Z) "[(0, Term(field=14, type=Json, path=date, type=Str, "2019")), (1, Term(field=14, type=Json, path=date, type=Str, "10")), (2, Term(field=14, type=Json, path=date, type=Str, "12t07")), (3, Term(field=14, type=Json, path=date, type=Str, "20")), (4, Term(field=14, type=Json, path=date, type=Str, "50")), (5, Term(field=14, type=Json, path=date, type=Str, "52z"))]")"#,
+            r#"(Term(field=14, type=Json, path=date, type=Date, 2019-10-12T07:20:50.52Z) "[(0, Term(field=14, type=Json, path=date, type=Str, "2019")), (1, Term(field=14, type=Json, path=date, type=Str, "10")), (2, Term(field=14, type=Json, path=date, type=Str, "12t07")), (3, Term(field=14, type=Json, path=date, type=Str, "20")), (4, Term(field=14, type=Json, path=date, type=Str, "50")), (5, Term(field=14, type=Json, path=date, type=Str, "52z"))]")"#,
             true,
         );
     }
@@ -1445,7 +1593,7 @@ mod test {
         );
         test_parse_query_to_logical_ast_helper(
             "(+title:a +title:b) title:c",
-            r#"(+(+Term(field=0, type=Str, "a") +Term(field=0, type=Str, "b")) +Term(field=0, type=Str, "c"))"#,
+            r#"(+Term(field=0, type=Str, "a") +Term(field=0, type=Str, "b") +Term(field=0, type=Str, "c"))"#,
             true,
         );
     }
@@ -1481,7 +1629,7 @@ mod test {
     pub fn test_parse_query_to_ast_two_terms() {
         test_parse_query_to_logical_ast_helper(
             "title:a b",
-            r#"(Term(field=0, type=Str, "a") (Term(field=0, type=Str, "b") Term(field=1, type=Str, "b")))"#,
+            r#"(Term(field=0, type=Str, "a") Term(field=0, type=Str, "b") Term(field=1, type=Str, "b"))"#,
             false,
         );
         test_parse_query_to_logical_ast_helper(
@@ -1647,7 +1795,7 @@ mod test {
         );
         test_parse_query_to_logical_ast_helper(
             r#"date:"1985-04-12T23:20:50.52Z""#,
-            r#"Term(field=9, type=Date, 1985-04-12T23:20:50Z)"#,
+            r#"Term(field=9, type=Date, 1985-04-12T23:20:50.52Z)"#,
             true,
         );
     }
@@ -1714,6 +1862,21 @@ mod test {
     }
 
     #[test]
+    pub fn test_parse_query_negative() {
+        test_parse_query_to_logical_ast_helper(
+            "title:b -title:a",
+            r#"(+Term(field=0, type=Str, "b") -Term(field=0, type=Str, "a"))"#,
+            true,
+        );
+
+        test_parse_query_to_logical_ast_helper(
+            "title:b -(-title:a -title:c)",
+            r#"(+Term(field=0, type=Str, "b") -(-Term(field=0, type=Str, "a") -Term(field=0, type=Str, "c")))"#,
+            true,
+        );
+    }
+
+    #[test]
     pub fn test_query_parser_hyphen() {
         test_parse_query_to_logical_ast_helper(
             "title:www-form-encoded",
@@ -1742,6 +1905,15 @@ mod test {
                 default_conjunction,
             );
         }
+    }
+
+    #[test]
+    fn test_space_before_value() {
+        test_parse_query_to_logical_ast_helper(
+            "title: a",
+            r#"Term(field=0, type=Str, "a")"#,
+            false,
+        );
     }
 
     #[test]
@@ -1826,7 +1998,8 @@ mod test {
              \"bad\"))], prefix: (2, Term(field=0, type=Str, \"wo\")), max_expansions: 50 }), \
              (Should, PhrasePrefixQuery { field: Field(1), phrase_terms: [(0, Term(field=1, \
              type=Str, \"big\")), (1, Term(field=1, type=Str, \"bad\"))], prefix: (2, \
-             Term(field=1, type=Str, \"wo\")), max_expansions: 50 })] }"
+             Term(field=1, type=Str, \"wo\")), max_expansions: 50 })], \
+             minimum_number_should_match: 1 }"
         );
     }
 
@@ -1849,6 +2022,82 @@ mod test {
                 tokenizer: "default".to_owned()
             }
         );
+    }
+
+    #[test]
+    pub fn test_phrase_prefix_on_json_field() {
+        let query_parser = make_query_parser();
+        let query = query_parser
+            .parse_query("json.attr:\"big bad wo\"*")
+            .unwrap();
+        assert_eq!(
+            format!("{query:?}"),
+            "PhrasePrefixQuery { field: Field(14), phrase_terms: [(0, Term(field=14, type=Json, \
+             path=attr, type=Str, \"big\")), (1, Term(field=14, type=Json, path=attr, type=Str, \
+             \"bad\"))], prefix: (2, Term(field=14, type=Json, path=attr, type=Str, \"wo\")), \
+             max_expansions: 50 }"
+        );
+    }
+
+    #[test]
+    pub fn test_phrase_prefix_too_short_on_json_field() {
+        let err = parse_query_to_logical_ast("json.attr:\"wo\"*", true).unwrap_err();
+        assert_eq!(
+            err,
+            QueryParserError::PhrasePrefixRequiresAtLeastTwoTerms {
+                phrase: "wo".to_owned(),
+                tokenizer: "default".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    pub fn test_phrase_slop_on_json_field() {
+        test_parse_query_to_logical_ast_helper(
+            "json.attr:\"a b\"~2",
+            r#""[(0, Term(field=14, type=Json, path=attr, type=Str, "a")), (1, Term(field=14, type=Json, path=attr, type=Str, "b"))]"~2"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn test_phrase_prefix_and_slop_on_json_field_with_documents() -> crate::Result<()> {
+        use serde_json::json;
+
+        use crate::collector::Count;
+
+        let mut schema_builder = Schema::builder();
+        let json = schema_builder.add_json_field("json", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(json => json!({"attr": "big bad wolf"})))?;
+        index_writer.add_document(doc!(json => json!({"attr": "big bad world"})))?;
+        index_writer.add_document(doc!(json => json!({"attr": "big bad"})))?;
+        index_writer.add_document(doc!(json => json!({"attr": "small bad wolf"})))?;
+        index_writer.add_document(doc!(json => json!({"attr": "big angry bad wolf"})))?;
+        index_writer.commit()?;
+
+        let query_parser = QueryParser::for_index(&index, Vec::new());
+        let searcher = index.reader()?.searcher();
+
+        // Phrase prefix: matches "big bad wolf" and "big bad world", but not "big bad" (no term
+        // after the phrase to expand) nor "small bad wolf" (phrase does not match).
+        let phrase_prefix = query_parser.parse_query("json.attr:\"big bad wo\"*")?;
+        assert_eq!(searcher.search(&*phrase_prefix, &Count)?, 2);
+
+        // Without the trailing `*` the same input is an exact phrase and matches nothing.
+        let exact_phrase = query_parser.parse_query("json.attr:\"big bad wo\"")?;
+        assert_eq!(searcher.search(&*exact_phrase, &Count)?, 0);
+
+        // Slop: "big angry bad wolf" only matches "big bad" once a slop of 1 is allowed.
+        let phrase = query_parser.parse_query("json.attr:\"big bad\"")?;
+        assert_eq!(searcher.search(&*phrase, &Count)?, 3);
+        let phrase_slop = query_parser.parse_query("json.attr:\"big bad\"~1")?;
+        assert_eq!(searcher.search(&*phrase_slop, &Count)?, 4);
+
+        Ok(())
     }
 
     #[test]
@@ -1891,7 +2140,8 @@ mod test {
                 format!("{query:?}"),
                 "BooleanQuery { subqueries: [(Should, FuzzyTermQuery { term: Term(field=0, \
                  type=Str, \"abc\"), distance: 1, transposition_cost_one: true, prefix: false }), \
-                 (Should, TermQuery(Term(field=1, type=Str, \"abc\")))] }"
+                 (Should, TermQuery(Term(field=1, type=Str, \"abc\")))], \
+                 minimum_number_should_match: 1 }"
             );
         }
 
@@ -1908,8 +2158,157 @@ mod test {
                 format!("{query:?}"),
                 "BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \
                  \"abc\"))), (Should, FuzzyTermQuery { term: Term(field=1, type=Str, \"abc\"), \
-                 distance: 2, transposition_cost_one: false, prefix: true })] }"
+                 distance: 2, transposition_cost_one: false, prefix: true })], \
+                 minimum_number_should_match: 1 }"
             );
         }
+    }
+
+    #[test]
+    pub fn test_set_default_field_integer() {
+        test_parse_query_to_logical_ast_helper_with_default_fields(
+            "2324",
+            "(Term(field=0, type=Str, \"2324\") Term(field=2, type=I64, 2324))",
+            false,
+            &["title", "signed"],
+        );
+
+        test_parse_query_to_logical_ast_helper_with_default_fields(
+            "abc",
+            "Term(field=0, type=Str, \"abc\")",
+            false,
+            &["title", "signed"],
+        );
+
+        let query_parser = make_query_parser_with_default_fields(&["signed"]);
+        assert_matches!(
+            query_parser.parse_query("abc"),
+            Err(QueryParserError::ExpectedInt(_))
+        );
+    }
+
+    #[test]
+    pub fn test_deduplication() {
+        let query = "be be";
+        test_parse_query_to_logical_ast_helper(
+            query,
+            "(Term(field=0, type=Str, \"be\") Term(field=1, type=Str, \"be\"))",
+            false,
+        );
+    }
+
+    #[test]
+    pub fn test_regex() {
+        let expected_regex = tantivy_fst::Regex::new(r".*b").unwrap();
+        test_parse_query_to_logical_ast_helper(
+            "title:/.*b/",
+            format!("Regex(Field(0), {:#?})", expected_regex).as_str(),
+            false,
+        );
+        let expected_regex2 = tantivy_fst::Regex::new(r".*a").unwrap();
+        test_parse_query_to_logical_ast_helper(
+            "title:(/.*b/ OR /.*a/)",
+            format!(
+                "(Regex(Field(0), {:#?}) Regex(Field(0), {:#?}))",
+                expected_regex, expected_regex2
+            )
+            .as_str(),
+            false,
+        );
+
+        // Invalid field
+        let err = parse_query_to_logical_ast("float:/.*b/", false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Regex query only supported on text fields"
+        );
+
+        // No field specified
+        let err = parse_query_to_logical_ast("/.*b/", false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Regex query need to target a specific field."
+        );
+
+        // Regex on a json path
+        let err = parse_query_to_logical_ast("title.subpath:/.*b/", false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Regex query does not support json paths."
+        );
+
+        // Invalid regex
+        let err = parse_query_to_logical_ast("title:/[A-Z*b/", false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Invalid regex: regex parse error:\n    [A-Z*b\n    ^\nerror: \
+             unclosed character class"
+        );
+
+        // Regexes not allowed
+        let err = parse_query_to_logical_ast_with_default_fields(
+            "title:/.*b/",
+            false,
+            &["title", "text"],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported query: Regex queries are not allowed."
+        );
+    }
+
+    #[test]
+    pub fn test_exists() {
+        test_parse_query_to_logical_ast_helper("title:*", "Exists(title)", false);
+    }
+
+    #[test]
+    fn test_exists_query_with_documents() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let fast = schema_builder.add_u64_field("fast", FAST);
+        let json = schema_builder.add_json_field("json", TEXT | FAST);
+        let not_fast = schema_builder.add_text_field("not_fast", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(
+            fast => 1u64,
+            json => json!({"nested": {"value": true}}),
+            not_fast => "present",
+        ))?;
+        index_writer.add_document(doc!(json => json!({"other": 2u64})))?;
+        index_writer.add_document(doc!(json => json!({"nested": null})))?;
+        index_writer.add_document(doc!())?;
+        index_writer.commit()?;
+
+        let query_parser = QueryParser::for_index(&index, Vec::new());
+        let searcher = index.reader()?.searcher();
+
+        let fast_exists = query_parser.parse_query("fast:*")?;
+        assert_eq!(searcher.search(&*fast_exists, &Count)?, 1);
+
+        // JSON exists queries include non-null values in subpaths. The document containing only a
+        // null value and the empty document do not match.
+        let json_exists = query_parser.parse_query("json:*")?;
+        assert_eq!(searcher.search(&*json_exists, &Count)?, 2);
+        let nested_exists = query_parser.parse_query("json.nested:*")?;
+        assert_eq!(searcher.search(&*nested_exists, &Count)?, 1);
+
+        let fast_does_not_exist = query_parser.parse_query("* NOT fast:*")?;
+        assert_eq!(searcher.search(&*fast_does_not_exist, &Count)?, 3);
+
+        let not_fast_exists = query_parser.parse_query("not_fast:*")?;
+        assert_eq!(
+            searcher
+                .search(&*not_fast_exists, &Count)
+                .unwrap_err()
+                .to_string(),
+            "Schema error: 'Field not_fast is not a fast field.'"
+        );
+
+        Ok(())
     }
 }

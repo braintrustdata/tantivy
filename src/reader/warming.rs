@@ -156,7 +156,7 @@ impl WarmingStateInner {
                 // rely on deterministic gc in tests
                 #[cfg(not(test))]
                 if let Err(err) = std::panic::catch_unwind(|| inner.lock().unwrap().gc_maybe()) {
-                    error!("Panic in Warmer GC {:?}", err);
+                    error!("Panic in Warmer GC {err:?}");
                 }
                 // avoid unused var warning in tests
                 #[cfg(test)]
@@ -183,9 +183,10 @@ mod tests {
     use super::Warmer;
     use crate::core::searcher::SearcherGeneration;
     use crate::directory::RamDirectory;
+    use crate::index::SegmentId;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::schema::{Schema, INDEXED};
-    use crate::{Index, IndexSettings, ReloadPolicy, Searcher, SegmentId};
+    use crate::{Index, IndexSettings, ReloadPolicy, Searcher};
 
     #[derive(Default)]
     struct TestWarmer {

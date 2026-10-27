@@ -7,15 +7,15 @@ use std::io;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-use itertools::Itertools;
+pub use merge_dict_column::compute_merged_term_ord_mapping;
 pub use merge_mapping::{MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};
 
 use super::writer::ColumnarSerializer;
-use crate::column::{serialize_column_mappable_to_u128, serialize_column_mappable_to_u64};
+use crate::column::{serialize_column_mappable_to_u64, serialize_column_mappable_to_u128};
 use crate::column_values::MergedColumnValues;
+use crate::columnar::ColumnarReader;
 use crate::columnar::merge::merge_dict_column::merge_bytes_or_str_column;
 use crate::columnar::writer::CompatibleNumericalTypes;
-use crate::columnar::ColumnarReader;
 use crate::dynamic_column::DynamicColumn;
 use crate::{
     BytesColumn, Column, ColumnIndex, ColumnType, ColumnValues, DynamicColumnHandle, NumericalType,
@@ -26,7 +26,7 @@ use crate::{
 /// After merge, all columns belonging to the same category are coerced to
 /// the same column type.
 ///
-/// In practise, today, only Numerical colummns are coerced into one type today.
+/// In practise, today, only Numerical columns are coerced into one type today.
 ///
 /// See also [README.md].
 ///
@@ -64,11 +64,10 @@ impl From<ColumnType> for ColumnTypeCategory {
 /// `require_columns` makes it possible to ensure that some columns will be present in the
 /// resulting columnar. When a required column is a numerical column type, one of two things can
 /// happen:
-/// - If the required column type is compatible with all of the input columnar, the resulsting
-///   merged
-/// columnar will simply coerce the input column and use the required column type.
-/// - If the required column type is incompatible with one of the input columnar, the merged
-/// will fail with an InvalidData error.
+/// - If the required column type is compatible with all of the input columnar, the resulting merged
+///   columnar will simply coerce the input column and use the required column type.
+/// - If the required column type is incompatible with one of the input columnar, the merged will
+///   fail with an InvalidData error.
 ///
 /// `merge_row_order` makes it possible to remove or reorder row in the resulting
 /// `Columnar` table.
@@ -82,13 +81,12 @@ pub fn merge_columnar(
     output: &mut impl io::Write,
 ) -> io::Result<()> {
     let mut serializer = ColumnarSerializer::new(output);
-    let num_rows_per_columnar = columnar_readers
+    let num_docs_per_columnar = columnar_readers
         .iter()
-        .map(|reader| reader.num_rows())
+        .map(|reader| reader.num_docs())
         .collect::<Vec<u32>>();
 
-    let columns_to_merge =
-        group_columns_for_merge(columnar_readers, required_columns, &merge_row_order)?;
+    let columns_to_merge = group_columns_for_merge(columnar_readers, required_columns)?;
     for res in columns_to_merge {
         let ((column_name, _column_type_category), grouped_columns) = res;
         let grouped_columns = grouped_columns.open(&merge_row_order)?;
@@ -96,15 +94,18 @@ pub fn merge_columnar(
             continue;
         }
 
-        let column_type = grouped_columns.column_type_after_merge();
+        let column_type_after_merge = grouped_columns.column_type_after_merge();
         let mut columns = grouped_columns.columns;
-        coerce_columns(column_type, &mut columns)?;
+        // Make sure the number of columns is the same as the number of columnar readers.
+        // Or num_docs_per_columnar would be incorrect.
+        assert_eq!(columns.len(), columnar_readers.len());
+        coerce_columns(column_type_after_merge, &mut columns)?;
 
         let mut column_serializer =
-            serializer.start_serialize_column(column_name.as_bytes(), column_type);
+            serializer.start_serialize_column(column_name.as_bytes(), column_type_after_merge);
         merge_column(
-            column_type,
-            &num_rows_per_columnar,
+            column_type_after_merge,
+            &num_docs_per_columnar,
             columns,
             &merge_row_order,
             &mut column_serializer,
@@ -123,14 +124,18 @@ fn dynamic_column_to_u64_monotonic(dynamic_column: DynamicColumn) -> Option<Colu
         DynamicColumn::U64(column) => Some(column.to_u64_monotonic()),
         DynamicColumn::F64(column) => Some(column.to_u64_monotonic()),
         DynamicColumn::DateTime(column) => Some(column.to_u64_monotonic()),
-        DynamicColumn::IpAddr(_) | DynamicColumn::Bytes(_) | DynamicColumn::Str(_) => None,
+        DynamicColumn::IpAddr(_)
+        | DynamicColumn::Bytes(_)
+        | DynamicColumn::Str(_)
+        | DynamicColumn::PlainBytes(_)
+        | DynamicColumn::PlainStr(_) => None,
     }
 }
 
 fn merge_column(
     column_type: ColumnType,
     num_docs_per_column: &[u32],
-    columns: Vec<Option<DynamicColumn>>,
+    columns_to_merge: Vec<Option<DynamicColumn>>,
     merge_row_order: &MergeRowOrder,
     wrt: &mut impl io::Write,
 ) -> io::Result<()> {
@@ -140,20 +145,21 @@ fn merge_column(
         | ColumnType::F64
         | ColumnType::DateTime
         | ColumnType::Bool => {
-            let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns.len());
+            let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());
             let mut column_values: Vec<Option<Arc<dyn ColumnValues>>> =
-                Vec::with_capacity(columns.len());
-            for (i, dynamic_column_opt) in columns.into_iter().enumerate() {
-                if let Some(Column { index: idx, values }) =
-                    dynamic_column_opt.and_then(dynamic_column_to_u64_monotonic)
-                {
-                    column_indexes.push(idx);
-                    column_values.push(Some(values));
-                } else {
-                    column_indexes.push(ColumnIndex::Empty {
-                        num_docs: num_docs_per_column[i],
-                    });
-                    column_values.push(None);
+                Vec::with_capacity(columns_to_merge.len());
+            for (i, dynamic_column_opt) in columns_to_merge.into_iter().enumerate() {
+                match dynamic_column_opt.and_then(dynamic_column_to_u64_monotonic) {
+                    Some(Column { index: idx, values }) => {
+                        column_indexes.push(idx);
+                        column_values.push(Some(values));
+                    }
+                    None => {
+                        column_indexes.push(ColumnIndex::Empty {
+                            num_docs: num_docs_per_column[i],
+                        });
+                        column_values.push(None);
+                    }
                 }
             }
             let merged_column_index =
@@ -166,10 +172,10 @@ fn merge_column(
             serialize_column_mappable_to_u64(merged_column_index, &merge_column_values, wrt)?;
         }
         ColumnType::IpAddr => {
-            let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns.len());
+            let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());
             let mut column_values: Vec<Option<Arc<dyn ColumnValues<Ipv6Addr>>>> =
-                Vec::with_capacity(columns.len());
-            for (i, dynamic_column_opt) in columns.into_iter().enumerate() {
+                Vec::with_capacity(columns_to_merge.len());
+            for (i, dynamic_column_opt) in columns_to_merge.into_iter().enumerate() {
                 if let Some(DynamicColumn::IpAddr(Column { index: idx, values })) =
                     dynamic_column_opt
                 {
@@ -194,9 +200,10 @@ fn merge_column(
             serialize_column_mappable_to_u128(merged_column_index, &merge_column_values, wrt)?;
         }
         ColumnType::Bytes | ColumnType::Str => {
-            let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns.len());
-            let mut bytes_columns: Vec<Option<BytesColumn>> = Vec::with_capacity(columns.len());
-            for (i, dynamic_column_opt) in columns.into_iter().enumerate() {
+            let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns_to_merge.len());
+            let mut bytes_columns: Vec<Option<BytesColumn>> =
+                Vec::with_capacity(columns_to_merge.len());
+            for (i, dynamic_column_opt) in columns_to_merge.into_iter().enumerate() {
                 match dynamic_column_opt {
                     Some(DynamicColumn::Str(str_column)) => {
                         column_indexes.push(str_column.term_ord_column.index.clone());
@@ -205,6 +212,12 @@ fn merge_column(
                     Some(DynamicColumn::Bytes(bytes_column)) => {
                         column_indexes.push(bytes_column.term_ord_column.index.clone());
                         bytes_columns.push(Some(bytes_column));
+                    }
+                    Some(DynamicColumn::PlainStr(_) | DynamicColumn::PlainBytes(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "merging plain-encoded columns is not supported",
+                        ));
                     }
                     _ => {
                         column_indexes.push(ColumnIndex::Empty {
@@ -250,13 +263,15 @@ impl GroupedColumns {
         if column_type.len() == 1 {
             return column_type.into_iter().next().unwrap();
         }
-        // At the moment, only the numerical categorical column type has more than one possible
+        // At the moment, only the numerical column type category has more than one possible
         // column type.
-        assert!(self
-            .columns
-            .iter()
-            .flatten()
-            .all(|el| ColumnTypeCategory::from(el.column_type()) == ColumnTypeCategory::Numerical));
+        assert!(
+            self.columns
+                .iter()
+                .flatten()
+                .all(|el| ColumnTypeCategory::from(el.column_type())
+                    == ColumnTypeCategory::Numerical)
+        );
         merged_numerical_columns_type(self.columns.iter().flatten()).into()
     }
 }
@@ -362,7 +377,7 @@ fn is_empty_after_merge(
                     ColumnIndex::Empty { .. } => true,
                     ColumnIndex::Full => alive_bitset.len() == 0,
                     ColumnIndex::Optional(optional_index) => {
-                        for doc in optional_index.iter_rows() {
+                        for doc in optional_index.iter_non_null_docs() {
                             if alive_bitset.contains(doc) {
                                 return false;
                             }
@@ -370,20 +385,8 @@ fn is_empty_after_merge(
                         true
                     }
                     ColumnIndex::Multivalued(multivalued_index) => {
-                        for (doc_id, (start_index, end_index)) in multivalued_index
-                            .start_index_column
-                            .iter()
-                            .tuple_windows()
-                            .enumerate()
-                        {
-                            let doc_id = doc_id as u32;
-                            if start_index == end_index {
-                                // There are no values in this document
-                                continue;
-                            }
-                            // The document contains values and is present in the alive bitset.
-                            // The column is therefore not empty.
-                            if alive_bitset.contains(doc_id) {
+                        for alive_docid in alive_bitset.iter() {
+                            if !multivalued_index.range(alive_docid).is_empty() {
                                 return false;
                             }
                         }
@@ -404,7 +407,6 @@ fn is_empty_after_merge(
 fn group_columns_for_merge<'a>(
     columnar_readers: &'a [&'a ColumnarReader],
     required_columns: &'a [(String, ColumnType)],
-    _merge_row_order: &'a MergeRowOrder,
 ) -> io::Result<BTreeMap<(String, ColumnTypeCategory), GroupedColumnsHandle>> {
     let mut columns: BTreeMap<(String, ColumnTypeCategory), GroupedColumnsHandle> = BTreeMap::new();
 
@@ -477,7 +479,9 @@ fn min_max_if_numerical(column: &DynamicColumn) -> Option<(NumericalValue, Numer
         | DynamicColumn::IpAddr(_)
         | DynamicColumn::DateTime(_)
         | DynamicColumn::Bytes(_)
-        | DynamicColumn::Str(_) => None,
+        | DynamicColumn::Str(_)
+        | DynamicColumn::PlainBytes(_)
+        | DynamicColumn::PlainStr(_) => None,
     }
 }
 

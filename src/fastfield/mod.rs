@@ -25,6 +25,8 @@ use columnar::MonotonicallyMappableToU64;
 pub use self::alive_bitset::{intersect_alive_bitsets, write_alive_bitset, AliveBitSet};
 pub use self::error::{FastFieldNotAvailableError, Result};
 pub use self::facet_reader::FacetReader;
+pub mod plugin;
+pub use self::plugin::{FastFieldsPlugin, FastFieldsPluginWriter};
 pub use self::readers::FastFieldReaders;
 pub use self::writer::FastFieldsWriter;
 use crate::schema::Type;
@@ -80,7 +82,7 @@ mod tests {
     use std::path::Path;
 
     use columnar::StrColumn;
-    use common::{ByteCount, HasLen, TerminatingWrite};
+    use common::{ByteCount, DateTimePrecision, HasLen, TerminatingWrite};
     use once_cell::sync::Lazy;
     use rand::prelude::SliceRandom;
     use rand::rngs::StdRng;
@@ -88,14 +90,17 @@ mod tests {
 
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
+    use crate::index::SegmentId;
     use crate::merge_policy::NoMergePolicy;
     use crate::schema::{
-        Facet, FacetOptions, Field, JsonObjectOptions, Schema, SchemaBuilder, TantivyDocument,
-        TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
+        DateOptions, Facet, FacetOptions, Field, FieldType, JsonObjectOptions, Schema,
+        SchemaBuilder, TantivyDocument, TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
     };
     use crate::time::OffsetDateTime;
-    use crate::tokenizer::{LowerCaser, RawTokenizer, TextAnalyzer, TokenizerManager};
-    use crate::{DateOptions, DateTimePrecision, Index, IndexWriter, SegmentId, SegmentReader};
+    use crate::tokenizer::{
+        LowerCaser, RawTokenizer, TextAnalyzer, TokenizerManager, RAW_TOKENIZER_NAME,
+    };
+    use crate::{Index, IndexWriter, SegmentReader};
 
     pub static SCHEMA: Lazy<Schema> = Lazy::new(|| {
         let mut schema_builder = Schema::builder();
@@ -141,6 +146,37 @@ mod tests {
         assert_eq!(column.get_val(1), 14u64);
         assert_eq!(column.get_val(2), 2u64);
         Ok(())
+    }
+
+    #[test]
+    fn test_generated_tie_breaker_fast_field() {
+        let mut schema_builder = Schema::builder();
+        let tie = schema_builder.add_tie_breaker_field("tie");
+        let schema = schema_builder.build();
+        let entry = schema.get_field_entry(tie);
+        assert!(matches!(entry.field_type(), FieldType::TieBreaker));
+        assert!(entry.is_fast());
+        assert!(!entry.is_indexed());
+        assert!(!entry.is_stored());
+        let schema_json = serde_json::to_string(&schema).unwrap();
+        assert!(schema_json.contains(r#""type":"tie_breaker""#));
+        assert_eq!(
+            serde_json::from_str::<Schema>(&schema_json).unwrap(),
+            schema
+        );
+
+        let mut writer = FastFieldsWriter::from_schema(&schema).unwrap();
+        for _ in 0..1_025 {
+            writer.add_document(&TantivyDocument::default()).unwrap();
+        }
+        let mut bytes = Vec::new();
+        writer.serialize(&mut bytes, None).unwrap();
+
+        let readers = FastFieldReaders::open(bytes.into(), schema).unwrap();
+        let values = readers.i64("tie").unwrap().first_or_default_col(0);
+        for doc in 1..1_025 {
+            assert_eq!(values.get_val(doc), values.get_val(doc - 1) + 1);
+        }
     }
 
     #[test]
@@ -725,22 +761,22 @@ mod tests {
             .column_opt::<DateTime>("multi_date")
             .unwrap()
             .unwrap();
-        let mut dates = Vec::new();
+
         {
             assert_eq!(date_fast_field.get_val(0).into_timestamp_nanos(), 1i64);
-            dates_fast_field.fill_vals(0u32, &mut dates);
+            let dates: Vec<DateTime> = dates_fast_field.values_for_doc(0u32).collect();
             assert_eq!(dates.len(), 2);
             assert_eq!(dates[0].into_timestamp_nanos(), 2i64);
             assert_eq!(dates[1].into_timestamp_nanos(), 3i64);
         }
         {
             assert_eq!(date_fast_field.get_val(1).into_timestamp_nanos(), 4i64);
-            dates_fast_field.fill_vals(1u32, &mut dates);
+            let dates: Vec<DateTime> = dates_fast_field.values_for_doc(1u32).collect();
             assert!(dates.is_empty());
         }
         {
             assert_eq!(date_fast_field.get_val(2).into_timestamp_nanos(), 0i64);
-            dates_fast_field.fill_vals(2u32, &mut dates);
+            let dates: Vec<DateTime> = dates_fast_field.values_for_doc(2u32).collect();
             assert_eq!(dates.len(), 2);
             assert_eq!(dates[0].into_timestamp_nanos(), 5i64);
             assert_eq!(dates[1].into_timestamp_nanos(), 6i64);
@@ -878,7 +914,7 @@ mod tests {
         const ONE_HOUR_IN_MICROSECS: i64 = 3_600 * 1_000_000;
         let times: Vec<DateTime> = std::iter::repeat_with(|| {
             // +- One hour.
-            let t = T0 + rng.gen_range(-ONE_HOUR_IN_MICROSECS..ONE_HOUR_IN_MICROSECS);
+            let t = T0 + rng.random_range(-ONE_HOUR_IN_MICROSECS..ONE_HOUR_IN_MICROSECS);
             DateTime::from_timestamp_micros(t)
         })
         .take(1_000)
@@ -941,10 +977,10 @@ mod tests {
 
         let numbers = [100, 200, 300];
         let test_range = |range: RangeInclusive<u64>| {
-            let expexted_count = numbers.iter().filter(|num| range.contains(num)).count();
+            let expected_count = numbers.iter().filter(|num| range.contains(*num)).count();
             let mut vec = vec![];
             field.get_row_ids_for_value_range(range, 0..u32::MAX, &mut vec);
-            assert_eq!(vec.len(), expexted_count);
+            assert_eq!(vec.len(), expected_count);
         };
         test_range(50..=50);
         test_range(150..=150);
@@ -1019,10 +1055,10 @@ mod tests {
 
         let numbers = [1000, 1001, 1003];
         let test_range = |range: RangeInclusive<u64>| {
-            let expexted_count = numbers.iter().filter(|num| range.contains(num)).count();
+            let expected_count = numbers.iter().filter(|num| range.contains(*num)).count();
             let mut vec = vec![];
             field.get_row_ids_for_value_range(range, 0..u32::MAX, &mut vec);
-            assert_eq!(vec.len(), expexted_count);
+            assert_eq!(vec.len(), expected_count);
         };
         let test_range_variant = |start, stop| {
             let start_range = start..=stop;
@@ -1086,7 +1122,7 @@ mod tests {
     #[test]
     fn test_fast_field_in_json_field_expand_dots_disabled() {
         let mut schema_builder = Schema::builder();
-        let json_option = JsonObjectOptions::default().set_fast(None);
+        let json_option = JsonObjectOptions::default().set_fast(RAW_TOKENIZER_NAME);
         let json = schema_builder.add_json_field("json", json_option);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
@@ -1112,7 +1148,7 @@ mod tests {
     #[test]
     fn test_fast_field_in_json_field_with_tokenizer() {
         let mut schema_builder = Schema::builder();
-        let json_option = JsonObjectOptions::default().set_fast(Some("default"));
+        let json_option = JsonObjectOptions::default().set_fast("default");
         let json = schema_builder.add_json_field("json", json_option);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
@@ -1138,7 +1174,7 @@ mod tests {
     fn test_fast_field_in_json_field_expand_dots_enabled() {
         let mut schema_builder = Schema::builder();
         let json_option = JsonObjectOptions::default()
-            .set_fast(None)
+            .set_fast(RAW_TOKENIZER_NAME)
             .set_expand_dots_enabled();
         let json = schema_builder.add_json_field("json", json_option);
         let schema = schema_builder.build();
@@ -1206,7 +1242,7 @@ mod tests {
     #[test]
     fn test_fast_field_tokenizer() {
         let mut schema_builder = Schema::builder();
-        let opt = TextOptions::default().set_fast(Some("custom_lowercase"));
+        let opt = TextOptions::default().set_fast("custom_lowercase");
         let text_field = schema_builder.add_text_field("text", opt);
         let schema = schema_builder.build();
         let ff_tokenizer_manager = TokenizerManager::default();
@@ -1242,7 +1278,7 @@ mod tests {
                     .set_index_option(crate::schema::IndexRecordOption::WithFreqs)
                     .set_tokenizer("raw"),
             )
-            .set_fast(Some("default"))
+            .set_fast("default")
             .set_stored();
 
         let log_field = schema_builder.add_text_field("log_level", text_fieldtype);
@@ -1275,7 +1311,7 @@ mod tests {
     fn test_shadowing_fast_field_with_expand_dots() {
         let mut schema_builder = Schema::builder();
         let json_option = JsonObjectOptions::default()
-            .set_fast(None)
+            .set_fast(RAW_TOKENIZER_NAME)
             .set_expand_dots_enabled();
         let json_field = schema_builder.add_json_field("jsonfield", json_option.clone());
         let shadowing_json_field = schema_builder.add_json_field("jsonfield.attr", json_option);

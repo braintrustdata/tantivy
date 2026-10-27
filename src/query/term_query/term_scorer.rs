@@ -1,6 +1,6 @@
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
-use crate::postings::{FreqReadingOption, Postings, SegmentPostings};
+use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
 use crate::{DocId, Score};
@@ -25,8 +25,8 @@ impl TermScorer {
         }
     }
 
-    pub(crate) fn shallow_seek(&mut self, target_doc: DocId) {
-        self.postings.block_cursor.shallow_seek(target_doc);
+    pub(crate) fn seek_block(&mut self, target_doc: DocId) {
+        self.postings.block_cursor.seek_block(target_doc);
     }
 
     #[cfg(test)]
@@ -95,17 +95,36 @@ impl TermScorer {
     pub fn last_doc_in_block(&self) -> DocId {
         self.postings.block_cursor.skip_reader().last_doc_in_block()
     }
+
+    /// Returns a mutable reference to the underlying block cursor.
+    pub(crate) fn block_cursor(&mut self) -> &mut BlockSegmentPostings {
+        &mut self.postings.block_cursor
+    }
+
+    /// Returns a reference to the fieldnorm reader for batch lookups.
+    pub(crate) fn fieldnorm_reader(&self) -> &FieldNormReader {
+        &self.fieldnorm_reader
+    }
+
+    /// Returns a reference to the BM25 weight for batch score computation.
+    pub(crate) fn bm25_weight(&self) -> &Bm25Weight {
+        &self.similarity_weight
+    }
 }
 
 impl DocSet for TermScorer {
+    #[inline]
     fn advance(&mut self) -> DocId {
         self.postings.advance()
     }
 
+    #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
+        debug_assert!(target >= self.doc());
         self.postings.seek(target)
     }
 
+    #[inline]
     fn doc(&self) -> DocId {
         self.postings.doc()
     }
@@ -113,9 +132,16 @@ impl DocSet for TermScorer {
     fn size_hint(&self) -> u32 {
         self.postings.size_hint()
     }
+
+    // TODO
+    // It is probably possible to optimize fill_bitset_block for TermScorer,
+    // working directly with the blocks, enabling vectorization.
+    // I did not manage to get a performance improvement on Mac ARM,
+    // and do not have access to x86 to investigate.
 }
 
 impl Scorer for TermScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
@@ -127,6 +153,7 @@ impl Scorer for TermScorer {
 mod tests {
     use proptest::prelude::*;
 
+    use crate::index::SegmentId;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
     use crate::merge_policy::NoMergePolicy;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
@@ -134,8 +161,7 @@ mod tests {
     use crate::query::{Bm25Weight, EnableScoring, Scorer, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
     use crate::{
-        assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, SegmentId, Term,
-        TERMINATED,
+        assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, Term, TERMINATED,
     };
 
     #[test]
@@ -172,10 +198,10 @@ mod tests {
             let doc = i * 10;
             doc_and_tfs.push((doc, 1u32 + doc % 3u32));
         }
-        let fieldnorms: Vec<u32> = std::iter::repeat(10u32).take(3_000).collect();
+        let fieldnorms: Vec<u32> = std::iter::repeat_n(10u32, 3_000).collect();
         let mut term_scorer = TermScorer::create_for_test(&doc_and_tfs, &fieldnorms, bm25_weight);
         assert_eq!(term_scorer.doc(), 0u32);
-        term_scorer.shallow_seek(1289);
+        term_scorer.seek_block(1289);
         assert_eq!(term_scorer.doc(), 0u32);
         term_scorer.seek(1289);
         assert_eq!(term_scorer.doc(), 1290);
@@ -238,13 +264,13 @@ mod tests {
         doc_tfs.push((257, 3u32));
         doc_tfs.push((258, 1u32));
 
-        let fieldnorms: Vec<u32> = std::iter::repeat(20u32).take(300).collect();
+        let fieldnorms: Vec<u32> = std::iter::repeat_n(20u32, 300).collect();
         let bm25_weight = Bm25Weight::for_one_term(10, 129, 20.0);
         let mut docs = TermScorer::create_for_test(&doc_tfs[..], &fieldnorms[..], bm25_weight);
         assert_nearly_equals!(docs.block_max_score(), 2.5161593);
-        docs.shallow_seek(135);
+        docs.seek_block(135);
         assert_nearly_equals!(docs.block_max_score(), 3.4597192);
-        docs.shallow_seek(256);
+        docs.seek_block(256);
         // the block is not loaded yet.
         assert_nearly_equals!(docs.block_max_score(), 5.2971773);
         assert_eq!(256, docs.seek(256));
@@ -259,7 +285,7 @@ mod tests {
             let mut block_max_scores_b = vec![];
             let mut docs = vec![];
             {
-                let mut term_scorer = term_weight.specialized_scorer(reader, 1.0)?;
+                let mut term_scorer = term_weight.term_scorer_for_test(reader, 1.0)?.unwrap();
                 while term_scorer.doc() != TERMINATED {
                     let mut score = term_scorer.score();
                     docs.push(term_scorer.doc());
@@ -273,9 +299,9 @@ mod tests {
                 }
             }
             {
-                let mut term_scorer = term_weight.specialized_scorer(reader, 1.0)?;
+                let mut term_scorer = term_weight.term_scorer_for_test(reader, 1.0)?.unwrap();
                 for d in docs {
-                    term_scorer.shallow_seek(d);
+                    term_scorer.seek_block(d);
                     block_max_scores_b.push(term_scorer.block_max_score());
                 }
             }
@@ -300,11 +326,11 @@ mod tests {
         let mut writer: IndexWriter =
             index.writer_with_num_threads(3, 3 * MEMORY_BUDGET_NUM_BYTES_MIN)?;
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for _ in 0..3_000 {
-            let term_freq = rng.gen_range(1..10000);
-            let words: Vec<&str> = std::iter::repeat("bbbb").take(term_freq).collect();
+            let term_freq = rng.random_range(1..10000);
+            let words: Vec<&str> = std::iter::repeat_n("bbbb", term_freq).collect();
             let text = words.join(" ");
             writer.add_document(doc!(text_field=>text))?;
         }

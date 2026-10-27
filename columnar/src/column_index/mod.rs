@@ -11,10 +11,13 @@ mod serialize;
 use std::ops::Range;
 
 pub use merge::merge_column_index;
+pub use multivalued_index::MultiValueIndex;
+pub(crate) use multivalued_index::SerializableMultivalueIndex;
 pub use optional_index::{OptionalIndex, Set};
-pub use serialize::{open_column_index, serialize_column_index, SerializableColumnIndex};
+pub use serialize::{
+    SerializableColumnIndex, SerializableOptionalIndex, open_column_index, serialize_column_index,
+};
 
-use crate::column_index::multivalued_index::MultiValueIndex;
 use crate::{Cardinality, DocId, RowId};
 
 #[derive(Clone, Debug)]
@@ -25,7 +28,7 @@ pub enum ColumnIndex {
     Full,
     Optional(OptionalIndex),
     /// In addition, at index num_rows, an extra value is added
-    /// containing the overal number of values.
+    /// containing the overall number of values.
     Multivalued(MultiValueIndex),
 }
 
@@ -53,6 +56,19 @@ impl ColumnIndex {
             ColumnIndex::Empty { .. } => Cardinality::Optional,
             ColumnIndex::Optional(_) => Cardinality::Optional,
             ColumnIndex::Multivalued(_) => Cardinality::Multivalued,
+        }
+    }
+
+    /// Returns the number of docs of the column index.
+    ///
+    /// Returns `None` for a `Full` index: it does not store its number of docs, which is the
+    /// number of values of the column.
+    pub fn num_docs(&self) -> Option<RowId> {
+        match self {
+            ColumnIndex::Empty { num_docs } => Some(*num_docs),
+            ColumnIndex::Full => None,
+            ColumnIndex::Optional(optional_index) => Some(optional_index.num_docs()),
+            ColumnIndex::Multivalued(multivalued_index) => Some(multivalued_index.num_docs()),
         }
     }
 
@@ -104,12 +120,7 @@ impl ColumnIndex {
                 row_ids.extend_from_slice(doc_ids);
             }
             ColumnIndex::Optional(optional_index) => {
-                for doc_id in doc_ids {
-                    if let Some(row_id) = optional_index.rank_if_exists(*doc_id) {
-                        doc_ids_out.push(*doc_id);
-                        row_ids.push(row_id);
-                    }
-                }
+                optional_index.rank_if_exists_batch(doc_ids, doc_ids_out, row_ids);
             }
             ColumnIndex::Multivalued(multivalued_index) => {
                 for doc_id in doc_ids {
@@ -131,15 +142,41 @@ impl ColumnIndex {
                 let row_end = optional_index.rank(doc_id_range.end);
                 row_start..row_end
             }
-            ColumnIndex::Multivalued(multivalued_index) => {
-                let end_docid = doc_id_range.end.min(multivalued_index.num_docs() - 1) + 1;
-                let start_docid = doc_id_range.start.min(end_docid);
+            ColumnIndex::Multivalued(multivalued_index) => match multivalued_index {
+                MultiValueIndex::MultiValueIndexV1(index) => {
+                    let row_start = index.start_index_column.get_val(doc_id_range.start);
+                    let row_end = index.start_index_column.get_val(doc_id_range.end);
+                    row_start..row_end
+                }
+                MultiValueIndex::MultiValueIndexV2(index) => {
+                    // In this case we will use the optional_index select the next values
+                    // that are valid. There are different cases to consider:
+                    // Not exists below means does not exist in the optional
+                    // index, because it has no values.
+                    // * doc_id_range may cover a range of docids which are non existent
+                    // => rank
+                    //   will give us the next document outside the range with a value. They both
+                    //   get the same rank and therefore return a zero range
+                    //
+                    // * doc_id_range.start and doc_id_range.end may not exist, but docids in
+                    // between may have values
+                    // => rank will give us the next document outside the range with a value.
+                    //
+                    // * doc_id_range.start may be not existent but doc_id_range.end may exist
+                    // * doc_id_range.start may exist but doc_id_range.end may not exist
+                    // * doc_id_range.start and doc_id_range.end may exist
+                    // => rank on doc_id_range.end will give use the next value, which matches
+                    // how the `start_index_column` works, so we get the value start of the next
+                    // docid which we use to create the exclusive range.
+                    //
+                    let rank_start = index.optional_index.rank(doc_id_range.start);
+                    let row_start = index.start_index_column.get_val(rank_start);
+                    let rank_end = index.optional_index.rank(doc_id_range.end);
+                    let row_end = index.start_index_column.get_val(rank_end);
 
-                let row_start = multivalued_index.start_index_column.get_val(start_docid);
-                let row_end = multivalued_index.start_index_column.get_val(end_docid);
-
-                row_start..row_end
-            }
+                    row_start..row_end
+                }
+            },
         }
     }
 

@@ -6,13 +6,13 @@ use once_cell::sync::OnceCell;
 
 use crate::collector::Collector;
 use crate::core::Executor;
-use crate::index::SegmentReader;
+use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
-use crate::{DocAddress, Index, Opstamp, SegmentId, TrackedObject};
+use crate::{DocAddress, Index, Opstamp, TrackedObject};
 
 /// Identifies the searcher generation accessed by a [`Searcher`].
 ///
@@ -114,8 +114,9 @@ impl Searcher {
         &self,
         doc_address: DocAddress,
     ) -> crate::Result<D> {
+        let executor = self.inner.index.search_executor();
         let store_reader = self.inner.store_reader(doc_address.segment_ord)?;
-        store_reader.get_async(doc_address.doc_id).await
+        store_reader.get_async(doc_address.doc_id, executor).await
     }
 
     /// Access the schema associated with the index of this searcher.
@@ -218,7 +219,7 @@ impl Searcher {
     /// It is powerless at making search faster if your index consists in
     /// one large segment.
     ///
-    /// Also, keep in my multithreading a single query on several
+    /// Also, keep in mind multithreading a single query on several
     /// threads will not improve your throughput. It can actually
     /// hurt it. It will however, decrease the average response time.
     pub fn search_with_executor<C: Collector>(
@@ -229,6 +230,7 @@ impl Searcher {
         enabled_scoring: EnableScoring,
     ) -> crate::Result<C::Fruit> {
         let weight = query.weight(enabled_scoring)?;
+        collector.check_schema(self.schema())?;
         let segment_readers = self.segment_readers();
         let fruits = executor.map(
             |(segment_ord, segment_reader)| {

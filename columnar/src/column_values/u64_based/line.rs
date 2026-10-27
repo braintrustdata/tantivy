@@ -8,7 +8,7 @@ use crate::column_values::ColumnValues;
 const MID_POINT: u64 = (1u64 << 32) - 1u64;
 
 /// `Line` describes a line function `y: ax + b` using integer
-/// arithmetics.
+/// arithmetic.
 ///
 /// The slope is in fact a decimal split into a 32 bit integer value,
 /// and a 32-bit decimal value.
@@ -37,7 +37,7 @@ fn compute_slope(y0: u64, y1: u64, num_vals: NonZeroU32) -> u64 {
     } else {
         y0.wrapping_sub(y1)
     };
-    if abs_dy >= 1 << 32 {
+    if abs_dy >= 1 << 31 {
         // This is outside of realm we handle.
         // Let's just bail.
         return 0u64;
@@ -94,7 +94,7 @@ impl Line {
         // `(i, ys[])`.
         //
         // The best intercept therefore has the form
-        // `y[i] - line.eval(i)` (using wrapping arithmetics).
+        // `y[i] - line.eval(i)` (using wrapping arithmetic).
         // In other words, the best intercept is one of the `y - Line::eval(ys[i])`
         // and our task is just to pick the one that minimizes our error.
         //
@@ -122,12 +122,11 @@ impl Line {
         line
     }
 
-    /// Returns a line that attemps to approximate a function
+    /// Returns a line that attempts to approximate a function
     /// f: i in 0..[ys.num_vals()) -> ys[i].
     ///
-    /// - The approximation is always lower than the actual value.
-    /// Or more rigorously, formally `f(i).wrapping_sub(ys[i])` is small
-    /// for any i in [0..ys.len()).
+    /// - The approximation is always lower than the actual value. Or more rigorously, formally
+    ///   `f(i).wrapping_sub(ys[i])` is small for any i in [0..ys.len()).
     /// - It computes without panicking for any value of it.
     ///
     /// This function is only invariable by translation if all of the

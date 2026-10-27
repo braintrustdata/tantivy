@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use super::{prefix_end, PhrasePrefixWeight};
 use crate::query::bm25::Bm25Weight;
-use crate::query::{EnableScoring, Query, RangeQuery, Weight};
+use crate::query::{EnableScoring, InvertedIndexRangeWeight, Query, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 
 const DEFAULT_MAX_EXPANSIONS: u32 = 50;
@@ -86,7 +86,7 @@ impl PhrasePrefixQuery {
     ///
     /// This function is the same as [`Query::weight()`] except it returns
     /// a specialized type [`PhraseQueryWeight`] instead of a Boxed trait.
-    /// If the query was only one term long, this returns `None` wherease [`Query::weight`]
+    /// If the query was only one term long, this returns `None` whereas [`Query::weight`]
     /// returns a boxed [`RangeWeight`]
     pub(crate) fn phrase_prefix_query_weight(
         &self,
@@ -145,17 +145,15 @@ impl Query for PhrasePrefixQuery {
                     Bound::Unbounded
                 };
 
-            let mut range_query = RangeQuery::new_term_bounds(
-                enable_scoring
-                    .schema()
-                    .get_field_name(self.field)
-                    .to_owned(),
-                self.prefix.1.typ(),
-                &Bound::Included(self.prefix.1.clone()),
-                &end_term,
-            );
-            range_query.limit(self.max_expansions as u64);
-            range_query.weight(enable_scoring)
+            let lower_bound = Bound::Included(self.prefix.1.clone());
+            let upper_bound = end_term;
+
+            Ok(Box::new(InvertedIndexRangeWeight::new(
+                self.field,
+                &lower_bound,
+                &upper_bound,
+                Some(self.max_expansions as u64),
+            )))
         }
     }
 

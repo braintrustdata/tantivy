@@ -1,8 +1,9 @@
 use super::Scorer;
 use crate::docset::TERMINATED;
+use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
 use crate::query::{EnableScoring, Explanation, Query, Weight};
-use crate::{DocId, DocSet, Score, Searcher, SegmentReader};
+use crate::{DocId, DocSet, Score, Searcher};
 
 /// `EmptyQuery` is a dummy `Query` in which no document matches.
 ///
@@ -54,6 +55,7 @@ impl DocSet for EmptyScorer {
 }
 
 impl Scorer for EmptyScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         0.0
     }

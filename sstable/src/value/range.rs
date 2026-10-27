@@ -1,7 +1,7 @@
 use std::io;
 use std::ops::Range;
 
-use crate::value::{deserialize_vint_u64, ValueReader, ValueWriter};
+use crate::value::{ValueReader, ValueWriter, deserialize_vint_u64};
 
 /// See module comment.
 #[derive(Default)]
@@ -78,6 +78,7 @@ impl ValueWriter for RangeValueWriter {
 }
 
 #[cfg(test)]
+#[expect(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 

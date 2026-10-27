@@ -1,8 +1,11 @@
 use std::fmt;
 use std::ops::Bound;
+use std::sync::Arc;
+
+use tantivy_fst::Regex;
 
 use crate::query::Occur;
-use crate::schema::{Field, Term, Type};
+use crate::schema::{Field, Term};
 use crate::Score;
 
 #[derive(Clone)]
@@ -14,17 +17,20 @@ pub enum LogicalLiteral {
         prefix: bool,
     },
     Range {
-        field: String,
-        value_type: Type,
         lower: Bound<Term>,
         upper: Bound<Term>,
     },
     Set {
-        field: Field,
-        value_type: Type,
         elements: Vec<Term>,
     },
     All,
+    Regex {
+        pattern: Arc<Regex>,
+        field: Field,
+    },
+    Exists {
+        field: String,
+    },
 }
 
 pub enum LogicalAst {
@@ -39,6 +45,35 @@ impl LogicalAst {
             self
         } else {
             LogicalAst::Boost(Box::new(self), boost)
+        }
+    }
+
+    // TODO: Move to rewrite_ast in query_grammar
+    pub fn simplify(self) -> LogicalAst {
+        match self {
+            LogicalAst::Clause(clauses) => {
+                let mut new_clauses: Vec<(Occur, LogicalAst)> = Vec::new();
+
+                for (occur, sub_ast) in clauses {
+                    let simplified_sub_ast = sub_ast.simplify();
+
+                    // If clauses below have the same `Occur`, we can pull them up
+                    match simplified_sub_ast {
+                        LogicalAst::Clause(sub_clauses)
+                            if (occur == Occur::Should || occur == Occur::Must)
+                                && sub_clauses.iter().all(|(o, _)| *o == occur) =>
+                        {
+                            for sub_clause in sub_clauses {
+                                new_clauses.push(sub_clause);
+                            }
+                        }
+                        _ => new_clauses.push((occur, simplified_sub_ast)),
+                    }
+                }
+
+                LogicalAst::Clause(new_clauses)
+            }
+            LogicalAst::Leaf(_) | LogicalAst::Boost(_, _) => self,
         }
     }
 }
@@ -123,6 +158,11 @@ impl fmt::Debug for LogicalLiteral {
                 write!(formatter, "]")
             }
             LogicalLiteral::All => write!(formatter, "*"),
+            LogicalLiteral::Regex {
+                ref pattern,
+                ref field,
+            } => write!(formatter, "Regex({field:?}, {pattern:?})"),
+            LogicalLiteral::Exists { ref field } => write!(formatter, "Exists({field})"),
         }
     }
 }
