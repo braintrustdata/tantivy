@@ -1,6 +1,8 @@
 use std::iter;
 
-use crate::column_index::{SerializableColumnIndex, Set};
+use crate::column_index::{
+    SerializableColumnIndex, SerializableMultivalueIndex, SerializableOptionalIndex, Set,
+};
 use crate::iterable::Iterable;
 use crate::{Cardinality, ColumnIndex, RowId, ShuffleMergeOrder};
 
@@ -14,15 +16,24 @@ pub fn merge_column_index_shuffled<'a>(
         Cardinality::Optional => {
             let non_null_row_ids =
                 merge_column_index_shuffled_optional(column_indexes, shuffle_merge_order);
-            SerializableColumnIndex::Optional {
+            SerializableColumnIndex::Optional(SerializableOptionalIndex {
                 non_null_row_ids,
                 num_rows: shuffle_merge_order.num_rows(),
-            }
+            })
         }
         Cardinality::Multivalued => {
-            let multivalue_start_index =
-                merge_column_index_shuffled_multivalued(column_indexes, shuffle_merge_order);
-            SerializableColumnIndex::Multivalued(multivalue_start_index)
+            let non_null_row_ids =
+                merge_column_index_shuffled_optional(column_indexes, shuffle_merge_order);
+            SerializableColumnIndex::Multivalued(SerializableMultivalueIndex {
+                doc_ids_with_values: SerializableOptionalIndex {
+                    non_null_row_ids,
+                    num_rows: shuffle_merge_order.num_rows(),
+                },
+                start_offsets: merge_column_index_shuffled_multivalued(
+                    column_indexes,
+                    shuffle_merge_order,
+                ),
+            })
         }
     }
 }
@@ -47,7 +58,7 @@ struct ShuffledIndex<'a> {
     merge_order: &'a ShuffleMergeOrder,
 }
 
-impl<'a> Iterable<u32> for ShuffledIndex<'a> {
+impl Iterable<u32> for ShuffledIndex<'_> {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
         Box::new(
             self.merge_order
@@ -102,14 +113,21 @@ fn iter_num_values<'a>(
 
 /// Transforms an iterator containing the number of vals per row (with `num_rows` elements)
 /// into a `start_offset` iterator starting at 0 and (with `num_rows + 1` element)
+///
+/// This will filter values with 0 values as these are covered by the optional index in the
+/// multivalue index.
 fn integrate_num_vals(num_vals: impl Iterator<Item = u32>) -> impl Iterator<Item = RowId> {
-    iter::once(0u32).chain(num_vals.scan(0, |state, num_vals| {
-        *state += num_vals;
-        Some(*state)
-    }))
+    iter::once(0u32).chain(
+        num_vals
+            .filter(|num_vals| *num_vals != 0)
+            .scan(0, |state, num_vals| {
+                *state += num_vals;
+                Some(*state)
+            }),
+    )
 }
 
-impl<'a> Iterable<u32> for ShuffledMultivaluedIndex<'a> {
+impl Iterable<u32> for ShuffledMultivaluedIndex<'_> {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
         let num_vals_per_row = iter_num_values(self.column_indexes, self.merge_order);
         Box::new(integrate_num_vals(num_vals_per_row))
@@ -119,8 +137,8 @@ impl<'a> Iterable<u32> for ShuffledMultivaluedIndex<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::column_index::OptionalIndex;
     use crate::RowAddr;
+    use crate::column_index::OptionalIndex;
 
     #[test]
     fn test_integrate_num_vals_empty() {
@@ -134,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_integrate_num_vals_several() {
-        assert!(integrate_num_vals([3, 0, 10, 20].into_iter()).eq([0, 3, 3, 13, 33].into_iter()));
+        assert!(integrate_num_vals([3, 0, 10, 20].into_iter()).eq([0, 3, 13, 33].into_iter()));
     }
 
     #[test]
@@ -157,10 +175,10 @@ mod tests {
             Cardinality::Optional,
             &shuffle_merge_order,
         );
-        let SerializableColumnIndex::Optional {
+        let SerializableColumnIndex::Optional(SerializableOptionalIndex {
             non_null_row_ids,
             num_rows,
-        } = serializable_index
+        }) = serializable_index
         else {
             panic!()
         };

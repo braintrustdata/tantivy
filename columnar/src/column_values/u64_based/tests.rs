@@ -1,5 +1,6 @@
 use proptest::prelude::*;
 use proptest::{prop_oneof, proptest};
+use rand::Rng;
 
 #[test]
 fn test_serialize_and_load_simple() {
@@ -120,8 +121,24 @@ pub(crate) fn create_and_validate<TColumnCodec: ColumnCodec>(
     reader.get_vals(&all_docs, &mut buffer);
     assert_eq!(vals, buffer);
 
+    // Validate `get_range` over the full column and a sub-range. The sub-range starts
+    // at a non-zero offset to exercise the entrance-ramp alignment of the batch decode.
+    buffer.resize(all_docs.len(), 0);
+    reader.get_range(0, &mut buffer);
+    assert_eq!(vals, buffer, "get_range (full) mismatch in data set {name}");
+    if vals.len() >= 2 {
+        let start = 1usize;
+        buffer.resize(vals.len() - start, 0);
+        reader.get_range(start as u64, &mut buffer);
+        assert_eq!(
+            &vals[start..],
+            &buffer[..],
+            "get_range (sub-range) mismatch in data set {name}"
+        );
+    }
+
     if !vals.is_empty() {
-        let test_rand_idx = rand::thread_rng().gen_range(0..=vals.len() - 1);
+        let test_rand_idx = rand::rng().random_range(0..=vals.len() - 1);
         let expected_positions: Vec<u32> = vals
             .iter()
             .enumerate()

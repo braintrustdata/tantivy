@@ -4,14 +4,16 @@
 //! `IndexWriter` is the main entry point for that, which created from
 //! [`Index::writer`](crate::Index::writer).
 
+/// Delete queue implementation for broadcasting delete operations to consumers.
 pub(crate) mod delete_queue;
 pub(crate) mod path_to_unordered_id;
 
-pub(crate) mod doc_id_mapping;
+pub mod doc_id_mapping;
 mod doc_opstamp_mapping;
 mod flat_map_with_buffer;
 pub(crate) mod index_writer;
 pub(crate) mod index_writer_status;
+pub(crate) mod indexing_term;
 mod log_merge_policy;
 mod merge_operation;
 pub(crate) mod merge_policy;
@@ -22,7 +24,6 @@ pub(crate) mod prepared_commit;
 mod segment_entry;
 mod segment_manager;
 mod segment_register;
-pub(crate) mod segment_serializer;
 pub(crate) mod segment_updater;
 pub(crate) mod segment_writer;
 pub(crate) mod single_segment_index_writer;
@@ -31,15 +32,14 @@ mod stamper;
 use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
-pub use self::index_writer::IndexWriter;
+pub use self::doc_id_mapping::DocIdMapping;
+pub use self::index_writer::{advance_deletes, IndexWriter, IndexWriterOptions};
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
-use self::operation::AddOperation;
-pub use self::operation::UserOperation;
+pub use self::operation::{AddOperation, DeleteOperation, UserOperation};
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
-pub(crate) use self::segment_serializer::SegmentSerializer;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};
 pub use self::segment_writer::SegmentWriter;
 pub use self::single_segment_index_writer::SingleSegmentIndexWriter;
@@ -61,6 +61,8 @@ type AddBatchReceiver<D> = channel::Receiver<AddBatch<D>>;
 #[cfg(test)]
 mod tests_mmap {
 
+    use common::ByteCount;
+
     use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::agg_result::AggregationResults;
     use crate::aggregation::AggregationCollector;
@@ -68,6 +70,7 @@ mod tests_mmap {
     use crate::index::FieldMetadata;
     use crate::query::{AllQuery, QueryParser};
     use crate::schema::{JsonObjectOptions, Schema, Type, FAST, INDEXED, STORED, TEXT};
+    use crate::tokenizer::RAW_TOKENIZER_NAME;
     use crate::{Index, IndexWriter, Term};
 
     #[test]
@@ -145,24 +148,45 @@ mod tests_mmap {
         }
     }
     #[test]
-    fn test_json_field_null_byte() {
-        // Test when field name contains a zero byte, which has special meaning in tantivy.
-        // As a workaround, we convert the zero byte to the ASCII character '0'.
-        // https://github.com/quickwit-oss/tantivy/issues/2340
-        // https://github.com/quickwit-oss/tantivy/issues/2193
-        let field_name_in = "\u{0000}";
-        let field_name_out = "0";
-        test_json_field_name(field_name_in, field_name_out);
+    fn test_json_field_null_byte_is_ignored() {
+        let mut schema_builder = Schema::builder();
+        let options = JsonObjectOptions::from(TEXT | FAST).set_expand_dots_enabled();
+        let field = schema_builder.add_json_field("json", options);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(field=>json!({"key": "test1", "invalidkey\u{0000}": "test2"})))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let inv_indexer = segment_reader.inverted_index(field).unwrap();
+        let term_dict = inv_indexer.terms();
+        assert_eq!(term_dict.num_terms(), 1);
+        let mut term_bytes = Vec::new();
+        term_dict.ord_to_term(0, &mut term_bytes).unwrap();
+        assert_eq!(term_bytes, b"key\0stest1");
     }
+
     #[test]
     fn test_json_field_1byte() {
-        // Test when field name contains a 1 byte, which has special meaning in tantivy.
+        // Test when field name contains a '1' byte, which has special meaning in tantivy.
+        // The 1 byte can be addressed as '1' byte or '.'.
         let field_name_in = "\u{0001}";
         let field_name_out = "\u{0001}";
         test_json_field_name(field_name_in, field_name_out);
 
-        // Test when field name contains a 1 byte, which has special meaning in tantivy.
+        // Test when field name contains a '1' byte, which has special meaning in tantivy.
         let field_name_in = "\u{0001}";
+        let field_name_out = ".";
+        test_json_field_name(field_name_in, field_name_out);
+    }
+
+    #[test]
+    fn test_json_field_dot() {
+        // Test when field name contains a '.'
+        let field_name_in = ".";
         let field_name_out = ".";
         test_json_field_name(field_name_in, field_name_out);
     }
@@ -174,7 +198,7 @@ mod tests_mmap {
         let index = Index::create_in_ram(schema_builder.build());
         let mut index_writer = index.writer_for_tests().unwrap();
         index_writer
-            .add_document(doc!(field=>json!({format!("{field_name_in}"): "test1"})))
+            .add_document(doc!(field=>json!({field_name_in.to_string(): "test1", format!("num{field_name_in}"): 10})))
             .unwrap();
         index_writer
             .add_document(doc!(field=>json!({format!("a{field_name_in}"): "test2"})))
@@ -205,10 +229,10 @@ mod tests_mmap {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let parse_query = QueryParser::for_index(&index, Vec::new());
-        let test_query = |field_name: &str| {
-            let query = parse_query.parse_query(field_name).unwrap();
+        let test_query = |query_str: &str| {
+            let query = parse_query.parse_query(query_str).unwrap();
             let num_docs = searcher.search(&query, &Count).unwrap();
-            assert_eq!(num_docs, 1);
+            assert_eq!(num_docs, 1, "{query_str}");
         };
         test_query(format!("json.{field_name_out}:test1").as_str());
         test_query(format!("json.a{field_name_out}:test2").as_str());
@@ -252,6 +276,67 @@ mod tests_mmap {
             "test6",
         );
         test_agg(format!("json.{field_name_out}a").as_str(), "test7");
+
+        // `.` is stored as `\u{0001}` internally in tantivy
+        let field_name_out_internal = if field_name_out == "." {
+            "\u{0001}"
+        } else {
+            field_name_out
+        };
+
+        let mut fields: Vec<(String, Type)> = reader.searcher().segment_readers()[0]
+            .inverted_index(field)
+            .unwrap()
+            .list_encoded_json_fields()
+            .unwrap()
+            .into_iter()
+            .map(|field_space| (field_space.field_name, field_space.field_type))
+            .collect();
+        assert_eq!(fields.len(), 8);
+        fields.sort();
+        let mut expected_fields = vec![
+            (format!("a{field_name_out_internal}"), Type::Str),
+            (format!("a{field_name_out_internal}a"), Type::Str),
+            (
+                format!("a{field_name_out_internal}a{field_name_out_internal}"),
+                Type::Str,
+            ),
+            (
+                format!("a{field_name_out_internal}\u{1}ab{field_name_out_internal}"),
+                Type::Str,
+            ),
+            (
+                format!("a{field_name_out_internal}\u{1}a{field_name_out_internal}"),
+                Type::Str,
+            ),
+            (format!("{field_name_out_internal}a"), Type::Str),
+            (field_name_out_internal.to_string(), Type::Str),
+            (format!("num{field_name_out_internal}"), Type::I64),
+        ];
+        expected_fields.sort();
+        assert_eq!(fields, expected_fields);
+        // Check columnar reader
+        let mut columns = reader.searcher().segment_readers()[0]
+            .fast_fields()
+            .columnar()
+            .list_columns()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        let mut expected_columns = vec![
+            format!("json\u{1}{field_name_out_internal}"),
+            format!("json\u{1}{field_name_out_internal}a"),
+            format!("json\u{1}a{field_name_out_internal}"),
+            format!("json\u{1}a{field_name_out_internal}a"),
+            format!("json\u{1}a{field_name_out_internal}a{field_name_out_internal}"),
+            format!("json\u{1}a{field_name_out_internal}\u{1}ab{field_name_out_internal}"),
+            format!("json\u{1}a{field_name_out_internal}\u{1}a{field_name_out_internal}"),
+            format!("json\u{1}num{field_name_out_internal}"),
+        ];
+        columns.sort();
+        expected_columns.sort();
+        assert_eq!(columns, expected_columns);
     }
 
     #[test]
@@ -307,7 +392,12 @@ mod tests_mmap {
         let reader = &searcher.segment_readers()[0];
         let inverted_index = reader.inverted_index(json_field).unwrap();
         assert_eq!(
-            inverted_index.list_encoded_fields().unwrap(),
+            inverted_index
+                .list_encoded_json_fields()
+                .unwrap()
+                .into_iter()
+                .map(|field_space| (field_space.field_name, field_space.field_type))
+                .collect::<Vec<_>>(),
             [
                 ("k8s.container.name".to_string(), Type::Str),
                 ("sub\u{1}a".to_string(), Type::I64),
@@ -324,24 +414,47 @@ mod tests_mmap {
     fn test_json_fields_metadata_expanded_dots_one_segment() {
         test_json_fields_metadata(true, true);
     }
+
     #[test]
     fn test_json_fields_metadata_expanded_dots_multi_segment() {
         test_json_fields_metadata(true, false);
     }
+
     #[test]
     fn test_json_fields_metadata_no_expanded_dots_one_segment() {
         test_json_fields_metadata(false, true);
     }
+
     #[test]
     fn test_json_fields_metadata_no_expanded_dots_multi_segment() {
         test_json_fields_metadata(false, false);
     }
 
+    #[track_caller]
+    fn assert_size_eq(lhs: Option<ByteCount>, rhs: Option<ByteCount>) {
+        let ignore_actual_values = |size_opt: Option<ByteCount>| size_opt.map(|val| val > 0);
+        assert_eq!(ignore_actual_values(lhs), ignore_actual_values(rhs));
+    }
+
+    #[track_caller]
+    fn assert_field_metadata_eq_but_ignore_field_size(
+        expected: &FieldMetadata,
+        actual: &FieldMetadata,
+    ) {
+        assert_eq!(&expected.field_name, &actual.field_name);
+        assert_eq!(&expected.typ, &actual.typ);
+        assert_eq!(&expected.stored, &actual.stored);
+        assert_size_eq(expected.postings_size, actual.postings_size);
+        assert_size_eq(expected.positions_size, actual.positions_size);
+        assert_size_eq(expected.fast_size, actual.fast_size);
+    }
+
     fn test_json_fields_metadata(expanded_dots: bool, one_segment: bool) {
         use pretty_assertions::assert_eq;
         let mut schema_builder = Schema::builder();
-        let json_options: JsonObjectOptions =
-            JsonObjectOptions::from(TEXT).set_fast(None).set_stored();
+        let json_options: JsonObjectOptions = JsonObjectOptions::from(TEXT)
+            .set_fast(RAW_TOKENIZER_NAME)
+            .set_stored();
         let json_options = if expanded_dots {
             json_options.set_expand_dots_enabled()
         } else {
@@ -375,81 +488,101 @@ mod tests_mmap {
         assert_eq!(searcher.num_docs(), 3);
 
         let fields_metadata = index.fields_metadata().unwrap();
-        assert_eq!(
-            fields_metadata,
-            [
-                FieldMetadata {
-                    field_name: "empty".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::U64
+
+        let expected_fields = &[
+            FieldMetadata {
+                field_name: "empty".to_string(),
+                stored: true,
+                typ: Type::U64,
+                term_dictionary_size: Some(0u64.into()),
+                fast_size: Some(1u64.into()),
+                postings_size: Some(0u64.into()),
+                positions_size: Some(0u64.into()),
+            },
+            FieldMetadata {
+                field_name: if expanded_dots {
+                    "json.shadow.k8s.container.name".to_string()
+                } else {
+                    "json.shadow.k8s\\.container\\.name".to_string()
                 },
-                FieldMetadata {
-                    field_name: if expanded_dots {
-                        "json.shadow.k8s.container.name".to_string()
-                    } else {
-                        "json.shadow.k8s\\.container\\.name".to_string()
-                    },
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::Str
-                },
-                FieldMetadata {
-                    field_name: "json.shadow.sub.a".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::I64
-                },
-                FieldMetadata {
-                    field_name: "json.shadow.sub.b".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::I64
-                },
-                FieldMetadata {
-                    field_name: "json.shadow.suber.a".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::I64
-                },
-                FieldMetadata {
-                    field_name: "json.shadow.suber.a".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::Str
-                },
-                FieldMetadata {
-                    field_name: "json.shadow.suber.b".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::I64
-                },
-                FieldMetadata {
-                    field_name: "json.shadow.val".to_string(),
-                    indexed: true,
-                    stored: true,
-                    fast: true,
-                    typ: Type::Str
-                },
-                FieldMetadata {
-                    field_name: "numbers".to_string(),
-                    indexed: false,
-                    stored: false,
-                    fast: true,
-                    typ: Type::U64
-                }
-            ]
-        );
+                stored: true,
+                typ: Type::Str,
+                term_dictionary_size: Some(1u64.into()),
+                fast_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "json.shadow.sub.a".to_string(),
+                typ: Type::I64,
+                stored: true,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "json.shadow.sub.b".to_string(),
+                typ: Type::I64,
+                stored: true,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "json.shadow.suber.a".to_string(),
+                stored: true,
+                typ: Type::I64,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "json.shadow.suber.a".to_string(),
+                typ: Type::Str,
+                stored: true,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "json.shadow.suber.b".to_string(),
+                typ: Type::I64,
+                stored: true,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "json.shadow.val".to_string(),
+                typ: Type::Str,
+                stored: true,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: Some(1u64.into()),
+                postings_size: Some(1u64.into()),
+                positions_size: Some(1u64.into()),
+            },
+            FieldMetadata {
+                field_name: "numbers".to_string(),
+                stored: false,
+                typ: Type::U64,
+                fast_size: Some(1u64.into()),
+                term_dictionary_size: None,
+                postings_size: None,
+                positions_size: None,
+            },
+        ];
+        assert_eq!(fields_metadata.len(), expected_fields.len());
+        for (expected, value) in expected_fields.iter().zip(fields_metadata.iter()) {
+            assert_field_metadata_eq_but_ignore_field_size(expected, value);
+        }
         let query_parser = QueryParser::for_index(&index, vec![]);
         // Test if returned field name can be queried
-        for indexed_field in fields_metadata.iter().filter(|meta| meta.indexed) {
+        for indexed_field in fields_metadata.iter().filter(|meta| meta.is_indexed()) {
             let val = if indexed_field.typ == Type::Str {
                 "a"
             } else {
@@ -457,7 +590,9 @@ mod tests_mmap {
             };
             let query_str = &format!("{}:{}", indexed_field.field_name, val);
             let query = query_parser.parse_query(query_str).unwrap();
-            let count_docs = searcher.search(&*query, &TopDocs::with_limit(2)).unwrap();
+            let count_docs = searcher
+                .search(&*query, &TopDocs::with_limit(2).order_by_score())
+                .unwrap();
             if indexed_field.field_name.contains("empty") || indexed_field.typ == Type::Json {
                 assert_eq!(count_docs.len(), 0);
             } else {
@@ -465,7 +600,10 @@ mod tests_mmap {
             }
         }
         // Test if returned field name can be used for aggregation
-        for fast_field in fields_metadata.iter().filter(|meta| meta.fast) {
+        for fast_field in fields_metadata
+            .iter()
+            .filter(|field_metadata| field_metadata.is_fast())
+        {
             let agg_req_str = json!(
             {
               "termagg": {
@@ -498,8 +636,9 @@ mod tests_mmap {
         /// affect the field name itself.
         use pretty_assertions::assert_eq;
         let mut schema_builder = Schema::builder();
-        let json_options: JsonObjectOptions =
-            JsonObjectOptions::from(TEXT).set_fast(None).set_stored();
+        let json_options: JsonObjectOptions = JsonObjectOptions::from(TEXT)
+            .set_fast(RAW_TOKENIZER_NAME)
+            .set_stored();
         // let json_options = json_options.set_expand_dots_enabled();
         let json_field_shadow = schema_builder.add_json_field("json.shadow", json_options.clone());
         let json_field = schema_builder.add_json_field("json", json_options.clone());
@@ -524,10 +663,12 @@ mod tests_mmap {
         let query_parser = QueryParser::for_index(&index, vec![]);
         // Test if field name can be queried
         for (indexed_field, val) in fields_and_vals.iter() {
-            let query_str = &format!("{}:{}", indexed_field, val);
+            let query_str = &format!("{indexed_field}:{val}");
             let query = query_parser.parse_query(query_str).unwrap();
-            let count_docs = searcher.search(&*query, &TopDocs::with_limit(2)).unwrap();
-            assert!(!count_docs.is_empty(), "{}:{}", indexed_field, val);
+            let count_docs = searcher
+                .search(&*query, &TopDocs::with_limit(2).order_by_score())
+                .unwrap();
+            assert!(!count_docs.is_empty(), "{indexed_field}:{val}");
         }
         // Test if field name can be used for aggregation
         for (field_name, val) in fields_and_vals.iter() {

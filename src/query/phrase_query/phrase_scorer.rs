@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::docset::{DocSet, TERMINATED};
+use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::Postings;
 use crate::query::bm25::Bm25Weight;
@@ -43,6 +43,9 @@ impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
     }
 }
 
+/// Scores the documents where the terms of a phrase occur at their offsets
+/// (within `slop`), with BM25 over the phrase count when a similarity weight
+/// is given. Each position is any [`Postings`], e.g. a union of several terms.
 pub struct PhraseScorer<TPostings: Postings> {
     intersection_docset: Intersection<PostingsWithOffset<TPostings>, PostingsWithOffset<TPostings>>,
     num_terms: usize,
@@ -219,8 +222,8 @@ fn intersection_exists_with_slop(
 /// In contrast to the regular algorithm this solves some issues:
 /// - Keep track of the slop so far. Slop is a budget that is spent on the distance between terms.
 /// - When encountering a match between two positions, which position is the best match is unclear
-/// and depends on intersections afterwards, therefore this algorithm keeps left and right as
-/// matches, but only counts one.
+///   and depends on intersections afterwards, therefore this algorithm keeps left and right as
+///   matches, but only counts one.
 ///
 /// This algorithm may return an incorrect count in some cases (e.g. left, right expansion and is
 /// then matches both on the following term.)
@@ -345,7 +348,13 @@ fn intersection_count_with_carrying_slop(
 }
 
 impl<TPostings: Postings> PhraseScorer<TPostings> {
-    // If similarity_weight is None, then scoring is disabled.
+    /// A scorer over `term_postings` (each with its offset in the phrase),
+    /// positioned on the first match. If `similarity_weight_opt` is None,
+    /// then scoring is disabled (every match scores 1).
+    ///
+    /// # Panics
+    ///
+    /// If `term_postings` has fewer than two postings. A phrase of one term is a term query.
     pub fn new(
         term_postings: Vec<(usize, TPostings)>,
         similarity_weight_opt: Option<Bm25Weight>,
@@ -368,6 +377,43 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         slop: u32,
         offset: usize,
     ) -> PhraseScorer<TPostings> {
+        let (seek_result, mut scorer) = Self::new_danger(
+            term_postings_with_offset,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+            offset,
+            0,
+        );
+        if let SeekDangerResult::SeekLowerBound(target) = seek_result {
+            if target < TERMINATED {
+                scorer.seek(target);
+            }
+        }
+        scorer
+    }
+
+    /// Creates a phrase scorer near `target` without scanning forward to the next phrase match.
+    ///
+    /// On a miss, the scorer follows the danger-state contract: it must only receive further
+    /// `seek_danger` calls until one returns [`SeekDangerResult::Found`].
+    pub(crate) fn new_danger(
+        mut term_postings_with_offset: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+        offset: usize,
+        target: DocId,
+    ) -> (SeekDangerResult, PhraseScorer<TPostings>) {
+        for (_, postings) in &mut term_postings_with_offset {
+            if postings.doc() < target {
+                // We do not optimize for that seek.
+                // This would require a constructor Intersection::new that
+                // accepts postings in the danger zone and we prefer to avoid that.
+                postings.seek(target);
+            }
+        }
+        let num_docs = fieldnorm_reader.num_docs();
         let max_offset = term_postings_with_offset
             .iter()
             .map(|&(offset, _)| offset)
@@ -381,8 +427,9 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
             })
             .collect::<Vec<_>>();
+        let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
         let mut scorer = PhraseScorer {
-            intersection_docset: Intersection::new(postings_with_offsets),
+            intersection_docset,
             num_terms: num_docsets,
             left_positions: Vec::with_capacity(100),
             right_positions: Vec::with_capacity(100),
@@ -394,12 +441,22 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
         };
-        if scorer.doc() != TERMINATED && !scorer.phrase_match() {
-            scorer.advance();
-        }
-        scorer
+        let doc = scorer.doc();
+        debug_assert!(doc >= target);
+        let seek_result = if doc >= TERMINATED {
+            SeekDangerResult::SeekLowerBound(TERMINATED)
+        } else if doc > target {
+            SeekDangerResult::SeekLowerBound(doc)
+        } else if scorer.phrase_match() {
+            SeekDangerResult::Found
+        } else {
+            SeekDangerResult::SeekLowerBound(target + 1)
+        };
+        (seek_result, scorer)
     }
 
+    /// The number of phrase matches in the current document (computed when
+    /// scoring is enabled).
     pub fn phrase_count(&self) -> u32 {
         self.phrase_count
     }
@@ -528,16 +585,51 @@ impl<TPostings: Postings> DocSet for PhraseScorer<TPostings> {
         self.advance()
     }
 
+    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        debug_assert!(
+            target >= self.doc(),
+            "target ({}) should be greater than or equal to doc ({})",
+            target,
+            self.doc()
+        );
+        let seek_res = self.intersection_docset.seek_danger(target);
+        if seek_res != SeekDangerResult::Found {
+            return seek_res;
+        }
+        // The intersection matched. Now let's see if we match the phrase.
+        if self.phrase_match() {
+            SeekDangerResult::Found
+        } else {
+            SeekDangerResult::SeekLowerBound(target + 1)
+        }
+    }
+
     fn doc(&self) -> DocId {
         self.intersection_docset.doc()
     }
 
     fn size_hint(&self) -> u32 {
-        self.intersection_docset.size_hint()
+        // We adjust the intersection estimate, since actual phrase hits are much lower than where
+        // the all appear.
+        // The estimate should depend on average field length, e.g. if the field is really short
+        // a phrase hit is more likely
+        self.intersection_docset.size_hint() / (10 * self.num_terms as u32)
+    }
+
+    /// Returns a best-effort hint of the
+    /// cost to drive the docset.
+    fn cost(&self) -> u64 {
+        // While determing a potential hit is cheap for phrases, evaluating an actual hit is
+        // expensive since it requires to load positions for a doc and check if they are next to
+        // each other.
+        // So the cost estimation would be the number of times we need to check if a doc is a hit *
+        // 10 * self.num_terms.
+        self.intersection_docset.size_hint() as u64 * 10 * self.num_terms as u64
     }
 }
 
 impl<TPostings: Postings> Scorer for PhraseScorer<TPostings> {
+    #[inline]
     fn score(&mut self) -> Score {
         let doc = self.doc();
         let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(doc);

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
 use std::io::Write;
@@ -12,7 +13,9 @@ use super::segment_manager::SegmentManager;
 use crate::core::META_FILEPATH;
 use crate::directory::{Directory, DirectoryClone, GarbageCollectionResult};
 use crate::fastfield::AliveBitSet;
-use crate::index::{Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta};
+use crate::index::{
+    Index, IndexMeta, IndexSettings, Segment, SegmentId, SegmentMeta,
+};
 use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
@@ -21,19 +24,17 @@ use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
     DefaultMergePolicy, MergeCandidate, MergeOperation, MergePolicy, SegmentEntry,
-    SegmentSerializer,
 };
-use crate::{FutureResult, Opstamp};
+use crate::{FutureResult, Opstamp, TantivyError};
 
 pub(crate) const DEFAULT_NUM_MERGE_THREADS: usize = 4;
+const PANIC_CAUGHT: &str = "Panic caught in merge thread";
 
 /// Save the index meta file.
 /// This operation is atomic:
 /// Either
-///  - it fails, in which case an error is returned,
-/// and the `meta.json` remains untouched,
-/// - it success, and `meta.json` is written
-/// and flushed.
+/// - it fails, in which case an error is returned, and the `meta.json` remains untouched,
+/// - it success, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
 pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
@@ -42,10 +43,7 @@ pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate:
     // Just adding a new line at the end of the buffer.
     writeln!(&mut buffer)?;
     crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            msg.unwrap_or_else(|| "Undefined".to_string())
-        )
+        std::io::Error::other(msg.unwrap_or_else(|| "Undefined".to_string()))
     )));
     directory.sync_directory()?;
     directory.atomic_write(&META_FILEPATH, &buffer[..])?;
@@ -141,11 +139,8 @@ fn merge(
         .in_scope(|| IndexMerger::open(index.schema(), index.settings().clone(), &segments[..]))?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = tracing::info_span!("open_segment_serializer")
-        .in_scope(|| SegmentSerializer::for_segment(merged_segment.clone(), true))?;
-
     let num_docs = tracing::info_span!("write_merged_segment")
-        .in_scope(|| merger.write(segment_serializer, Some(merge_thread_pool)))?;
+        .in_scope(|| merger.write(&merged_segment, Some(merge_thread_pool)))?;
 
     let merged_segment_id = merged_segment.id();
 
@@ -171,6 +166,10 @@ fn merge(
 /// This function does NOT check or take the `IndexWriter` is running. It is not
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
+///
+/// Every custom [`SegmentPlugin`](crate::SegmentPlugin) must be registered on the source
+/// indices, and all source indices must register the same plugin set; the merge errors
+/// otherwise. The merged output carries that shared plugin set forward.
 #[doc(hidden)]
 pub fn merge_indices<T: Into<Box<dyn Directory>>>(
     indices: &[Index],
@@ -217,6 +216,10 @@ pub fn merge_indices<T: Into<Box<dyn Directory>>>(
 /// This function does NOT check or take the `IndexWriter` is running. It is not
 /// meant to work if you have an `IndexWriter` running for the origin indices, or
 /// the destination `Index`.
+///
+/// Every custom [`SegmentPlugin`](crate::SegmentPlugin) must be registered on the segments'
+/// source indices, and all of those indices must register the same plugin set; the merge
+/// errors otherwise. The merged output carries that shared plugin set forward.
 #[doc(hidden)]
 pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     segments: &[Segment],
@@ -244,21 +247,33 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         ));
     }
 
+    // The source index's writer was already validated against its recorded plugin
+    // set (else `MissingPlugin`); the merger reuses those registered plugins.
+    let merger = IndexMerger::open_with_custom_alive_set(
+        target_schema.clone(),
+        target_settings.clone(),
+        segments,
+        filter_doc_ids,
+    )?;
+
     let mut merged_index = Index::create(
         output_directory,
         target_schema.clone(),
         target_settings.clone(),
     )?;
+
+    // Carry the merger's custom plugins onto the merged index (built-ins come for free) and
+    // record their extensions as the merged index's required set; without this the first GC
+    // drops the merged files.
+    let mut persisted_custom_extensions: Vec<String> = Vec::new();
+    for plugin in merger.custom_plugins() {
+        persisted_custom_extensions.extend(plugin.extensions().iter().map(|ext| ext.to_string()));
+        merged_index.register_plugin(plugin.clone());
+    }
+
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
-        merged_index.schema(),
-        merged_index.settings().clone(),
-        segments,
-        filter_doc_ids,
-    )?;
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment, true)?;
-    let num_docs = merger.write(segment_serializer, None)?;
+    let num_docs = merger.write(&merged_segment, None)?;
 
     let dictionary_path = target_settings
         .docstore_compression
@@ -281,6 +296,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
 
     let index_meta = IndexMeta {
         index_settings: target_settings, // index_settings of all segments should be the same
+        persisted_custom_extensions,
         segments: vec![segment_meta],
         schema: target_schema,
         opstamp: 0u64,
@@ -317,14 +333,6 @@ impl SegmentUpdater {
         index: Index,
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
-    ) -> crate::Result<SegmentUpdater> {
-        Self::create_with_merge_threads(index, stamper, delete_cursor, DEFAULT_NUM_MERGE_THREADS)
-    }
-
-    pub(crate) fn create_with_merge_threads(
-        index: Index,
-        stamper: Stamper,
-        delete_cursor: &DeleteCursor,
         num_merge_threads: usize,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
@@ -341,6 +349,15 @@ impl SegmentUpdater {
         let merge_thread_pool = ThreadPoolBuilder::new()
             .thread_name(|i| format!("merge_thread_{i}"))
             .num_threads(num_merge_threads.max(1))
+            .panic_handler(move |panic| {
+                // We don't print the panic content itself,
+                // it is already printed during the unwinding
+                if let Some(message) = panic.downcast_ref::<&str>() {
+                    if *message != PANIC_CAUGHT {
+                        error!("uncaught merge panic")
+                    }
+                }
+            })
             .build()
             .map_err(|_| {
                 crate::TantivyError::SystemError(
@@ -432,7 +449,7 @@ impl SegmentUpdater {
         if self.is_alive() {
             let index = &self.index;
             let directory = index.directory();
-            let mut commited_segment_metas = self.segment_manager.committed_segment_metas();
+            let mut committed_segment_metas = self.segment_manager.committed_segment_metas();
 
             // We sort segment_readers by number of documents.
             // This is an heuristic to make multithreading more efficient.
@@ -447,10 +464,13 @@ impl SegmentUpdater {
             // from the different drives.
             //
             // Segment 1 from disk 1, Segment 1 from disk 2, etc.
-            commited_segment_metas.sort_by_key(|segment_meta| -(segment_meta.max_doc() as i32));
+            committed_segment_metas
+                .sort_by_key(|segment_meta| std::cmp::Reverse(segment_meta.max_doc()));
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
-                segments: commited_segment_metas,
+                // The required plugin set is fixed at index creation; carry it forward.
+                persisted_custom_extensions: self.load_meta().persisted_custom_extensions.clone(),
+                segments: committed_segment_metas,
                 schema: index.schema(),
                 opstamp,
                 payload: commit_message,
@@ -472,11 +492,14 @@ impl SegmentUpdater {
     /// This does not include lock files, or files that are obsolete
     /// but have not yet been deleted by the garbage collector.
     fn list_files(&self) -> HashSet<PathBuf> {
+        // All tracked segments (including in-flight ones), so GC keeps files for segments
+        // not yet in the committed meta. Custom extensions come from the persisted record
+        // (not the live registry), so GC is correct even before a plugin is re-registered.
         let segment_metas = self.index.list_all_segment_metas();
-        let mut files: HashSet<PathBuf> = segment_metas
-            .iter()
-            .flat_map(|segment_meta| self.index.list_segment_files(segment_meta))
-            .collect();
+        let mut files = self.index.list_segment_files_with_artifacts(
+            &segment_metas,
+            &self.load_meta().persisted_custom_extensions,
+        );
         files.insert(META_FILEPATH.to_path_buf());
         // The dictionary is a sibling asset referenced by path from `IndexSettings`/`SegmentMeta`,
         // not from any segment's file list -- without this it's invisible to GC and gets swept
@@ -564,8 +587,7 @@ impl SegmentUpdater {
             Ok(segment_entries) => segment_entries,
             Err(err) => {
                 warn!(
-                    "Starting the merge failed for the following reason. This is not fatal. {}",
-                    err
+                    "Starting the merge failed for the following reason. This is not fatal. {err}"
                 );
                 return err.into();
             }
@@ -588,12 +610,35 @@ impl SegmentUpdater {
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
             // candidate for another merge.
-            match merge(
-                &segment_updater.index,
-                &segment_updater.merge_thread_pool,
-                segment_entries,
-                merge_operation.target_opstamp(),
-            ) {
+            let merge_panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                merge(
+                    &segment_updater.index,
+                    &segment_updater.merge_thread_pool,
+                    segment_entries,
+                    merge_operation.target_opstamp(),
+                )
+            }));
+            let merge_res = match merge_panic_res {
+                Ok(merge_res) => merge_res,
+                Err(panic_err) => {
+                    let panic_str = if let Some(msg) = panic_err.downcast_ref::<&str>() {
+                        *msg
+                    } else if let Some(msg) = panic_err.downcast_ref::<String>() {
+                        msg.as_str()
+                    } else {
+                        "UNKNOWN"
+                    };
+                    let _send_result = merging_future_send.send(Err(TantivyError::SystemError(
+                        format!("Merge thread panicked: {panic_str}"),
+                    )));
+                    // Resume unwinding because we forced unwind safety with
+                    // `std::panic::AssertUnwindSafe` Use a specific message so
+                    // the panic_handler can double check that we properly caught the panic.
+                    let boxed_panic_message: Box<dyn Any + Send> = Box::new(PANIC_CAUGHT);
+                    std::panic::resume_unwind(boxed_panic_message);
+                }
+            };
+            match merge_res {
                 Ok(after_merge_segment_entry) => {
                     let res = segment_updater.end_merge(merge_operation, after_merge_segment_entry);
                     let _send_result = merging_future_send.send(res);
@@ -622,7 +667,13 @@ impl SegmentUpdater {
     }
 
     fn consider_merge_options(&self) {
-        let (committed_segments, uncommitted_segments) = self.get_mergeable_segments();
+        let (mut committed_segments, mut uncommitted_segments) = self.get_mergeable_segments();
+        if committed_segments.len() == 1 && committed_segments[0].num_deleted_docs() == 0 {
+            committed_segments.clear();
+        }
+        if uncommitted_segments.len() == 1 && uncommitted_segments[0].num_deleted_docs() == 0 {
+            uncommitted_segments.clear();
+        }
 
         // Committed segments cannot be merged with uncommitted_segments.
         // We therefore consider merges using these two sets of segments independently.
@@ -691,9 +742,6 @@ impl SegmentUpdater {
                                     merge_operation.segment_ids(),
                                     advance_deletes_err
                                 );
-                                assert!(!cfg!(test), "Merge failed.");
-
-                                // ... cancel merge
                                 // `merge_operations` are tracked. As it is dropped, the
                                 // the segment_ids will be available again for merge.
                                 return Err(advance_deletes_err);
@@ -754,6 +802,7 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::directory::RamDirectory;
     use crate::fastfield::AliveBitSet;
+    use crate::index::{SegmentId, SegmentMetaInventory};
     use crate::indexer::merge_policy::tests::MergeWheneverPossible;
     use crate::indexer::merger::IndexMerger;
     use crate::indexer::segment_updater::merge_filtered_segments;
@@ -792,6 +841,22 @@ mod tests {
 
         let results: Vec<_> = rx.iter().collect();
         assert_eq!(results.len(), 8);
+    }
+
+    #[test]
+    fn test_segment_sort_large_max_doc() {
+        // Regression test: -(max_doc as i32) overflows for max_doc >= 2^31.
+        // Using std::cmp::Reverse avoids this.
+        let inventory = SegmentMetaInventory::default();
+        let mut metas = [
+            inventory.new_segment_meta(SegmentId::generate_random(), 100),
+            inventory.new_segment_meta(SegmentId::generate_random(), (1u32 << 31) - 1),
+            inventory.new_segment_meta(SegmentId::generate_random(), 50_000),
+        ];
+        metas.sort_by_key(|m| std::cmp::Reverse(m.max_doc()));
+        assert_eq!(metas[0].max_doc(), (1u32 << 31) - 1);
+        assert_eq!(metas[1].max_doc(), 50_000);
+        assert_eq!(metas[2].max_doc(), 100);
     }
 
     #[test]
@@ -1134,8 +1199,9 @@ mod tests {
                 let query = QueryParser::for_index(&index, vec![text_field])
                     .parse_query(term)
                     .unwrap();
-                let top_docs: Vec<(f32, DocAddress)> =
-                    searcher.search(&query, &TopDocs::with_limit(3)).unwrap();
+                let top_docs: Vec<(f32, DocAddress)> = searcher
+                    .search(&query, &TopDocs::with_limit(3).order_by_score())
+                    .unwrap();
 
                 top_docs.iter().map(|el| el.1.doc_id).collect::<Vec<_>>()
             };

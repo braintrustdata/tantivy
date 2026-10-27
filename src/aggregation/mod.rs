@@ -44,11 +44,14 @@
 //! - [Metric](metric)
 //!     - [Average](metric::AverageAggregation)
 //!     - [Stats](metric::StatsAggregation)
+//!     - [ExtendedStats](metric::ExtendedStatsAggregation)
 //!     - [Min](metric::MinAggregation)
 //!     - [Max](metric::MaxAggregation)
 //!     - [Sum](metric::SumAggregation)
 //!     - [Count](metric::CountAggregation)
 //!     - [Percentiles](metric::PercentilesAggregationReq)
+//!     - [Cardinality](metric::CardinalityAggregationReq)
+//!     - [TopHits](metric::TopHitsAggregationReq)
 //!
 //! # Example
 //! Compute the average metric, by building [`agg_req::Aggregations`], which is built from an
@@ -124,12 +127,13 @@
 //! [`AggregationResults`](agg_result::AggregationResults) via the
 //! [`into_final_result`](intermediate_agg_result::IntermediateAggregationResults::into_final_result) method.
 
+mod accessor_helpers;
+mod agg_data;
 mod agg_limits;
 pub mod agg_req;
-mod agg_req_with_accessor;
 pub mod agg_result;
 pub mod bucket;
-mod buf_collector;
+pub(crate) mod buffered_sub_aggs;
 mod collector;
 mod date;
 mod error;
@@ -137,17 +141,26 @@ pub mod intermediate_agg_result;
 pub mod metric;
 
 mod segment_agg_result;
-use std::collections::HashMap;
+mod value_source;
+use std::cmp::Ordering;
 use std::fmt::Display;
+use std::sync::Arc;
+
+#[cfg(feature = "jitexpr")]
+pub(crate) use value_source::jitexpr_value_source;
+pub(crate) use value_source::ColumnBlockAccessor;
+#[cfg(feature = "jitexpr")]
+pub use value_source::JitExprValueSourceProvider;
+pub use value_source::{
+    ValueSource, ValueSourceDictionary, ValueSourceProvider, ValueSourceRegistry,
+};
 
 #[cfg(test)]
 mod agg_tests;
 
-mod agg_bench;
-
 use core::fmt;
 
-pub use agg_limits::AggregationLimits;
+pub use agg_limits::AggregationLimitsGuard;
 pub use collector::{
     AggregationCollector, AggregationSegmentCollector, DistributedAggregationCollector,
     DEFAULT_BUCKET_LIMIT,
@@ -159,20 +172,63 @@ use itertools::Itertools;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub(crate) fn invalid_agg_request(message: String) -> crate::TantivyError {
-    crate::TantivyError::AggregationError(AggregationError::InvalidRequest(message))
+use crate::tokenizer::TokenizerManager;
+
+/// A bucket id is a dense identifier for a bucket within an aggregation.
+/// It is used to index into a Vec that hold per-bucket data.
+///
+/// For example, in a terms aggregation, each unique term will be assigned a incremental BucketId.
+/// This BucketId will be forwarded to sub-aggregations to identify the parent bucket.
+///
+/// This allows to have a single AggregationCollector instance per aggregation,
+/// that can handle multiple buckets efficiently.
+///
+/// The API to call sub-aggregations is therefore a &[(BucketId, &[DocId])].
+/// For that we'll need a buffer. One Vec per bucket aggregation is needed.
+pub type BucketId = u32;
+
+/// Context parameters for aggregation execution
+///
+/// This struct holds shared resources needed during aggregation execution:
+/// - `limits`: Memory and bucket limits for the aggregation
+/// - `tokenizers`: TokenizerManager for parsing query strings in filter aggregations
+/// - `value_sources`: Named computed columns that aggregations may read instead of a fast field
+#[derive(Clone, Default)]
+pub struct AggContextParams {
+    /// Aggregation limits (memory and bucket count)
+    pub limits: AggregationLimitsGuard,
+    /// Tokenizer manager for query string parsing
+    pub tokenizers: TokenizerManager,
+    /// Computed columns registered by name, resolved in preference to a fast field.
+    pub value_sources: Arc<ValueSourceRegistry>,
+}
+
+impl AggContextParams {
+    /// Create new aggregation context parameters
+    pub fn new(limits: AggregationLimitsGuard, tokenizers: TokenizerManager) -> Self {
+        Self {
+            limits,
+            tokenizers,
+            value_sources: Arc::new(ValueSourceRegistry::default()),
+        }
+    }
+
+    /// Attaches named computed columns, which aggregation requests address as field names.
+    pub fn with_value_sources(mut self, value_sources: Arc<ValueSourceRegistry>) -> Self {
+        self.value_sources = value_sources;
+        self
+    }
 }
 
 fn parse_str_into_f64<E: de::Error>(value: &str) -> Result<f64, E> {
-    let parsed = value.parse::<f64>().map_err(|_err| {
-        de::Error::custom(format!("Failed to parse f64 from string: {:?}", value))
-    })?;
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_err| de::Error::custom(format!("Failed to parse f64 from string: {value:?}")))?;
 
     // Check if the parsed value is NaN or infinity
     if parsed.is_nan() || parsed.is_infinite() {
         Err(de::Error::custom(format!(
-            "Value is not a valid f64 (NaN or Infinity): {:?}",
-            value
+            "Value is not a valid f64 (NaN or Infinity): {value:?}"
         )))
     } else {
         Ok(parsed)
@@ -184,7 +240,7 @@ pub(crate) fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f
 where D: Deserializer<'de> {
     struct StringOrFloatVisitor;
 
-    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+    impl Visitor<'_> for StringOrFloatVisitor {
         type Value = Option<f64>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -230,7 +286,7 @@ pub(crate) fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where D: Deserializer<'de> {
     struct StringOrFloatVisitor;
 
-    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+    impl Visitor<'_> for StringOrFloatVisitor {
         type Value = f64;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -261,99 +317,62 @@ where D: Deserializer<'de> {
     deserializer.deserialize_any(StringOrFloatVisitor)
 }
 
-/// Represents an associative array `(key => values)` in a very efficient manner.
-#[derive(PartialEq, Serialize, Deserialize)]
-pub(crate) struct VecWithNames<T> {
-    pub(crate) values: Vec<T>,
-    keys: Vec<String>,
-}
-
-impl<T: Clone> Clone for VecWithNames<T> {
-    fn clone(&self) -> Self {
-        Self {
-            values: self.values.clone(),
-            keys: self.keys.clone(),
-        }
-    }
-}
-
-impl<T> Default for VecWithNames<T> {
-    fn default() -> Self {
-        Self {
-            values: Default::default(),
-            keys: Default::default(),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug> std::fmt::Debug for VecWithNames<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
-    }
-}
-
-impl<T> From<HashMap<String, T>> for VecWithNames<T> {
-    fn from(map: HashMap<String, T>) -> Self {
-        VecWithNames::from_entries(map.into_iter().collect_vec())
-    }
-}
-
-impl<T> VecWithNames<T> {
-    fn from_entries(mut entries: Vec<(String, T)>) -> Self {
-        // Sort to ensure order of elements match across multiple instances
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut data = Vec::with_capacity(entries.len());
-        let mut data_names = Vec::with_capacity(entries.len());
-        for entry in entries {
-            data_names.push(entry.0);
-            data.push(entry.1);
-        }
-        VecWithNames {
-            values: data,
-            keys: data_names,
-        }
-    }
-    fn iter(&self) -> impl Iterator<Item = (&str, &T)> + '_ {
-        self.keys().zip(self.values.iter())
-    }
-    fn keys(&self) -> impl Iterator<Item = &str> + '_ {
-        self.keys.iter().map(|key| key.as_str())
-    }
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut T> + '_ {
-        self.values.iter_mut()
-    }
-    fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-    fn get(&self, name: &str) -> Option<&T> {
-        self.keys()
-            .position(|key| key == name)
-            .map(|pos| &self.values[pos])
-    }
-}
-
 /// The serialized key is used in a `HashMap`.
 pub type SerializedKey = String;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialOrd)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 /// The key to identify a bucket.
+///
+/// The order is important, with serde untagged, that we try to deserialize into i64 first.
 #[serde(untagged)]
 pub enum Key {
     /// String key
     Str(String),
+    /// `i64` key
+    I64(i64),
+    /// `u64` key
+    U64(u64),
     /// `f64` key
     F64(f64),
 }
 impl Eq for Key {}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Str(left), Self::Str(right)) => left.cmp(right),
+            (Self::I64(left), Self::I64(right)) => left.cmp(right),
+            (Self::U64(left), Self::U64(right)) => left.cmp(right),
+            (Self::F64(left), Self::F64(right)) => left.total_cmp(right),
+            // Keep the variant order from the previous derived `PartialOrd` implementation.
+            (left, right) => key_variant_ord(left).cmp(&key_variant_ord(right)),
+        }
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn key_variant_ord(key: &Key) -> u8 {
+    match key {
+        Key::Str(_) => 0,
+        Key::I64(_) => 1,
+        Key::U64(_) => 2,
+        Key::F64(_) => 3,
+    }
+}
+
 impl std::hash::Hash for Key {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
         match self {
             Key::Str(text) => text.hash(state),
             Key::F64(val) => val.to_bits().hash(state),
+            Key::U64(val) => val.hash(state),
+            Key::I64(val) => val.hash(state),
         }
     }
 }
@@ -362,8 +381,12 @@ impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Str(l), Self::Str(r)) => l == r,
-            (Self::F64(l), Self::F64(r)) => l == r,
-            _ => false,
+            (Self::F64(l), Self::F64(r)) => l.to_bits() == r.to_bits(),
+            (Self::I64(l), Self::I64(r)) => l == r,
+            (Self::U64(l), Self::U64(r)) => l == r,
+            // we list all variant of left operand to make sure this gets updated when we add
+            // variants to the enum
+            (Self::Str(_) | Self::F64(_) | Self::I64(_) | Self::U64(_), _) => false,
         }
     }
 }
@@ -373,7 +396,28 @@ impl Display for Key {
         match self {
             Key::Str(val) => f.write_str(val),
             Key::F64(val) => f.write_str(&val.to_string()),
+            Key::U64(val) => f.write_str(&val.to_string()),
+            Key::I64(val) => f.write_str(&val.to_string()),
         }
+    }
+}
+
+pub(crate) fn convert_to_f64<const COLUMN_TYPE_ID: u8>(val: u64) -> f64 {
+    if COLUMN_TYPE_ID == ColumnType::U64 as u8 {
+        val as f64
+    } else if COLUMN_TYPE_ID == ColumnType::I64 as u8
+        || COLUMN_TYPE_ID == ColumnType::DateTime as u8
+    {
+        i64::from_u64(val) as f64
+    } else if COLUMN_TYPE_ID == ColumnType::F64 as u8 {
+        f64::from_u64(val)
+    } else if COLUMN_TYPE_ID == ColumnType::Bool as u8 {
+        val as f64
+    } else {
+        panic!(
+            "ColumnType ID {} cannot be converted to f64 metric",
+            COLUMN_TYPE_ID
+        )
     }
 }
 
@@ -381,15 +425,14 @@ impl Display for Key {
 ///
 /// # Panics
 /// Only `u64`, `f64`, `date`, and `i64` are supported.
-pub(crate) fn f64_from_fastfield_u64(val: u64, field_type: &ColumnType) -> f64 {
+pub(crate) fn f64_from_fastfield_u64(val: u64, field_type: ColumnType) -> f64 {
     match field_type {
-        ColumnType::U64 => val as f64,
-        ColumnType::I64 | ColumnType::DateTime => i64::from_u64(val) as f64,
-        ColumnType::F64 => f64::from_u64(val),
-        ColumnType::Bool => val as f64,
-        _ => {
-            panic!("unexpected type {field_type:?}. This should not happen")
-        }
+        ColumnType::U64 => convert_to_f64::<{ ColumnType::U64 as u8 }>(val),
+        ColumnType::I64 => convert_to_f64::<{ ColumnType::I64 as u8 }>(val),
+        ColumnType::F64 => convert_to_f64::<{ ColumnType::F64 as u8 }>(val),
+        ColumnType::Bool => convert_to_f64::<{ ColumnType::Bool as u8 }>(val),
+        ColumnType::DateTime => convert_to_f64::<{ ColumnType::DateTime as u8 }>(val),
+        _ => panic!("unexpected type {field_type:?}. This should not happen"),
     }
 }
 
@@ -414,6 +457,7 @@ pub(crate) fn f64_to_fastfield_u64(val: f64, field_type: &ColumnType) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::net::Ipv6Addr;
 
     use columnar::DateTime;
@@ -425,7 +469,22 @@ mod tests {
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, FAST, STRING};
+    use crate::tokenizer::RAW_TOKENIZER_NAME;
     use crate::{Index, IndexWriter, Term};
+
+    #[test]
+    fn key_order_is_total_and_consistent_with_equality() {
+        let negative_zero = Key::F64(-0.0);
+        let positive_zero = Key::F64(0.0);
+        assert_ne!(negative_zero, positive_zero);
+        assert_eq!(negative_zero.cmp(&positive_zero), Ordering::Less);
+
+        let nan = Key::F64(f64::from_bits(0x7ff8_0000_0000_0001));
+        assert_eq!(nan.cmp(&nan), Ordering::Equal);
+
+        let keys = BTreeSet::from([negative_zero, positive_zero, nan]);
+        assert_eq!(keys.len(), 3);
+    }
 
     pub fn get_test_index_with_num_docs(
         merge_segments: bool,
@@ -452,9 +511,12 @@ mod tests {
         agg_req: Aggregations,
         index: &Index,
         query: Option<(&str, &str)>,
-        limits: AggregationLimits,
+        limits: AggregationLimitsGuard,
     ) -> crate::Result<Value> {
-        let collector = AggregationCollector::from_aggs(agg_req, limits);
+        let collector = AggregationCollector::from_aggs(
+            agg_req,
+            AggContextParams::new(limits, index.tokenizers().clone()),
+        );
 
         let reader = index.reader()?;
         let searcher = reader.searcher();
@@ -517,7 +579,7 @@ mod tests {
                     .set_index_option(IndexRecordOption::Basic)
                     .set_fieldnorms(false),
             )
-            .set_fast(None)
+            .set_fast(RAW_TOKENIZER_NAME)
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype.clone());
         let text_field_id = schema_builder.add_text_field("text_id", text_fieldtype);
@@ -572,7 +634,7 @@ mod tests {
             .set_indexing_options(
                 TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
             )
-            .set_fast(None)
+            .set_fast(RAW_TOKENIZER_NAME)
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype);
         let date_field = schema_builder.add_date_field("date", FAST);

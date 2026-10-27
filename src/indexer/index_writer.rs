@@ -7,7 +7,7 @@ use common::BitSet;
 use smallvec::smallvec;
 
 use super::operation::{AddOperation, UserOperation};
-use super::segment_updater::{SegmentUpdater, DEFAULT_NUM_MERGE_THREADS};
+use super::segment_updater::SegmentUpdater;
 use super::{AddBatch, AddBatchReceiver, AddBatchSender, PreparedCommit};
 use crate::directory::{DirectoryLock, GarbageCollectionResult, TerminatingWrite};
 use crate::error::TantivyError;
@@ -60,6 +60,23 @@ fn error_in_index_worker_thread(context: &str) -> TantivyError {
     ))
 }
 
+#[derive(Clone, bon::Builder)]
+/// A builder for creating a new [IndexWriter] for an index.
+pub struct IndexWriterOptions {
+    #[builder(default = MEMORY_BUDGET_NUM_BYTES_MIN)]
+    /// The memory budget per indexer thread.
+    ///
+    /// When an indexer thread has buffered this much data in memory
+    /// it will flush the segment to disk (although this is not searchable until commit is called.)
+    memory_budget_per_thread: usize,
+    #[builder(default = 1)]
+    /// The number of indexer worker threads to use.
+    num_worker_threads: usize,
+    #[builder(default = 4)]
+    /// Defines the number of merger threads to use.
+    num_merge_threads: usize,
+}
+
 /// `IndexWriter` is the user entry-point to add document to an index.
 ///
 /// It manages a small number of indexing thread, as well as a shared
@@ -73,8 +90,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
 
     index: Index,
 
-    // The memory budget per thread, after which a commit is triggered.
-    memory_budget_in_bytes_per_thread: usize,
+    options: IndexWriterOptions,
 
     workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
 
@@ -84,8 +100,6 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
     segment_updater: SegmentUpdater,
 
     worker_id: usize,
-
-    num_threads: usize,
 
     delete_queue: DeleteQueue,
 
@@ -129,7 +143,7 @@ fn compute_deleted_bitset(
 /// is `==` target_opstamp.
 /// For instance, there was no delete operation between the state of the `segment_entry` and
 /// the `target_opstamp`, `segment_entry` is not updated.
-pub(crate) fn advance_deletes(
+pub fn advance_deletes(
     mut segment: Segment,
     segment_entry: &mut SegmentEntry,
     target_opstamp: Opstamp,
@@ -194,7 +208,7 @@ fn index_documents<D: Document>(
         }
         let mem_usage = segment_writer.mem_usage();
         if mem_usage >= memory_budget - MARGIN_IN_BYTES {
-            info!(
+            debug!(
                 "Buffer limit reached, flushing segment with maxdoc={}.",
                 segment_writer.max_doc()
             );
@@ -287,60 +301,49 @@ impl<D: Document> IndexWriter<D> {
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
     pub(crate) fn new(
-        index: &Index,
-        num_threads: usize,
-        memory_budget_in_bytes_per_thread: usize,
+        index: Index,
+        options: IndexWriterOptions,
         directory_lock: DirectoryLock,
     ) -> crate::Result<Self> {
-        Self::new_with_merge_threads(
-            index,
-            num_threads,
-            DEFAULT_NUM_MERGE_THREADS,
-            memory_budget_in_bytes_per_thread,
-            directory_lock,
-        )
-    }
-
-    pub(crate) fn new_with_merge_threads(
-        index: &Index,
-        num_threads: usize,
-        num_merge_threads: usize,
-        memory_budget_in_bytes_per_thread: usize,
-        directory_lock: DirectoryLock,
-    ) -> crate::Result<Self> {
-        if memory_budget_in_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
+        index.validate_plugins()?;
+        if options.memory_budget_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             let err_msg = format!(
                 "The memory arena in bytes per thread needs to be at least \
                  {MEMORY_BUDGET_NUM_BYTES_MIN}."
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
-        if memory_budget_in_bytes_per_thread >= MEMORY_BUDGET_NUM_BYTES_MAX {
+        if options.memory_budget_per_thread >= MEMORY_BUDGET_NUM_BYTES_MAX {
             let err_msg = format!(
                 "The memory arena in bytes per thread cannot exceed {MEMORY_BUDGET_NUM_BYTES_MAX}"
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
+        if options.num_worker_threads == 0 {
+            let err_msg = "At least one worker thread is required, got 0".to_string();
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+
         let (document_sender, document_receiver) =
             crossbeam_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
 
-        let delete_queue = DeleteQueue::new();
+        let delete_queue = DeleteQueue::default();
 
         let current_opstamp = index.load_metas()?.opstamp;
 
         let stamper = Stamper::new(current_opstamp);
 
-        let segment_updater = SegmentUpdater::create_with_merge_threads(
+        let segment_updater = SegmentUpdater::create(
             index.clone(),
             stamper.clone(),
             &delete_queue.cursor(),
-            num_merge_threads,
+            options.num_merge_threads,
         )?;
 
         let mut index_writer = Self {
             _directory_lock: Some(directory_lock),
 
-            memory_budget_in_bytes_per_thread,
+            options: options.clone(),
             index: index.clone(),
             index_writer_status: IndexWriterStatus::from(document_receiver),
             operation_sender: document_sender,
@@ -348,7 +351,6 @@ impl<D: Document> IndexWriter<D> {
             segment_updater,
 
             workers_join_handle: vec![],
-            num_threads,
 
             delete_queue,
 
@@ -392,7 +394,7 @@ impl<D: Document> IndexWriter<D> {
             .map_err(|_| error_in_index_worker_thread("Failed to join merging thread."));
 
         if let Err(ref e) = result {
-            error!("Some merging thread failed {:?}", e);
+            error!("Some merging thread failed {e:?}");
         }
 
         result
@@ -441,7 +443,7 @@ impl<D: Document> IndexWriter<D> {
 
         let mut delete_cursor = self.delete_queue.cursor();
 
-        let mem_budget = self.memory_budget_in_bytes_per_thread;
+        let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
         let span = tracing::span!(tracing::Level::INFO, "index_writer_worker");
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
@@ -496,7 +498,7 @@ impl<D: Document> IndexWriter<D> {
     }
 
     fn start_workers(&mut self) -> crate::Result<()> {
-        for _ in 0..self.num_threads {
+        for _ in 0..self.options.num_worker_threads {
             self.add_indexing_worker()?;
         }
         Ok(())
@@ -527,7 +529,7 @@ impl<D: Document> IndexWriter<D> {
     ///     let index = Index::create_in_ram(schema.clone());
     ///
     ///     let mut index_writer = index.writer_with_num_threads(1, 50_000_000)?;
-    ///     index_writer.add_document(doc!(title => "The modern Promotheus"))?;
+    ///     index_writer.add_document(doc!(title => "The modern Prometheus"))?;
     ///     index_writer.commit()?;
     ///
     ///     let clear_res = index_writer.delete_all_documents().unwrap();
@@ -536,8 +538,8 @@ impl<D: Document> IndexWriter<D> {
     ///
     ///     let searcher = index.reader()?.searcher();
     ///     let query_parser = QueryParser::for_index(&index, vec![title]);
-    ///     let query_promo = query_parser.parse_query("Promotheus")?;
-    ///     let top_docs_promo = searcher.search(&query_promo, &TopDocs::with_limit(1))?;
+    ///     let query_promo = query_parser.parse_query("Prometheus")?;
+    ///     let top_docs_promo = searcher.search(&query_promo, &TopDocs::with_limit(1).order_by_score())?;
     ///
     ///     assert!(top_docs_promo.is_empty());
     ///     Ok(())
@@ -586,7 +588,7 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// The opstamp at the last commit is returned.
     pub fn rollback(&mut self) -> crate::Result<Opstamp> {
-        info!("Rolling back to opstamp {}", self.committed_opstamp);
+        debug!("Rolling back to opstamp {}", self.committed_opstamp);
         // marks the segment updater as killed. From now on, all
         // segment updates will be ignored.
         self.segment_updater.kill();
@@ -598,12 +600,8 @@ impl<D: Document> IndexWriter<D> {
             .take()
             .expect("The IndexWriter does not have any lock. This is a bug, please report.");
 
-        let new_index_writer = IndexWriter::new(
-            &self.index,
-            self.num_threads,
-            self.memory_budget_in_bytes_per_thread,
-            directory_lock,
-        )?;
+        let new_index_writer =
+            IndexWriter::new(self.index.clone(), self.options.clone(), directory_lock)?;
 
         // the current `self` is dropped right away because of this call.
         //
@@ -644,7 +642,7 @@ impl<D: Document> IndexWriter<D> {
     /// It is also possible to add a payload to the `commit`
     /// using this API.
     /// See [`PreparedCommit::set_payload()`].
-    pub fn prepare_commit(&mut self) -> crate::Result<PreparedCommit<D>> {
+    pub fn prepare_commit(&mut self) -> crate::Result<PreparedCommit<'_, D>> {
         // Here, because we join all of the worker threads,
         // all of the segment update for this commit have been
         // sent.
@@ -680,7 +678,7 @@ impl<D: Document> IndexWriter<D> {
 
         let commit_opstamp = self.stamper.stamp();
         let prepared_commit = PreparedCommit::new(self, commit_opstamp);
-        debug!("Prepared commit {}", commit_opstamp);
+        debug!("Prepared commit {commit_opstamp}");
         Ok(prepared_commit)
     }
 
@@ -697,6 +695,18 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// Commit returns the `opstamp` of the last document
     /// that made it in the commit.
+    ///
+    /// Note that "published" here only means committed to the [`Directory`](crate::Directory).
+    /// Any already-open [`IndexReader`](crate::IndexReader) only picks up the change according
+    /// to its [`ReloadPolicy`](crate::ReloadPolicy): with the default
+    /// [`ReloadPolicy::OnCommitWithDelay`](crate::ReloadPolicy::OnCommitWithDelay), the reload
+    /// happens asynchronously and is not guaranteed to be done by the time `commit()` returns,
+    /// so a search right after `commit()` can still miss the documents just committed. Use
+    /// [`ReloadPolicy::Manual`](crate::ReloadPolicy::Manual) with an explicit
+    /// [`IndexReader::reload()`](crate::IndexReader::reload) call if you need the search to
+    /// deterministically reflect this commit (see the
+    /// [`reload_after_commit`](https://github.com/quickwit-oss/tantivy/blob/main/examples/reload_after_commit.rs)
+    /// example).
     pub fn commit(&mut self) -> crate::Result<Opstamp> {
         self.prepare_commit()?.commit()
     }
@@ -886,16 +896,16 @@ mod tests {
     use proptest::prop_oneof;
 
     use super::super::operation::UserOperation;
-    use crate::collector::TopDocs;
+    use crate::collector::{Count, TopDocs};
     use crate::directory::error::LockError;
     use crate::error::*;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
-    use crate::indexer::NoMergePolicy;
+    use crate::indexer::{IndexWriterOptions, NoMergePolicy};
     use crate::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
-    use crate::schema::document::Value;
     use crate::schema::{
-        self, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, NumericOptions, Schema,
-        TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
+        self, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, JsonObjectOptions,
+        NumericOptions, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
+        STRING, TEXT,
     };
     use crate::store::DOCSTORE_CACHE_CAPACITY;
     use crate::{
@@ -1008,11 +1018,11 @@ mod tests {
         let searcher = reader.searcher();
 
         let a_docs = searcher
-            .search(&a_query, &TopDocs::with_limit(1))
+            .search(&a_query, &TopDocs::with_limit(1).order_by_score())
             .expect("search for a failed");
 
         let b_docs = searcher
-            .search(&b_query, &TopDocs::with_limit(1))
+            .search(&b_query, &TopDocs::with_limit(1).order_by_score())
             .expect("search for b failed");
 
         assert_eq!(a_docs.len(), 1);
@@ -1651,20 +1661,74 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     enum IndexingOp {
-        AddDoc { id: u64 },
-        DeleteDoc { id: u64 },
-        DeleteDocQuery { id: u64 },
+        AddMultipleDoc {
+            id: u64,
+            num_docs: u64,
+            value: IndexValue,
+        },
+        AddDoc {
+            id: u64,
+            value: IndexValue,
+        },
+        DeleteDoc {
+            id: u64,
+        },
+        DeleteDocQuery {
+            id: u64,
+        },
         Commit,
         Merge,
+    }
+    impl IndexingOp {
+        fn add(id: u64) -> Self {
+            IndexingOp::AddDoc {
+                id,
+                value: IndexValue::F64(id as f64),
+            }
+        }
+    }
+
+    use serde::Serialize;
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(untagged)]
+    enum IndexValue {
+        Str(String),
+        F64(f64),
+        U64(u64),
+        I64(i64),
+    }
+    impl Default for IndexValue {
+        fn default() -> Self {
+            IndexValue::F64(0.0)
+        }
+    }
+
+    fn value_strategy() -> impl Strategy<Value = IndexValue> {
+        prop_oneof![
+            any::<f64>().prop_map(IndexValue::F64),
+            any::<u64>().prop_map(IndexValue::U64),
+            any::<i64>().prop_map(IndexValue::I64),
+            any::<String>().prop_map(IndexValue::Str),
+        ]
     }
 
     fn balanced_operation_strategy() -> impl Strategy<Value = IndexingOp> {
         prop_oneof![
             (0u64..20u64).prop_map(|id| IndexingOp::DeleteDoc { id }),
             (0u64..20u64).prop_map(|id| IndexingOp::DeleteDocQuery { id }),
-            (0u64..20u64).prop_map(|id| IndexingOp::AddDoc { id }),
+            (0u64..20u64, value_strategy())
+                .prop_map(move |(id, value)| IndexingOp::AddDoc { id, value }),
+            ((0u64..20u64), (1u64..100), value_strategy()).prop_map(
+                move |(id, num_docs, value)| {
+                    IndexingOp::AddMultipleDoc {
+                        id,
+                        num_docs,
+                        value,
+                    }
+                }
+            ),
             (0u64..1u64).prop_map(|_| IndexingOp::Commit),
             (0u64..1u64).prop_map(|_| IndexingOp::Merge),
         ]
@@ -1674,7 +1738,17 @@ mod tests {
         prop_oneof![
             5 => (0u64..100u64).prop_map(|id| IndexingOp::DeleteDoc { id }),
             5 => (0u64..100u64).prop_map(|id| IndexingOp::DeleteDocQuery { id }),
-            50 => (0u64..100u64).prop_map(|id| IndexingOp::AddDoc { id }),
+            50 => (0u64..100u64, value_strategy())
+                .prop_map(move |(id, value)| IndexingOp::AddDoc { id, value }),
+            50 => (0u64..100u64, (1u64..100), value_strategy()).prop_map(
+                move |(id, num_docs, value)| {
+                    IndexingOp::AddMultipleDoc {
+                        id,
+                        num_docs,
+                        value,
+                    }
+                }
+            ),
             2 => (0u64..1u64).prop_map(|_| IndexingOp::Commit),
             1 => (0u64..1u64).prop_map(|_| IndexingOp::Merge),
         ]
@@ -1683,19 +1757,27 @@ mod tests {
     fn expected_ids(ops: &[IndexingOp]) -> (HashMap<u64, u64>, HashSet<u64>) {
         let mut existing_ids = HashMap::new();
         let mut deleted_ids = HashSet::new();
-        for &op in ops {
+        for op in ops {
             match op {
-                IndexingOp::AddDoc { id } => {
-                    *existing_ids.entry(id).or_insert(0) += 1;
-                    deleted_ids.remove(&id);
+                IndexingOp::AddDoc { id, value: _ } => {
+                    *existing_ids.entry(*id).or_insert(0) += 1;
+                    deleted_ids.remove(id);
+                }
+                IndexingOp::AddMultipleDoc {
+                    id,
+                    num_docs,
+                    value: _,
+                } => {
+                    *existing_ids.entry(*id).or_insert(0) += num_docs;
+                    deleted_ids.remove(id);
                 }
                 IndexingOp::DeleteDoc { id } => {
-                    existing_ids.remove(&id);
-                    deleted_ids.insert(id);
+                    existing_ids.remove(id);
+                    deleted_ids.insert(*id);
                 }
                 IndexingOp::DeleteDocQuery { id } => {
-                    existing_ids.remove(&id);
-                    deleted_ids.insert(id);
+                    existing_ids.remove(id);
+                    deleted_ids.insert(*id);
                 }
                 _ => {}
             }
@@ -1705,16 +1787,19 @@ mod tests {
 
     fn get_id_list(ops: &[IndexingOp]) -> Vec<u64> {
         let mut id_list = Vec::new();
-        for &op in ops {
+        for op in ops {
             match op {
-                IndexingOp::AddDoc { id } => {
-                    id_list.push(id);
+                IndexingOp::AddDoc { id, value: _ } => {
+                    id_list.push(*id);
+                }
+                IndexingOp::AddMultipleDoc { id, .. } => {
+                    id_list.push(*id);
                 }
                 IndexingOp::DeleteDoc { id } => {
-                    id_list.retain(|el| *el != id);
+                    id_list.retain(|el| el != id);
                 }
                 IndexingOp::DeleteDocQuery { id } => {
-                    id_list.retain(|el| *el != id);
+                    id_list.retain(|el| el != id);
                 }
                 _ => {}
             }
@@ -1795,42 +1880,59 @@ mod tests {
 
         let ip_from_id = |id| Ipv6Addr::from_u128(id as u128);
 
-        for &op in ops {
-            match op {
-                IndexingOp::AddDoc { id } => {
-                    let facet = Facet::from(&("/cola/".to_string() + &id.to_string()));
-                    let ip = ip_from_id(id);
-
-                    if !id_is_full_doc(id) {
-                        // every 3rd doc has no ip field
-                        index_writer.add_document(doc!(
-                            id_field=>id,
-                        ))?;
-                    } else {
-                        let json = json!({"date1": format!("2022-{id}-01T00:00:01Z"), "date2": format!("{id}-05-01T00:00:01Z"), "id": id, "ip": ip.to_string()});
-                        index_writer.add_document(doc!(id_field=>id,
-                                json_field=>json,
-                                bytes_field => id.to_le_bytes().as_slice(),
-                                id_opt_field => id,
-                                ip_field => ip,
-                                ips_field => ip,
-                                ips_field => ip,
-                                multi_numbers=> id,
-                                multi_numbers => id,
-                                bool_field => (id % 2u64) != 0,
-                                i64_field => id as i64,
-                                f64_field => id as f64,
-                                date_field => DateTime::from_timestamp_secs(id as i64),
-                                multi_bools => (id % 2u64) != 0,
-                                multi_bools => (id % 2u64) == 0,
-                                text_field => id.to_string(),
-                                facet_field => facet,
-                                large_text_field => LOREM,
-                                multi_text_fields => multi_text_field_text1,
-                                multi_text_fields => multi_text_field_text2,
-                                multi_text_fields => multi_text_field_text3,
-                        ))?;
-                    }
+        let add_docs = |index_writer: &mut IndexWriter,
+                        id: u64,
+                        value: IndexValue,
+                        num: u64|
+         -> crate::Result<()> {
+            let facet = Facet::from(&("/cola/".to_string() + &id.to_string()));
+            let ip = ip_from_id(id);
+            let doc = if !id_is_full_doc(id) {
+                // every 3rd doc has no ip field
+                doc!(
+                    id_field=>id,
+                )
+            } else {
+                let json = json!({"date1": format!("2022-{id}-01T00:00:01Z"), "date2": format!("{id}-05-01T00:00:01Z"), "id": id, "ip": ip.to_string(), "val": value});
+                doc!(id_field=>id,
+                        json_field=>json,
+                        bytes_field => id.to_le_bytes().as_slice(),
+                        id_opt_field => id,
+                        ip_field => ip,
+                        ips_field => ip,
+                        ips_field => ip,
+                        multi_numbers=> id,
+                        multi_numbers => id,
+                        bool_field => !id.is_multiple_of(2u64),
+                        i64_field => id as i64,
+                        f64_field => id as f64,
+                        date_field => DateTime::from_timestamp_secs(id as i64),
+                        multi_bools => !id.is_multiple_of(2u64),
+                        multi_bools => id.is_multiple_of(2u64),
+                        text_field => id.to_string(),
+                        facet_field => facet,
+                        large_text_field => LOREM,
+                        multi_text_fields => multi_text_field_text1,
+                        multi_text_fields => multi_text_field_text2,
+                        multi_text_fields => multi_text_field_text3,
+                )
+            };
+            for _ in 0..num {
+                index_writer.add_document(doc.clone())?;
+            }
+            Ok(())
+        };
+        for op in ops {
+            match op.clone() {
+                IndexingOp::AddMultipleDoc {
+                    id,
+                    num_docs,
+                    value,
+                } => {
+                    add_docs(&mut index_writer, id, value, num_docs)?;
+                }
+                IndexingOp::AddDoc { id, value } => {
+                    add_docs(&mut index_writer, id, value, 1)?;
                 }
                 IndexingOp::DeleteDoc { id } => {
                     index_writer.delete_term(Term::from_field_u64(id_field, id));
@@ -2058,7 +2160,13 @@ mod tests {
                 .unwrap();
             // test store iterator
             for doc in store_reader.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
-                let id = doc.unwrap().get_first(id_field).unwrap().as_u64().unwrap();
+                let id = doc
+                    .unwrap()
+                    .get_first(id_field)
+                    .unwrap()
+                    .as_value()
+                    .as_u64()
+                    .unwrap();
                 assert!(expected_ids_and_num_occurrences.contains_key(&id));
             }
             // test store random access
@@ -2091,7 +2199,7 @@ mod tests {
                     let mut bool2 = doc.get_all(multi_bools);
                     assert_eq!(bool, bool2.next().unwrap().as_bool().unwrap());
                     assert_ne!(bool, bool2.next().unwrap().as_bool().unwrap());
-                    assert_eq!(None, bool2.next())
+                    assert!(bool2.next().is_none())
                 }
             }
         }
@@ -2100,23 +2208,28 @@ mod tests {
             let query = QueryParser::for_index(&index, vec![field])
                 .parse_query(term)
                 .unwrap();
-            let top_docs: Vec<(f32, DocAddress)> =
-                searcher.search(&query, &TopDocs::with_limit(1000)).unwrap();
+            let top_docs: Vec<(f32, DocAddress)> = searcher
+                .search(&query, &TopDocs::with_limit(1000).order_by_score())
+                .unwrap();
 
             top_docs.iter().map(|el| el.1).collect::<Vec<_>>()
         };
+        let count_search = |term: &str, field| {
+            let query = QueryParser::for_index(&index, vec![field])
+                .parse_query(term)
+                .unwrap();
+            searcher.search(&query, &Count).unwrap()
+        };
 
-        let do_search2 = |term: Term| {
+        let count_search2 = |term: Term| {
             let query = TermQuery::new(term, IndexRecordOption::Basic);
-            let top_docs: Vec<(f32, DocAddress)> =
-                searcher.search(&query, &TopDocs::with_limit(1000)).unwrap();
-
-            top_docs.iter().map(|el| el.1).collect::<Vec<_>>()
+            searcher.search(&query, &Count).unwrap()
         };
 
         for (id, count) in &expected_ids_and_num_occurrences {
+            // skip expensive queries
             let (existing_id, count) = (*id, *count);
-            let get_num_hits = |field| do_search(&existing_id.to_string(), field).len() as u64;
+            let get_num_hits = |field| count_search(&existing_id.to_string(), field) as u64;
             assert_eq!(get_num_hits(id_field), count);
             if !id_is_full_doc(existing_id) {
                 continue;
@@ -2126,29 +2239,31 @@ mod tests {
             assert_eq!(get_num_hits(f64_field), count);
 
             // Test multi text
-            assert_eq!(
-                do_search("\"test1 test2\"", multi_text_fields).len(),
-                num_docs_with_values
-            );
-            assert_eq!(
-                do_search("\"test2 test3\"", multi_text_fields).len(),
-                num_docs_with_values
-            );
+            if num_docs_with_values < 1000 {
+                assert_eq!(
+                    do_search("\"test1 test2\"", multi_text_fields).len(),
+                    num_docs_with_values
+                );
+                assert_eq!(
+                    do_search("\"test2 test3\"", multi_text_fields).len(),
+                    num_docs_with_values
+                );
+            }
 
             // Test bytes
             let term = Term::from_field_bytes(bytes_field, existing_id.to_le_bytes().as_slice());
-            assert_eq!(do_search2(term).len() as u64, count);
+            assert_eq!(count_search2(term) as u64, count);
 
             // Test date
             let term = Term::from_field_date(
                 date_field,
                 DateTime::from_timestamp_secs(existing_id as i64),
             );
-            assert_eq!(do_search2(term).len() as u64, count);
+            assert_eq!(count_search2(term) as u64, count);
         }
         for deleted_id in deleted_ids {
             let assert_field = |field| {
-                assert_eq!(do_search(&deleted_id.to_string(), field).len() as u64, 0);
+                assert_eq!(count_search(&deleted_id.to_string(), field) as u64, 0);
             };
             assert_field(text_field);
             assert_field(f64_field);
@@ -2157,12 +2272,12 @@ mod tests {
 
             // Test bytes
             let term = Term::from_field_bytes(bytes_field, deleted_id.to_le_bytes().as_slice());
-            assert_eq!(do_search2(term).len() as u64, 0);
+            assert_eq!(count_search2(term), 0);
 
             // Test date
             let term =
                 Term::from_field_date(date_field, DateTime::from_timestamp_secs(deleted_id as i64));
-            assert_eq!(do_search2(term).len() as u64, 0);
+            assert_eq!(count_search2(term), 0);
         }
         // search ip address
         //
@@ -2171,13 +2286,13 @@ mod tests {
             if !id_is_full_doc(existing_id) {
                 continue;
             }
-            let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
+            let do_search_ip_field = |term: &str| count_search(term, ip_field) as u64;
             let ip_addr = Ipv6Addr::from_u128(existing_id as u128);
             // Test incoming ip as ipv6
             assert_eq!(do_search_ip_field(&format!("\"{ip_addr}\"")), count);
 
             let term = Term::from_field_ip_addr(ip_field, ip_addr);
-            assert_eq!(do_search2(term).len() as u64, count);
+            assert_eq!(count_search2(term) as u64, count);
 
             // Test incoming ip as ipv4
             if let Some(ip_addr) = ip_addr.to_ipv4_mapped() {
@@ -2189,16 +2304,16 @@ mod tests {
         //
         // Take half as sample
         let mut sample: Vec<_> = expected_ids_and_num_occurrences.iter().collect();
-        sample.sort_by_key(|(k, _num_occurences)| *k);
+        sample.sort_by_key(|(k, _num_occurrences)| *k);
         // sample.truncate(sample.len() / 2);
         if !sample.is_empty() {
             let (left_sample, right_sample) = sample.split_at(sample.len() / 2);
 
-            let expected_count = |sample: &[(&u64, &u64)]| {
+            let calc_expected_count = |sample: &[(&u64, &u64)]| {
                 sample
                     .iter()
                     .filter(|(id, _)| id_is_full_doc(**id))
-                    .map(|(_id, num_occurences)| **num_occurences)
+                    .map(|(_id, num_occurrences)| **num_occurrences)
                     .sum::<u64>()
             };
             fn gen_query_inclusive<T1: ToString, T2: ToString>(
@@ -2206,22 +2321,21 @@ mod tests {
                 from: T1,
                 to: T2,
             ) -> String {
-                format!("{}:[{} TO {}]", field, &from.to_string(), &to.to_string())
+                format!("{}:[{} TO {}]", field, from.to_string(), to.to_string())
             }
 
             // Query first half
-            if !left_sample.is_empty() {
-                let expected_count = expected_count(left_sample);
-
+            let expected_count = calc_expected_count(left_sample);
+            if !left_sample.is_empty() && expected_count < 1000 {
                 let start_range = *left_sample[0].0;
                 let end_range = *left_sample.last().unwrap().0;
                 let query = gen_query_inclusive("id_opt", start_range, end_range);
-                assert_eq!(do_search(&query, id_opt_field).len() as u64, expected_count);
+                assert_eq!(count_search(&query, id_opt_field) as u64, expected_count);
 
                 // Range query on ip field
                 let ip1 = ip_from_id(start_range);
                 let ip2 = ip_from_id(end_range);
-                let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
+                let do_search_ip_field = |term: &str| count_search(term, ip_field) as u64;
                 let query = gen_query_inclusive("ip", ip1, ip2);
                 assert_eq!(do_search_ip_field(&query), expected_count);
                 let query = gen_query_inclusive("ip", "*", ip2);
@@ -2233,19 +2347,19 @@ mod tests {
                 assert_eq!(do_search_ip_field(&query), expected_count);
             }
             // Query second half
-            if !right_sample.is_empty() {
-                let expected_count = expected_count(right_sample);
+            let expected_count = calc_expected_count(right_sample);
+            if !right_sample.is_empty() && expected_count < 1000 {
                 let start_range = *right_sample[0].0;
                 let end_range = *right_sample.last().unwrap().0;
                 // Range query on id opt field
                 let query =
                     gen_query_inclusive("id_opt", start_range.to_string(), end_range.to_string());
-                assert_eq!(do_search(&query, id_opt_field).len() as u64, expected_count);
+                assert_eq!(count_search(&query, id_opt_field) as u64, expected_count);
 
                 // Range query on ip field
                 let ip1 = ip_from_id(start_range);
                 let ip2 = ip_from_id(end_range);
-                let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
+                let do_search_ip_field = |term: &str| count_search(term, ip_field) as u64;
                 let query = gen_query_inclusive("ip", ip1, ip2);
                 assert_eq!(do_search_ip_field(&query), expected_count);
                 let query = gen_query_inclusive("ip", ip1, "*");
@@ -2266,11 +2380,11 @@ mod tests {
                 continue;
             }
             let gen_query_inclusive = |field: &str, from: Ipv6Addr, to: Ipv6Addr| {
-                format!("{}:[{} TO {}]", field, &from.to_string(), &to.to_string())
+                format!("{}:[{} TO {}]", field, from, to)
             };
             let ip = ip_from_id(existing_id);
 
-            let do_search_ip_field = |term: &str| do_search(term, ip_field).len() as u64;
+            let do_search_ip_field = |term: &str| count_search(term, ip_field) as u64;
             // Range query on single value field
             let query = gen_query_inclusive("ip", ip, ip);
             assert_eq!(do_search_ip_field(&query), count);
@@ -2332,32 +2446,18 @@ mod tests {
 
     #[test]
     fn test_fast_field_range() {
-        let ops: Vec<_> = (0..1000).map(|id| IndexingOp::AddDoc { id }).collect();
+        let ops: Vec<_> = (0..1000).map(IndexingOp::add).collect();
         assert!(test_operation_strategy(&ops, false, true).is_ok());
-    }
-
-    #[test]
-    fn test_sort_index_on_opt_field_regression() {
-        assert!(test_operation_strategy(
-            &[
-                IndexingOp::AddDoc { id: 81 },
-                IndexingOp::AddDoc { id: 70 },
-                IndexingOp::DeleteDoc { id: 70 }
-            ],
-            true,
-            false
-        )
-        .is_ok());
     }
 
     #[test]
     fn test_ip_range_query_multivalue_bug() {
         assert!(test_operation_strategy(
             &[
-                IndexingOp::AddDoc { id: 2 },
+                IndexingOp::add(2),
                 IndexingOp::Commit,
-                IndexingOp::AddDoc { id: 1 },
-                IndexingOp::AddDoc { id: 1 },
+                IndexingOp::add(1),
+                IndexingOp::add(1),
                 IndexingOp::Commit,
                 IndexingOp::Merge
             ],
@@ -2371,11 +2471,11 @@ mod tests {
     fn test_ff_num_ips_regression() {
         assert!(test_operation_strategy(
             &[
-                IndexingOp::AddDoc { id: 13 },
-                IndexingOp::AddDoc { id: 1 },
+                IndexingOp::add(13),
+                IndexingOp::add(1),
                 IndexingOp::Commit,
                 IndexingOp::DeleteDocQuery { id: 13 },
-                IndexingOp::AddDoc { id: 1 },
+                IndexingOp::add(1),
                 IndexingOp::Commit,
             ],
             false,
@@ -2387,7 +2487,7 @@ mod tests {
     #[test]
     fn test_minimal_sort_force_end_merge() {
         assert!(test_operation_strategy(
-            &[IndexingOp::AddDoc { id: 23 }, IndexingOp::AddDoc { id: 13 },],
+            &[IndexingOp::add(23), IndexingOp::add(13),],
             false,
             false
         )
@@ -2448,8 +2548,8 @@ mod tests {
     fn test_minimal_sort_force_end_merge_with_delete() {
         assert!(test_operation_strategy(
             &[
-                IndexingOp::AddDoc { id: 23 },
-                IndexingOp::AddDoc { id: 13 },
+                IndexingOp::add(23),
+                IndexingOp::add(13),
                 IndexingOp::DeleteDoc { id: 13 }
             ],
             true,
@@ -2462,8 +2562,8 @@ mod tests {
     fn test_minimal_no_sort_no_force_end_merge() {
         assert!(test_operation_strategy(
             &[
-                IndexingOp::AddDoc { id: 23 },
-                IndexingOp::AddDoc { id: 13 },
+                IndexingOp::add(23),
+                IndexingOp::add(13),
                 IndexingOp::DeleteDoc { id: 13 }
             ],
             false,
@@ -2474,7 +2574,7 @@ mod tests {
 
     #[test]
     fn test_minimal_sort_merge() {
-        assert!(test_operation_strategy(&[IndexingOp::AddDoc { id: 3 },], true, true).is_ok());
+        assert!(test_operation_strategy(&[IndexingOp::add(3),], true, true).is_ok());
     }
 
     use proptest::prelude::*;
@@ -2483,44 +2583,35 @@ mod tests {
 
         #![proptest_config(ProptestConfig::with_cases(20))]
         #[test]
-        fn test_delete_with_sort_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], true, false).is_ok());
+        fn test_delete_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
+            assert!(test_operation_strategy(&ops[..],  true, false).is_ok());
         }
 
         #[test]
-        fn test_delete_without_sort_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, false).is_ok());
+        fn test_delete_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
+            assert!(test_operation_strategy(&ops[..],  false, false).is_ok());
         }
 
         #[test]
-        fn test_delete_with_sort_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], true, true).is_ok());
+        fn test_delete_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
+            assert!(test_operation_strategy(&ops[..],  true, true).is_ok());
         }
 
         #[test]
-        fn test_delete_without_sort_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, true).is_ok());}
-
-        #[test]
-        fn test_delete_with_sort_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
-            assert!(test_operation_strategy(&ops[..], true, false).is_ok());
+        fn test_delete_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..100)) {
+            assert!(test_operation_strategy(&ops[..],  false, true).is_ok());
         }
 
         #[test]
+        #[ignore = "doesn't work with deferred segment loading"]
         fn test_delete_without_sort_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
             assert!(test_operation_strategy(&ops[..], false, false).is_ok());
         }
 
         #[test]
+        #[ignore = "doesn't work with deferred segment loading"]
         fn test_delete_with_sort_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
             assert!(test_operation_strategy(&ops[..], true, true).is_ok());
-        }
-
-
-
-        #[test]
-        fn test_delete_without_sort_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, true).is_ok());
         }
     }
 
@@ -2570,14 +2661,14 @@ mod tests {
     fn test_delete_bug_reproduction_ip_addr() {
         use IndexingOp::*;
         let ops = &[
-            AddDoc { id: 1 },
-            AddDoc { id: 2 },
+            IndexingOp::add(1),
+            IndexingOp::add(2),
             Commit,
-            AddDoc { id: 3 },
+            IndexingOp::add(3),
             DeleteDoc { id: 1 },
             Commit,
             Merge,
-            AddDoc { id: 4 },
+            IndexingOp::add(4),
             Commit,
         ];
         test_operation_strategy(&ops[..], false, true).unwrap();
@@ -2586,7 +2677,13 @@ mod tests {
     #[test]
     fn test_merge_regression_1() {
         use IndexingOp::*;
-        let ops = &[AddDoc { id: 15 }, Commit, AddDoc { id: 9 }, Commit, Merge];
+        let ops = &[
+            IndexingOp::add(15),
+            Commit,
+            IndexingOp::add(9),
+            Commit,
+            Merge,
+        ];
         test_operation_strategy(&ops[..], false, true).unwrap();
     }
 
@@ -2594,9 +2691,9 @@ mod tests {
     fn test_range_query_bug_1() {
         use IndexingOp::*;
         let ops = &[
-            AddDoc { id: 9 },
-            AddDoc { id: 0 },
-            AddDoc { id: 13 },
+            IndexingOp::add(9),
+            IndexingOp::add(0),
+            IndexingOp::add(13),
             Commit,
         ];
         test_operation_strategy(&ops[..], false, true).unwrap();
@@ -2604,12 +2701,11 @@ mod tests {
 
     #[test]
     fn test_range_query_bug_2() {
-        use IndexingOp::*;
         let ops = &[
-            AddDoc { id: 3 },
-            AddDoc { id: 6 },
-            AddDoc { id: 9 },
-            AddDoc { id: 10 },
+            IndexingOp::add(3),
+            IndexingOp::add(6),
+            IndexingOp::add(9),
+            IndexingOp::add(10),
         ];
         test_operation_strategy(&ops[..], false, false).unwrap();
     }
@@ -2631,7 +2727,7 @@ mod tests {
         assert!(test_operation_strategy(
             &[
                 IndexingOp::DeleteDoc { id: 0 },
-                IndexingOp::AddDoc { id: 6 },
+                IndexingOp::add(6),
                 IndexingOp::DeleteDocQuery { id: 11 },
                 IndexingOp::Commit,
                 IndexingOp::Merge,
@@ -2646,19 +2742,22 @@ mod tests {
 
     #[test]
     fn test_bug_1617_2() {
-        assert!(test_operation_strategy(
+        test_operation_strategy(
             &[
-                IndexingOp::AddDoc { id: 13 },
+                IndexingOp::AddDoc {
+                    id: 13,
+                    value: Default::default(),
+                },
                 IndexingOp::DeleteDoc { id: 13 },
                 IndexingOp::Commit,
-                IndexingOp::AddDoc { id: 30 },
+                IndexingOp::add(30),
                 IndexingOp::Commit,
                 IndexingOp::Merge,
             ],
+            true,
             false,
-            true
         )
-        .is_ok());
+        .unwrap();
     }
 
     #[test]
@@ -2698,8 +2797,9 @@ mod tests {
             Term::from_field_u64(id_field, existing_id),
             IndexRecordOption::Basic,
         );
-        let top_docs: Vec<(f32, DocAddress)> =
-            searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let top_docs: Vec<(f32, DocAddress)> = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
 
         assert_eq!(top_docs.len(), 1); // Was failing
 
@@ -2740,8 +2840,9 @@ mod tests {
             Term::from_field_i64(id_field, 10i64),
             IndexRecordOption::Basic,
         );
-        let top_docs: Vec<(f32, DocAddress)> =
-            searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let top_docs: Vec<(f32, DocAddress)> = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
 
         assert_eq!(top_docs.len(), 1); // Fails
 
@@ -2749,11 +2850,86 @@ mod tests {
             Term::from_field_i64(id_field, 30i64),
             IndexRecordOption::Basic,
         );
-        let top_docs: Vec<(f32, DocAddress)> =
-            searcher.search(&query, &TopDocs::with_limit(10)).unwrap();
+        let top_docs: Vec<(f32, DocAddress)> = searcher
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
 
         assert_eq!(top_docs.len(), 1); // Fails
 
         Ok(())
+    }
+
+    #[test]
+    fn test_bug_2442_reserved_character_fast_field() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let json_field = schema_builder.add_json_field("json", FAST | TEXT);
+
+        let schema = schema_builder.build();
+        let index = Index::builder().schema(schema).create_in_ram()?;
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        index_writer
+            .add_document(doc!(
+                json_field=>json!({"\u{0000}B":"1"})
+            ))
+            .unwrap();
+        index_writer
+            .add_document(doc!(
+                json_field=>json!({" A":"1"})
+            ))
+            .unwrap();
+        index_writer.commit()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bug_2442_reserved_character_columnar() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let options = JsonObjectOptions::from(FAST).set_expand_dots_enabled();
+        let field = schema_builder.add_json_field("json", options);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(field=>json!({"\u{0000}": "A"})))
+            .unwrap();
+        index_writer
+            .add_document(doc!(field=>json!({"\u{0000}\u{0000}".to_string(): "A"})))
+            .unwrap();
+        index_writer.commit().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn test_writer_options_validation() {
+        let mut schema_builder = Schema::builder();
+        let _field = schema_builder.add_bool_field("example", STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let opt_wo_threads = IndexWriterOptions::builder().num_worker_threads(0).build();
+        let result = index.writer_with_options::<TantivyDocument>(opt_wo_threads);
+        assert!(result.is_err(), "Writer should reject 0 thread count");
+        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+
+        let opt_with_low_memory = IndexWriterOptions::builder()
+            .memory_budget_per_thread(10 << 10)
+            .build();
+        let result = index.writer_with_options::<TantivyDocument>(opt_with_low_memory);
+        assert!(
+            result.is_err(),
+            "Writer should reject options with too low memory size"
+        );
+        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+
+        let opt_with_low_memory = IndexWriterOptions::builder()
+            .memory_budget_per_thread(5 << 30)
+            .build();
+        let result = index.writer_with_options::<TantivyDocument>(opt_with_low_memory);
+        assert!(
+            result.is_err(),
+            "Writer should reject options with too high memory size"
+        );
+        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
     }
 }

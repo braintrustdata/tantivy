@@ -40,7 +40,7 @@ impl Tokenizer for FacetTokenizer {
     }
 }
 
-impl<'a> TokenStream for FacetTokenStream<'a> {
+impl TokenStream for FacetTokenStream<'_> {
     fn advance(&mut self) -> bool {
         match self.state {
             State::RootFacetNotEmitted => {
@@ -96,7 +96,7 @@ mod tests {
         {
             let mut add_token = |token: &Token| {
                 let facet = Facet::from_encoded(token.text.as_bytes().to_owned()).unwrap();
-                tokens.push(format!("{}", facet));
+                tokens.push(format!("{facet}"));
             };
             FacetTokenizer::default()
                 .token_stream(facet.encoded_str())
@@ -116,7 +116,7 @@ mod tests {
         {
             let mut add_token = |token: &Token| {
                 let facet = Facet::from_encoded(token.text.as_bytes().to_owned()).unwrap(); // ok test
-                tokens.push(format!("{}", facet));
+                tokens.push(format!("{facet}"));
             };
             FacetTokenizer::default()
                 .token_stream(facet.encoded_str()) // ok test

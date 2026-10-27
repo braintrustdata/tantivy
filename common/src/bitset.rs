@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::{fmt, io, u64};
+use std::{fmt, io};
 
 use ownedbytes::OwnedBytes;
 
@@ -46,6 +46,9 @@ impl TinySet {
         let val: u64 = u64::from_le_bytes(data);
         TinySet(val)
     }
+
+    /// An empty `TinySet` constant.
+    pub const EMPTY: TinySet = TinySet(0u64);
 
     /// Returns an empty `TinySet`.
     #[inline]
@@ -153,7 +156,22 @@ impl TinySet {
             None
         } else {
             let lowest = self.0.trailing_zeros();
-            self.0 ^= TinySet::singleton(lowest).0;
+            // Kernighan's trick: `n &= n - 1` clears the lowest set bit
+            // without depending on `lowest`. This lets the CPU execute
+            // `trailing_zeros` and the bit-clear in parallel instead of
+            // serializing them.
+            //
+            // The previous form `self.0 ^= 1 << lowest` needs the result of
+            // `trailing_zeros` before it can shift, creating a dependency chain:
+            //   ARM64: rbit → clz → lsl → eor
+            //   x86:   tzcnt → btc
+            //
+            // With Kernighan's trick the clear path is independent of the count:
+            //   ARM64: sub → and  (trailing_zeros runs in parallel)
+            //   x86:   blsr       (tzcnt runs in parallel)
+            //
+            // https://godbolt.org/z/fnfrP1T5f
+            self.0 &= self.0 - 1;
             Some(lowest)
         }
     }
@@ -181,9 +199,17 @@ pub struct BitSet {
     len: u64,
     max_value: u32,
 }
+impl std::fmt::Debug for BitSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BitSet")
+            .field("len", &self.len)
+            .field("max_value", &self.max_value)
+            .finish()
+    }
+}
 
 fn num_buckets(max_val: u32) -> u32 {
-    (max_val + 63u32) / 64u32
+    max_val.div_ceil(64u32)
 }
 
 impl BitSet {
@@ -255,12 +281,16 @@ impl BitSet {
     }
 
     /// Inserts an element in the `BitSet`
+    ///
+    /// Returns true if the set changed.
     #[inline]
-    pub fn insert(&mut self, el: u32) {
+    pub fn insert(&mut self, el: u32) -> bool {
         // we do not check saturated els.
         let higher = el / 64u32;
         let lower = el % 64u32;
-        self.len += u64::from(self.tinysets[higher as usize].insert_mut(lower));
+        let changed = self.tinysets[higher as usize].insert_mut(lower);
+        self.len += u64::from(changed);
+        changed
     }
 
     /// Inserts an element in the `BitSet`
@@ -347,8 +377,8 @@ impl ReadOnlyBitSet {
     /// Iterate the tinyset on the fly from serialized data.
     #[inline]
     fn iter_tinysets(&self) -> impl Iterator<Item = TinySet> + '_ {
-        self.data.chunks_exact(8).map(move |chunk| {
-            let tinyset: TinySet = TinySet::deserialize(chunk.try_into().unwrap());
+        self.data.as_chunks::<8>().0.iter().map(move |&chunk| {
+            let tinyset: TinySet = TinySet::deserialize(chunk);
             tinyset
         })
     }
@@ -408,7 +438,7 @@ mod tests {
     use std::collections::HashSet;
 
     use ownedbytes::OwnedBytes;
-    use rand::distributions::Bernoulli;
+    use rand::distr::Bernoulli;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -694,45 +724,5 @@ mod tests {
         for el in 0u32..1000u32 {
             assert!(!bitset.contains(el));
         }
-    }
-}
-
-#[cfg(all(test, feature = "unstable"))]
-mod bench {
-
-    use test;
-
-    use super::{BitSet, TinySet};
-
-    #[bench]
-    fn bench_tinyset_pop(b: &mut test::Bencher) {
-        b.iter(|| {
-            let mut tinyset = TinySet::singleton(test::black_box(31u32));
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-            tinyset.pop_lowest();
-        });
-    }
-
-    #[bench]
-    fn bench_tinyset_sum(b: &mut test::Bencher) {
-        let tiny_set = TinySet::empty().insert(10u32).insert(14u32).insert(21u32);
-        b.iter(|| {
-            assert_eq!(test::black_box(tiny_set).into_iter().sum::<u32>(), 45u32);
-        });
-    }
-
-    #[bench]
-    fn bench_tinyarr_sum(b: &mut test::Bencher) {
-        let v = [10u32, 14u32, 21u32];
-        b.iter(|| test::black_box(v).iter().cloned().sum::<u32>());
-    }
-
-    #[bench]
-    fn bench_bitset_initialize(b: &mut test::Bencher) {
-        b.iter(|| BitSet::with_max_value(1_000_000));
     }
 }

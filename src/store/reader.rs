@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::io;
 use std::iter::Sum;
 use std::num::NonZeroUsize;
@@ -14,20 +15,59 @@ use super::Decompressor;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::schema::document::{BinaryDocumentDeserializer, Document, DocumentDeserialize};
+use crate::schema::document::{
+    BinaryDocumentDeserializer, BinaryDocumentSerializer, DocumentDeserialize,
+};
+use crate::schema::{Schema, TantivyDocument};
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
 use crate::DocId;
+#[cfg(feature = "quickwit")]
+use crate::Executor;
 
 pub(crate) const DOCSTORE_CACHE_CAPACITY: usize = 100;
 
 type Block = OwnedBytes;
+
+/// The format version of the document store.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub(crate) enum DocStoreVersion {
+    V1 = 1,
+    V2 = 2,
+}
+impl Display for DocStoreVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DocStoreVersion::V1 => write!(f, "V1"),
+            DocStoreVersion::V2 => write!(f, "V2"),
+        }
+    }
+}
+impl BinarySerializable for DocStoreVersion {
+    fn serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        (*self as u32).serialize(writer)
+    }
+
+    fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        Ok(match u32::deserialize(reader)? {
+            1 => DocStoreVersion::V1,
+            2 => DocStoreVersion::V2,
+            v => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid doc store version {v}"),
+                ))
+            }
+        })
+    }
+}
 
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
     decompressor: Decompressor,
     dictionary_used: bool,
     dictionary: Option<Arc<[u8]>>,
+    doc_store_version: DocStoreVersion,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
     space_usage: StoreSpaceUsage,
@@ -140,6 +180,7 @@ impl StoreReader {
             decompressor: footer.decompressor,
             dictionary_used: footer.dictionary_used(),
             dictionary,
+            doc_store_version: footer.doc_store_version,
             data: data_file,
             cache: BlockCache {
                 cache: NonZeroUsize::new(cache_num_blocks)
@@ -221,8 +262,9 @@ impl StoreReader {
     pub fn get<D: DocumentDeserialize>(&self, doc_id: DocId) -> crate::Result<D> {
         let mut doc_bytes = self.get_document_bytes(doc_id)?;
 
-        let deserializer = BinaryDocumentDeserializer::from_reader(&mut doc_bytes)
-            .map_err(crate::TantivyError::from)?;
+        let deserializer =
+            BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
+                .map_err(crate::TantivyError::from)?;
         D::deserialize(deserializer).map_err(crate::TantivyError::from)
     }
 
@@ -255,16 +297,51 @@ impl StoreReader {
     /// Iterator over all Documents in their order as they are stored in the doc store.
     /// Use this, if you want to extract all Documents from the doc store.
     /// The `alive_bitset` has to be forwarded from the `SegmentReader` or the results may be wrong.
-    pub fn iter<'a: 'b, 'b, D: Document + DocumentDeserialize>(
+    pub fn iter<'a: 'b, 'b, D: DocumentDeserialize>(
         &'b self,
         alive_bitset: Option<&'a AliveBitSet>,
     ) -> impl Iterator<Item = crate::Result<D>> + 'b {
         self.iter_raw(alive_bitset).map(|doc_bytes_res| {
             let mut doc_bytes = doc_bytes_res?;
 
-            let deserializer = BinaryDocumentDeserializer::from_reader(&mut doc_bytes)
-                .map_err(crate::TantivyError::from)?;
+            let deserializer =
+                BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
+                    .map_err(crate::TantivyError::from)?;
             D::deserialize(deserializer).map_err(crate::TantivyError::from)
+        })
+    }
+
+    /// The doc store format version this store was written with.
+    pub(crate) fn doc_store_version(&self) -> DocStoreVersion {
+        self.doc_store_version
+    }
+
+    /// Like [`iter_raw`](Self::iter_raw), but the returned bytes are always encoded in the
+    /// current [`DOC_STORE_VERSION`](super::DOC_STORE_VERSION) format.
+    ///
+    /// A `StoreWriter` always writes the current version, so raw bytes from an older store must
+    /// not be appended to it verbatim: version-dependent encodings (e.g. `DateTime` precision,
+    /// microseconds in V1 vs nanoseconds in V2) would be misread. Documents from an older store
+    /// are deserialized and re-serialized against `schema`.
+    pub(crate) fn iter_raw_current_version<'a: 'b, 'b>(
+        &'b self,
+        alive_bitset: Option<&'a AliveBitSet>,
+        schema: &'b Schema,
+    ) -> impl Iterator<Item = crate::Result<OwnedBytes>> + 'b {
+        let needs_transcoding = self.doc_store_version != super::DOC_STORE_VERSION;
+        self.iter_raw(alive_bitset).map(move |doc_bytes_res| {
+            let mut doc_bytes = doc_bytes_res?;
+            if !needs_transcoding {
+                return Ok(doc_bytes);
+            }
+            let deserializer =
+                BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
+                    .map_err(crate::TantivyError::from)?;
+            let doc = TantivyDocument::deserialize(deserializer)
+                .map_err(crate::TantivyError::from)?;
+            let mut buffer = Vec::new();
+            BinaryDocumentSerializer::new(&mut buffer, schema).serialize_doc(&doc)?;
+            Ok(OwnedBytes::new(buffer))
         })
     }
 
@@ -284,7 +361,9 @@ impl StoreReader {
         let mut curr_checkpoint = checkpoint_block_iter.next();
         let mut curr_block = curr_checkpoint
             .as_ref()
-            .map(|checkpoint| self.read_block(checkpoint).map_err(|e| e.kind())); // map error in order to enable cloning
+            .map(|checkpoint| self.read_block(checkpoint).map_err(|e| e.kind())); // map error in
+                                                                                  // order to enable
+                                                                                  // cloning
         let mut doc_pos = 0;
         (0..last_doc_id)
             .filter_map(move |doc_id| {
@@ -300,7 +379,9 @@ impl StoreReader {
                     doc_pos = 0;
                 }
 
-                let alive = alive_bitset.map_or(true, |bitset| bitset.is_alive(doc_id));
+                let alive = alive_bitset
+                    .map(|bitset| bitset.is_alive(doc_id))
+                    .unwrap_or(true);
                 let res = if alive {
                     Some((curr_block.clone(), doc_pos))
                 } else {
@@ -361,7 +442,11 @@ impl StoreReader {
     /// In most cases use [`get_async`](Self::get_async)
     ///
     /// Loads and decompresses a block asynchronously.
-    async fn read_block_async(&self, checkpoint: &Checkpoint) -> io::Result<Block> {
+    async fn read_block_async(
+        &self,
+        checkpoint: &Checkpoint,
+        executor: &Executor,
+    ) -> io::Result<Block> {
         let cache_key = checkpoint.byte_range.start;
         if let Some(block) = self.cache.get_from_cache(checkpoint.byte_range.start) {
             return Ok(block);
@@ -373,10 +458,15 @@ impl StoreReader {
             .read_bytes_async()
             .await?;
 
-        let decompressed_block = OwnedBytes::new(
-            self.decompressor
-                .decompress(compressed_block.as_ref(), self.dictionary.as_deref())?,
-        );
+        let decompressor = self.decompressor;
+        let dictionary = self.dictionary.clone();
+        let maybe_decompressed_block = executor
+            .spawn_blocking(move || {
+                decompressor.decompress(compressed_block.as_ref(), dictionary.as_deref())
+            })
+            .await
+            .expect("decompression panicked");
+        let decompressed_block = OwnedBytes::new(maybe_decompressed_block?);
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
@@ -385,18 +475,27 @@ impl StoreReader {
     }
 
     /// Reads raw bytes of a given document asynchronously.
-    pub async fn get_document_bytes_async(&self, doc_id: DocId) -> crate::Result<OwnedBytes> {
+    pub async fn get_document_bytes_async(
+        &self,
+        doc_id: DocId,
+        executor: &Executor,
+    ) -> crate::Result<OwnedBytes> {
         let checkpoint = self.block_checkpoint(doc_id)?;
-        let block = self.read_block_async(&checkpoint).await?;
+        let block = self.read_block_async(&checkpoint, executor).await?;
         Self::get_document_bytes_from_block(block, doc_id, &checkpoint)
     }
 
     /// Fetches a document asynchronously. Async version of [`get`](Self::get).
-    pub async fn get_async<D: DocumentDeserialize>(&self, doc_id: DocId) -> crate::Result<D> {
-        let mut doc_bytes = self.get_document_bytes_async(doc_id).await?;
+    pub async fn get_async<D: DocumentDeserialize>(
+        &self,
+        doc_id: DocId,
+        executor: &Executor,
+    ) -> crate::Result<D> {
+        let mut doc_bytes = self.get_document_bytes_async(doc_id, executor).await?;
 
-        let deserializer = BinaryDocumentDeserializer::from_reader(&mut doc_bytes)
-            .map_err(crate::TantivyError::from)?;
+        let deserializer =
+            BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
+                .map_err(crate::TantivyError::from)?;
         D::deserialize(deserializer).map_err(crate::TantivyError::from)
     }
 }
@@ -407,8 +506,7 @@ mod tests {
 
     use super::*;
     use crate::directory::RamDirectory;
-    use crate::schema::document::Value;
-    use crate::schema::{Field, TantivyDocument};
+    use crate::schema::{Field, TantivyDocument, Value};
     use crate::store::tests::write_lorem_ipsum_store;
     use crate::store::Compressor;
     use crate::Directory;
@@ -416,7 +514,12 @@ mod tests {
     const BLOCK_SIZE: usize = 16_384;
 
     fn get_text_field<'a>(doc: &'a TantivyDocument, field: &'a Field) -> Option<&'a str> {
-        doc.get_first(*field).and_then(|f| f.as_str())
+        doc.get_first(*field).and_then(|f| f.as_value().as_str())
+    }
+
+    #[test]
+    fn test_doc_store_version_ord() {
+        assert!(DocStoreVersion::V1 < DocStoreVersion::V2);
     }
 
     #[test]
@@ -424,7 +527,7 @@ mod tests {
         let directory = RamDirectory::create();
         let path = Path::new("store");
         let writer = directory.open_write(path)?;
-        let schema = write_lorem_ipsum_store(writer, 500, Compressor::default(), BLOCK_SIZE, true);
+        let schema = write_lorem_ipsum_store(writer, 500, Compressor::None, BLOCK_SIZE, true);
         let title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
         let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY, None)?;
@@ -458,7 +561,7 @@ mod tests {
         assert_eq!(store.cache_stats().cache_hits, 1);
         assert_eq!(store.cache_stats().cache_misses, 2);
 
-        assert_eq!(store.cache.peek_lru(), Some(11207));
+        assert_eq!(store.cache.peek_lru(), Some(232206));
 
         Ok(())
     }

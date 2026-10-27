@@ -39,7 +39,7 @@ Its representation is done by separating segments by a unicode char `\x01`, and 
 - `value`: The value representation is just the regular Value representation.
 
 This representation is designed to align the natural sort of Terms with the lexicographical sort
-of their binary representation (Tantivy's dictionary (whether fst or sstable) is sorted and does prefix encoding).
+of their binary representation (tantivy's dictionary (whether fst or sstable) is sorted and does prefix encoding).
 
 In the example above, the terms will be sorted as
 
@@ -60,7 +60,7 @@ At indexing, tantivy will try to interpret number and strings as different type 
 priority order.
 
 Numbers will be interpreted as u64, i64 and f64 in that order.
-Strings will be interpreted as rfc3999 dates or simple strings.
+Strings will be interpreted as rfc3339 dates or simple strings.
 
 The first working type is picked and is the only term that is emitted for indexing.
 Note this interpretation happens on a per-document basis, and there is no effort to try to sniff
@@ -81,7 +81,7 @@ Will be interpreted as
 (my_path.my_segment, String, 233) or (my_path.my_segment, u64, 233)
 ```
 
-Likewise, we need to emit two tokens if the query contains an rfc3999 date.
+Likewise, we need to emit two tokens if the query contains an rfc3339 date.
 Indeed the date could have been actually a single token inside the text of a document at ingestion time. Generally speaking, we will always at least emit a string token in query parsing, and sometimes more.
 
 If one more json field is defined, things get even more complicated.
@@ -99,9 +99,10 @@ This is a product decision.
 The user can still target the JSON field by specifying its name explicitly:
 `json_dynamic.text:hello`.
 
-## Range queries are not supported
+## `RangeQuery` requires a fast field
 
-Json field do not support range queries.
+`RangeQuery` on a json field is only supported if the field is `FAST`, and only for
+string, numeric and date values. Otherwise it returns an `InvalidArgument` error.
 
 ## Arrays do not work like nested object
 

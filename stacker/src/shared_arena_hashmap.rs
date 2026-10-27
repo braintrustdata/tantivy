@@ -169,7 +169,7 @@ impl SharedArenaHashMap {
     }
 
     #[inline]
-    fn get_key_value<'a>(&'a self, addr: Addr, memory_arena: &'a MemoryArena) -> (&[u8], Addr) {
+    fn get_key_value<'a>(&'a self, addr: Addr, memory_arena: &'a MemoryArena) -> (&'a [u8], Addr) {
         let data = memory_arena.slice_from(addr);
         let key_bytes_len_bytes = unsafe { data.get_unchecked(..2) };
         let key_bytes_len = u16::from_le_bytes(key_bytes_len_bytes.try_into().unwrap());
@@ -233,7 +233,7 @@ impl SharedArenaHashMap {
     }
 
     #[inline]
-    pub fn iter<'a>(&'a self, memory_arena: &'a MemoryArena) -> Iter<'_> {
+    pub fn iter<'a>(&'a self, memory_arena: &'a MemoryArena) -> Iter<'a> {
         Iter {
             inner: self
                 .table
@@ -274,13 +274,12 @@ impl SharedArenaHashMap {
             let kv: KeyValue = self.table[bucket];
             if kv.is_empty() {
                 return None;
-            } else if kv.hash == hash {
-                if let Some(val_addr) =
+            } else if kv.hash == hash
+                && let Some(val_addr) =
                     self.get_value_addr_if_key_match(key, kv.key_value_addr, memory_arena)
-                {
-                    let v = memory_arena.read(val_addr);
-                    return Some(v);
-                }
+            {
+                let v = memory_arena.read(val_addr);
+                return Some(v);
             }
         }
     }
@@ -334,15 +333,14 @@ impl SharedArenaHashMap {
                 self.set_bucket(hash, key_addr, bucket);
                 return val;
             }
-            if kv.hash == hash {
-                if let Some(val_addr) =
+            if kv.hash == hash
+                && let Some(val_addr) =
                     self.get_value_addr_if_key_match(key, kv.key_value_addr, memory_arena)
-                {
-                    let v = memory_arena.read(val_addr);
-                    let new_v = updater(Some(v));
-                    memory_arena.write_at(val_addr, new_v);
-                    return new_v;
-                }
+            {
+                let v = memory_arena.read(val_addr);
+                let new_v = updater(Some(v));
+                memory_arena.write_at(val_addr, new_v);
+                return new_v;
             }
             // This allows fetching the next bucket before the loop jmp
             bucket = probe.next_probe();
@@ -356,7 +354,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::{compute_previous_power_of_two, SharedArenaHashMap};
+    use super::{SharedArenaHashMap, compute_previous_power_of_two};
     use crate::MemoryArena;
 
     #[test]

@@ -34,10 +34,10 @@ use crate::aggregation::*;
 pub struct DateHistogramAggregationReq {
     #[doc(hidden)]
     /// Only for validation
-    interval: Option<String>,
+    pub interval: Option<String>,
     #[doc(hidden)]
     /// Only for validation
-    calendar_interval: Option<String>,
+    pub calendar_interval: Option<String>,
     /// The field to aggregate on.
     pub field: String,
     /// The format to format dates. Unsupported currently.
@@ -207,7 +207,7 @@ fn parse_offset_into_milliseconds(input: &str) -> Result<i64, AggregationError> 
     }
 }
 
-fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
+pub(crate) fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
     let split_boundary = input
         .as_bytes()
         .iter()
@@ -244,7 +244,7 @@ fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;

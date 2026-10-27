@@ -5,7 +5,7 @@
 //! Tantivy has a very strict schema.
 //! The schema defines information about the fields your index contains, that is, for each field:
 //!
-//! - the field name (may contain any characted, can't start with a `-` and can't be empty. Some
+//! - the field name (may contain any character, can't start with a `-` and can't be empty. Some
 //!   characters may require escaping when using the query parser).
 //! - the type of the field (currently `text`, `u64`, `i64`, `f64`, `bool`, `date`, `IpAddr`,
 //!   facets, bytes and json are supported)
@@ -98,6 +98,10 @@
 //! make it possible to access the value given the doc id rapidly. This is useful if the value
 //! of the field is required during scoring or collection for instance.
 //!
+//! Some queries may leverage Fast fields when run on a field that is not indexed. This can be
+//! handy if that kind of request is infrequent, however note that searching on a Fast field is
+//! generally much slower than searching in an index.
+//!
 //! ```
 //! use tantivy::schema::*;
 //! let mut schema_builder = Schema::builder();
@@ -114,10 +118,10 @@ pub(crate) mod term;
 
 mod field_entry;
 mod field_type;
-mod field_value;
 
 mod artifact_options;
 mod bytes_options;
+mod custom_options;
 mod date_time_options;
 mod field;
 mod flags;
@@ -132,6 +136,7 @@ use columnar::ColumnType;
 
 pub use self::artifact_options::ArtifactOptions;
 pub use self::bytes_options::BytesOptions;
+pub use self::custom_options::CustomOptions;
 pub use self::date_time_options::{DateOptions, DateTimePrecision, DATE_TIME_PRECISION_INDEXED};
 pub use self::document::{DocParsingError, Document, OwnedValue, TantivyDocument, Value};
 pub(crate) use self::facet::FACET_SEP_BYTE;
@@ -140,7 +145,6 @@ pub use self::facet_options::FacetOptions;
 pub use self::field::Field;
 pub use self::field_entry::FieldEntry;
 pub use self::field_type::{FieldType, Type};
-pub use self::field_value::FieldValue;
 pub use self::flags::{COERCE, FAST, INDEXED, STORED};
 pub use self::index_record_option::IndexRecordOption;
 pub use self::ip_options::{IntoIpv6Addr, IpAddrOptions};
@@ -148,7 +152,7 @@ pub use self::json_object_options::JsonObjectOptions;
 pub use self::named_field_document::NamedFieldDocument;
 pub use self::numeric_options::NumericOptions;
 pub use self::schema::{Schema, SchemaBuilder};
-pub use self::term::{Term, ValueBytes, JSON_END_OF_PATH};
+pub use self::term::{Term, ValueBytes};
 pub use self::text_options::{TextFieldIndexing, TextOptions, STRING, TEXT};
 
 /// Validator for a potential `field_name`.
@@ -173,6 +177,7 @@ pub(crate) fn value_type_to_column_type(typ: Type) -> Option<ColumnType> {
         Type::IpAddr => Some(ColumnType::IpAddr),
         Type::Json => None,
         Type::Artifact => None,
+        Type::Custom => None,
     }
 }
 

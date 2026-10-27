@@ -32,7 +32,7 @@ pub struct WatchCallbackList {
 /// file change is detected.
 #[must_use = "This `WatchHandle` controls the lifetime of the watch and should therefore be used."]
 #[derive(Clone)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub struct WatchHandle(Arc<WatchCallback>);
 
 impl WatchHandle {
@@ -92,10 +92,7 @@ impl WatchCallbackList {
                 let _ = sender.send(Ok(()));
             });
         if let Err(err) = spawn_res {
-            error!(
-                "Failed to spawn thread to call watch callbacks. Cause: {:?}",
-                err
-            );
+            error!("Failed to spawn thread to call watch callbacks. Cause: {err:?}");
         }
         result
     }

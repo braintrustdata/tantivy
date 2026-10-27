@@ -5,26 +5,28 @@
 //! - [Value] which provides tantivy with a way to access the document's values in a common way
 //!   without performing any additional allocations.
 //! - [DocumentDeserialize] which implements the necessary code to deserialize the document from the
-//!   doc store.
+//!   doc store. If you are fine with fetching [TantivyDocument] from the doc store, you can skip
+//!   implementing this trait for your type.
 //!
 //! Tantivy provides a few out-of-box implementations of these core traits to provide
 //! some simple usage if you don't want to implement these traits on a custom type yourself.
 //!
 //! # Out-of-box document implementations
-//! - [Document] the old document type used by Tantivy before the trait based approach was
+//! - [TantivyDocument] the old document type used by Tantivy before the trait based approach was
 //!   implemented. This type is still valid and provides all of the original behaviour you might
 //!   expect.
-//! - `BTreeMap<Field, Value>` a mapping of field_ids to their relevant schema value using a
+//! - `BTreeMap<Field, OwnedValue>` a mapping of field_ids to their relevant schema value using a
 //!   BTreeMap.
-//! - `HashMap<Field, Value>` a mapping of field_ids to their relevant schema value using a HashMap.
+//! - `HashMap<Field, OwnedValue>` a mapping of field_ids to their relevant schema value using a
+//!   HashMap.
 //!
 //! # Implementing your custom documents
 //! Often in larger projects or higher performance applications you want to avoid the extra overhead
-//! of converting your own types to the Tantivy [Document] type, this can often save you a
+//! of converting your own types to the [TantivyDocument] type, this can often save you a
 //! significant amount of time when indexing by avoiding the additional allocations.
 //!
 //! ### Important Note
-//! The implementor of the `Document` trait must be `'static` and safe to send across
+//! The implementer of the `Document` trait must be `'static` and safe to send across
 //! thread boundaries.
 //!
 //! ## Reusing existing types
@@ -39,6 +41,7 @@
 //! use tantivy::schema::document::{DeserializeError, DocumentDeserialize, DocumentDeserializer};
 //!
 //! /// Our custom document to let us use a map of `serde_json::Values`.
+//! #[allow(dead_code)]
 //! pub struct MyCustomDocument {
 //!     // Tantivy provides trait implementations for common `serde_json` types.
 //!     fields: BTreeMap<Field, serde_json::Value>
@@ -46,6 +49,7 @@
 //!
 //! impl Document for MyCustomDocument {
 //!     // The value type produced by the `iter_fields_and_values` iterator.
+//!     // tantivy already implements the Value trait for serde_json::Value.
 //!     type Value<'a> = &'a serde_json::Value;
 //!     // The iterator which is produced by `iter_fields_and_values`.
 //!     // Often this is a simple new-type wrapper unless you like super long generics.
@@ -76,6 +80,7 @@
 //! }
 //!
 //! /// Our custom iterator just helps us to avoid some messy generics.
+//! #[allow(dead_code)]
 //! pub struct MyCustomIter<'a>(btree_map::Iter<'a, Field, serde_json::Value>);
 //! impl<'a> Iterator for MyCustomIter<'a> {
 //!     // Here we can see our field-value pairs being produced by the iterator.
@@ -94,24 +99,25 @@
 //! implementation for.
 //!
 //! ## Implementing custom values
-//! Internally, Tantivy only works with `ReferenceValue` which is an enum that tries to borrow
-//! as much data as it can, in order to allow documents to return custom types, they must implement
-//! the `Value` trait which provides a way for Tantivy to get a `ReferenceValue` that it can then
+//! In order to allow documents to return custom types, they must implement
+//! the [Value] trait which provides a way for Tantivy to get a `ReferenceValue` that it can then
 //! index and store.
+//! Internally, Tantivy only works with `ReferenceValue` which is an enum that tries to borrow
+//! as much data as it can
 //!
 //! Values can just as easily be customised as documents by implementing the `Value` trait.
 //!
-//! The implementor of this type should not own the data it's returning, instead it should just
+//! The implementer of this type should not own the data it's returning, instead it should just
 //! hold references of the data held by the parent [Document] which can then be passed
 //! on to the [ReferenceValue].
 //!
-//! This is why `Value` is implemented for `&'a serde_json::Value` and `&'a
-//! tantivy::schema::Value` but not for their owned counterparts, as we cannot satisfy the lifetime
-//! bounds necessary when indexing the documents.
+//! This is why [Value] is implemented for `&'a serde_json::Value` and
+//! [&'a tantivy::schema::document::OwnedValue](OwnedValue) but not for their owned counterparts, as
+//! we cannot satisfy the lifetime bounds necessary when indexing the documents.
 //!
 //! ### A note about returning values
 //! The custom value type does not have to be the type stored by the document, instead the
-//! implementor of a `Value` can just be used as a way to convert between the owned type
+//! implementer of a `Value` can just be used as a way to convert between the owned type
 //! kept in the parent document, and the value passed into Tantivy.
 //!
 //! ```
@@ -155,6 +161,7 @@
 
 mod de;
 mod default_document;
+mod erased;
 mod existing_type_impls;
 mod owned_value;
 mod se;
@@ -168,7 +175,10 @@ pub use self::de::{
     ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
     ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
 };
-pub use self::default_document::{DocParsingError, TantivyDocument};
+pub use self::default_document::{
+    CompactDocArrayIter, CompactDocObjectIter, CompactDocValue, DocParsingError, TantivyDocument,
+};
+pub use self::erased::{ErasedDocument, ErasedValue};
 pub use self::owned_value::OwnedValue;
 pub(crate) use self::se::BinaryDocumentSerializer;
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
@@ -186,6 +196,21 @@ pub trait Document: Send + Sync + 'static {
 
     /// Get an iterator iterating over all fields and values in a document.
     fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_>;
+
+    /// Convert this document into the canonical [`TantivyDocument`] representation.
+    ///
+    /// The indexer calls this once per document so it can hand a single concrete type to
+    /// every [`PluginWriter`](crate::plugin::PluginWriter). The default materializes a new
+    /// `TantivyDocument`; `TantivyDocument` overrides it to return itself, so indexing the
+    /// default document type costs nothing extra.
+    fn into_tantivy_document(self) -> TantivyDocument
+    where Self: Sized {
+        let mut doc = TantivyDocument::new();
+        for (field, value) in self.iter_fields_and_values() {
+            doc.add_field_value(field, value);
+        }
+        doc
+    }
 
     /// Sort and groups the field_values by field.
     ///
@@ -229,7 +254,7 @@ pub trait Document: Send + Sync + 'static {
             let field_name = schema.get_field_name(field);
             let values: Vec<OwnedValue> = field_values
                 .into_iter()
-                .map(|val| val.as_value().into())
+                .map(|val| OwnedValue::from(val.as_value()))
                 .collect();
             field_map.insert(field_name.to_string(), values);
         }

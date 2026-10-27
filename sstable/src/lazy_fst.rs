@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
+use tantivy_fst::Map;
+use tantivy_fst::raw::Fst;
 
 const FST_VERSION: u64 = 2;
 const EMPTY_ADDRESS: usize = 0;
@@ -22,6 +24,8 @@ pub(crate) struct LazyFstIndex {
     fst_file: FileSlice,
     meta: LazyFstMeta,
     pages: Arc<[CachedPage]>,
+    /// The whole FST, only materialized for operations that need to stream it (automatons).
+    full_map: Arc<OnceLock<Map<OwnedBytes>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +70,18 @@ impl LazyFstIndex {
             fst_file,
             meta: LazyFstMeta { version, root_addr },
             pages,
+            full_map: Arc::default(),
         })
+    }
+
+    /// Returns the whole FST, reading it entirely on first use.
+    pub(crate) fn map(&self) -> io::Result<&Map<OwnedBytes>> {
+        if let Some(map) = self.full_map.get() {
+            return Ok(map);
+        }
+        let bytes = self.fst_file.read_bytes()?;
+        let map = Map::from(Fst::new(bytes).map_err(|_| corruption_error())?);
+        Ok(self.full_map.get_or_init(|| map))
     }
 
     pub(crate) fn lower_bound(&self, key: &[u8]) -> io::Result<Option<u64>> {
@@ -269,7 +284,7 @@ impl LazyFstIndex {
         let _loading = page
             .loading
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "FST page cache poisoned"))?;
+            .map_err(|_| io::Error::other("FST page cache poisoned"))?;
         if let Some(bytes) = page.bytes.get() {
             return Ok(bytes);
         }

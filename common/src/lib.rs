@@ -5,12 +5,15 @@ use std::ops::Deref;
 pub use byteorder::LittleEndian as Endianness;
 
 mod bitset;
+pub mod bounds;
 mod byte_count;
 mod datetime;
 pub mod file_slice;
 mod group_by;
-mod json_path_writer;
+pub mod json_path_writer;
+mod key_tracking;
 mod serialize;
+mod versatile_buffer;
 mod vint;
 mod writer;
 pub use bitset::*;
@@ -18,10 +21,12 @@ pub use byte_count::ByteCount;
 pub use datetime::{DateTime, DateTimePrecision};
 pub use group_by::GroupByIteratorExtended;
 pub use json_path_writer::JsonPathWriter;
+pub use key_tracking::{KeyTracking, WithoutKeys};
 pub use ownedbytes::{OwnedBytes, StableDeref};
 pub use serialize::{BinarySerializable, DeserializeFrom, FixedSize};
+pub use versatile_buffer::VersatileBuffer;
 pub use vint::{
-    read_u32_vint, read_u32_vint_no_advance, serialize_vint_u32, write_u32_vint, VInt, VIntU128,
+    VInt, VIntU128, read_u32_vint, read_u32_vint_no_advance, serialize_vint_u32, write_u32_vint,
 };
 pub use writer::{AntiCallToken, CountingWriter, TerminatingWrite};
 
@@ -129,11 +134,11 @@ pub fn replace_in_place(needle: u8, replacement: u8, bytes: &mut [u8]) {
 }
 
 #[cfg(test)]
-pub mod test {
+pub(crate) mod test {
 
     use proptest::prelude::*;
 
-    use super::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64, BinarySerializable, FixedSize};
+    use super::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64};
 
     fn test_i64_converter_helper(val: i64) {
         assert_eq!(u64_to_i64(i64_to_u64(val)), val);
@@ -141,12 +146,6 @@ pub mod test {
 
     fn test_f64_converter_helper(val: f64) {
         assert_eq!(u64_to_f64(f64_to_u64(val)), val);
-    }
-
-    pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
-        let mut buffer = Vec::new();
-        O::default().serialize(&mut buffer).unwrap();
-        assert_eq!(buffer.len(), O::SIZE_IN_BYTES);
     }
 
     proptest! {
@@ -182,8 +181,10 @@ pub mod test {
 
     #[test]
     fn test_f64_order() {
-        assert!(!(f64_to_u64(f64::NEG_INFINITY)..f64_to_u64(f64::INFINITY))
-            .contains(&f64_to_u64(f64::NAN))); // nan is not a number
+        assert!(
+            !(f64_to_u64(f64::NEG_INFINITY)..f64_to_u64(f64::INFINITY))
+                .contains(&f64_to_u64(f64::NAN))
+        ); // nan is not a number
         assert!(f64_to_u64(1.5) > f64_to_u64(1.0)); // same exponent, different mantissa
         assert!(f64_to_u64(2.0) > f64_to_u64(1.0)); // same mantissa, different exponent
         assert!(f64_to_u64(2.0) > f64_to_u64(1.5)); // different exponent and mantissa

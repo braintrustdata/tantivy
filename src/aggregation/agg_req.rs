@@ -26,23 +26,26 @@
 //! let _agg_req: Aggregations = serde_json::from_str(elasticsearch_compatible_json_req).unwrap();
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::bucket::{
-    DateHistogramAggregationReq, HistogramAggregation, RangeAggregation, TermsAggregation,
+    CompositeAggregation, DateHistogramAggregationReq, FilterAggregation, HistogramAggregation,
+    MultiTermsAggregation, RangeAggregation, TermsAggregation,
 };
 use super::metric::{
-    AverageAggregation, CountAggregation, MaxAggregation, MinAggregation,
-    PercentilesAggregationReq, StatsAggregation, SumAggregation, TopHitsAggregation,
+    AverageAggregation, CardinalityAggregationReq, CountAggregation, ExtendedStatsAggregation,
+    MaxAggregation, MinAggregation, PercentilesAggregationReq, StatsAggregation, SumAggregation,
+    TopHitsAggregationReq,
 };
 
 /// The top-level aggregation request structure, which contains [`Aggregation`] and their user
 /// defined names. It is also used in buckets aggregations to define sub-aggregations.
 ///
 /// The key is the user defined name of the aggregation.
-pub type Aggregations = HashMap<String, Aggregation>;
+pub type Aggregations = FxHashMap<String, Aggregation>;
 
 /// Aggregation request.
 ///
@@ -112,6 +115,71 @@ pub fn get_fast_field_names(aggs: &Aggregations) -> HashSet<String> {
     fast_field_names
 }
 
+/// Validates that all fields referenced in the aggregation request exist in the schema
+/// and are configured as fast fields.
+///
+/// This is a convenience function for upfront validation before executing aggregations.
+/// Returns an error if any field doesn't exist or is not a fast field.
+///
+/// Validation is intentionally opt-in rather than baked into aggregation execution: the
+/// default lenient behavior (returning empty results for missing fields) supports
+/// schema evolution and federated queries where the same request runs against segments
+/// or indices with different schemas.
+///
+/// # Example
+/// ```
+/// use tantivy::aggregation::agg_req::{Aggregations, validate_aggregation_fields_exist};
+/// use tantivy::schema::{Schema, FAST};
+/// use tantivy::Index;
+///
+/// # fn main() -> tantivy::Result<()> {
+/// // Create a simple index
+/// let mut schema_builder = Schema::builder();
+/// schema_builder.add_f64_field("price", FAST);
+/// let schema = schema_builder.build();
+/// let index = Index::create_in_ram(schema);
+///
+/// // Parse aggregation request
+/// let agg_req: Aggregations = serde_json::from_str(r#"{
+///     "avg_price": { "avg": { "field": "price" } }
+/// }"#)?;
+///
+/// let reader = index.reader()?;
+/// let searcher = reader.searcher();
+///
+/// // Validate fields before executing
+/// for segment_reader in searcher.segment_readers() {
+///     validate_aggregation_fields_exist(&agg_req, segment_reader)?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_aggregation_fields_exist(
+    aggs: &Aggregations,
+    reader: &crate::SegmentReader,
+) -> crate::Result<()> {
+    let field_names = get_fast_field_names(aggs);
+    let schema = reader.schema();
+
+    for field_name in field_names {
+        // Check if the field is either directly in the schema or could be part of a json field
+        // present in the schema, and verify it's a fast field.
+        if let Some((field, _path)) = schema.find_field(&field_name) {
+            let field_type = schema.get_field_entry(field).field_type();
+            if !field_type.is_fast() {
+                return Err(crate::TantivyError::SchemaError(format!(
+                    "Field '{}' is not a fast field. Aggregations require fast fields.",
+                    field_name
+                )));
+            }
+        } else {
+            return Err(crate::TantivyError::FieldNotFound(field_name));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 /// All aggregation types.
 pub enum AggregationVariants {
@@ -128,6 +196,15 @@ pub enum AggregationVariants {
     /// Put data into buckets of terms.
     #[serde(rename = "terms")]
     Terms(TermsAggregation),
+    /// Filter documents into a single bucket.
+    #[serde(rename = "filter")]
+    Filter(FilterAggregation),
+    /// Multi-dimensional, paginable bucket aggregation.
+    #[serde(rename = "composite")]
+    Composite(CompositeAggregation),
+    /// Bucket aggregation over unique combinations of values across multiple term fields.
+    #[serde(rename = "multi_terms")]
+    MultiTerms(MultiTermsAggregation),
 
     // Metric aggregation types
     /// Computes the average of the extracted values.
@@ -146,6 +223,11 @@ pub enum AggregationVariants {
     /// extracted values.
     #[serde(rename = "stats")]
     Stats(StatsAggregation),
+    /// Computes a collection of estended statistics (`min`, `max`, `sum`, `count`, `avg`,
+    /// `sum_of_squares`, `variance`, `variance_sampling`, `std_deviation`,
+    /// `std_deviation_sampling`) over the  extracted values.
+    #[serde(rename = "extended_stats")]
+    ExtendedStats(ExtendedStatsAggregation),
     /// Computes the sum of the extracted values.
     #[serde(rename = "sum")]
     Sum(SumAggregation),
@@ -154,7 +236,10 @@ pub enum AggregationVariants {
     Percentiles(PercentilesAggregationReq),
     /// Finds the top k values matching some order
     #[serde(rename = "top_hits")]
-    TopHits(TopHitsAggregation),
+    TopHits(TopHitsAggregationReq),
+    /// Computes an estimate of the number of unique values
+    #[serde(rename = "cardinality")]
+    Cardinality(CardinalityAggregationReq),
 }
 
 impl AggregationVariants {
@@ -165,14 +250,25 @@ impl AggregationVariants {
             AggregationVariants::Range(range) => vec![range.field.as_str()],
             AggregationVariants::Histogram(histogram) => vec![histogram.field.as_str()],
             AggregationVariants::DateHistogram(histogram) => vec![histogram.field.as_str()],
+            AggregationVariants::Filter(filter) => filter.get_fast_field_names(),
+            AggregationVariants::Composite(composite) => composite
+                .sources
+                .iter()
+                .map(|source| source.field())
+                .collect(),
+            AggregationVariants::MultiTerms(mt) => {
+                mt.terms.iter().map(|t| t.field.as_str()).collect()
+            }
             AggregationVariants::Average(avg) => vec![avg.field_name()],
             AggregationVariants::Count(count) => vec![count.field_name()],
             AggregationVariants::Max(max) => vec![max.field_name()],
             AggregationVariants::Min(min) => vec![min.field_name()],
             AggregationVariants::Stats(stats) => vec![stats.field_name()],
+            AggregationVariants::ExtendedStats(extended_stats) => vec![extended_stats.field_name()],
             AggregationVariants::Sum(sum) => vec![sum.field_name()],
             AggregationVariants::Percentiles(per) => vec![per.field_name()],
             AggregationVariants::TopHits(top_hits) => top_hits.field_names(),
+            AggregationVariants::Cardinality(per) => vec![per.field_name()],
         }
     }
 
@@ -197,10 +293,27 @@ impl AggregationVariants {
             _ => None,
         }
     }
-
+    pub(crate) fn as_composite(&self) -> Option<&CompositeAggregation> {
+        match &self {
+            AggregationVariants::Composite(composite) => Some(composite),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_multi_terms(&self) -> Option<&MultiTermsAggregation> {
+        match &self {
+            AggregationVariants::MultiTerms(mt) => Some(mt),
+            _ => None,
+        }
+    }
     pub(crate) fn as_percentile(&self) -> Option<&PercentilesAggregationReq> {
         match &self {
             AggregationVariants::Percentiles(percentile_req) => Some(percentile_req),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_sum(&self) -> Option<&SumAggregation> {
+        match &self {
+            AggregationVariants::Sum(sum) => Some(sum),
             _ => None,
         }
     }

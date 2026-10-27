@@ -2,15 +2,443 @@ use serde_json::Value;
 
 use crate::aggregation::agg_req::{Aggregation, Aggregations};
 use crate::aggregation::agg_result::AggregationResults;
-use crate::aggregation::buf_collector::DOC_BLOCK_SIZE;
 use crate::aggregation::collector::AggregationCollector;
-use crate::aggregation::intermediate_agg_result::IntermediateAggregationResults;
-use crate::aggregation::segment_agg_result::AggregationLimits;
+use crate::aggregation::intermediate_agg_result::{
+    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
+    IntermediateKey, PruneMode,
+};
 use crate::aggregation::tests::{get_test_index_2_segments, get_test_index_from_values_and_terms};
 use crate::aggregation::DistributedAggregationCollector;
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{AllQuery, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, FAST};
 use crate::{Index, IndexWriter, Term};
+
+// The following tests ensure that each bucket aggregation type correctly functions as a
+// sub-aggregation of another bucket aggregation in two scenarios:
+// 1) The parent has more buckets than the child sub-aggregation
+// 2) The child sub-aggregation has more buckets than the parent
+//
+// These scenarios exercise the bucket id mapping and sub-aggregation routing logic.
+
+#[test]
+fn test_terms_as_subagg_parent_more_vs_child_more() -> crate::Result<()> {
+    let index = get_test_index_2_segments(false)?;
+
+    // Case A: parent has more buckets than child
+    // Parent: range with 4 buckets
+    // Child: terms on text -> 2 buckets
+    let agg_parent_more: Aggregations = serde_json::from_value(json!({
+        "parent_range": {
+            "range": {
+                "field": "score",
+                "ranges": [
+                    {"to": 3.0},
+                    {"from": 3.0, "to": 7.0},
+                    {"from": 7.0, "to": 20.0},
+                    {"from": 20.0}
+                ]
+            },
+            "aggs": {
+                "child_terms": {"terms": {"field": "text", "order": {"_key": "asc"}}}
+            }
+        }
+    }))
+    .unwrap();
+
+    let res = crate::aggregation::tests::exec_request(agg_parent_more, &index)?;
+    // Exact expected structure and counts
+    assert_eq!(
+        res["parent_range"]["buckets"],
+        json!([
+            {
+                "key": "*-3",
+                "doc_count": 1,
+                "to": 3.0,
+                "child_terms": {
+                    "buckets": [
+                        {"doc_count": 1, "key": "cool"}
+                    ],
+                    "sum_other_doc_count": 0
+                }
+            },
+            {
+                "key": "3-7",
+                "doc_count": 3,
+                "from": 3.0,
+                "to": 7.0,
+                "child_terms": {
+                    "buckets": [
+                        {"doc_count": 2, "key": "cool"},
+                        {"doc_count": 1, "key": "nohit"}
+                    ],
+                    "sum_other_doc_count": 0
+                }
+            },
+            {
+                "key": "7-20",
+                "doc_count": 3,
+                "from": 7.0,
+                "to": 20.0,
+                "child_terms": {
+                    "buckets": [
+                        {"doc_count": 3, "key": "cool"}
+                    ],
+                    "sum_other_doc_count": 0
+                }
+            },
+            {
+                "key": "20-*",
+                "doc_count": 2,
+                "from": 20.0,
+                "child_terms": {
+                    "buckets": [
+                        {"doc_count": 1, "key": "cool"},
+                        {"doc_count": 1, "key": "nohit"}
+                    ],
+                    "sum_other_doc_count": 0
+                }
+            }
+        ])
+    );
+
+    // Case B: child has more buckets than parent
+    // Parent: histogram on score with large interval -> 1 bucket
+    // Child: terms on text -> 2 buckets (cool/nohit)
+    let agg_child_more: Aggregations = serde_json::from_value(json!({
+        "parent_hist": {
+            "histogram": {"field": "score", "interval": 100.0},
+            "aggs": {
+                "child_terms": {"terms": {"field": "text", "order": {"_key": "asc"}}}
+            }
+        }
+    }))
+    .unwrap();
+
+    let res = crate::aggregation::tests::exec_request(agg_child_more, &index)?;
+    assert_eq!(
+        res["parent_hist"],
+        json!({
+            "buckets": [
+                {
+                    "key": 0.0,
+                    "doc_count": 9,
+                    "child_terms": {
+                        "buckets": [
+                            {"doc_count": 7, "key": "cool"},
+                            {"doc_count": 2, "key": "nohit"}
+                        ],
+                        "sum_other_doc_count": 0
+                    }
+                }
+            ]
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_range_as_subagg_parent_more_vs_child_more() -> crate::Result<()> {
+    let index = get_test_index_2_segments(false)?;
+
+    // Case A: parent has more buckets than child
+    // Parent: range with 5 buckets
+    // Child: coarse range with 3 buckets
+    let agg_parent_more: Aggregations = serde_json::from_value(json!({
+        "parent_range": {
+            "range": {
+                "field": "score",
+                "ranges": [
+                    {"to": 3.0},
+                    {"from": 3.0, "to": 7.0},
+                    {"from": 7.0, "to": 11.0},
+                    {"from": 11.0, "to": 20.0},
+                    {"from": 20.0}
+                ]
+            },
+            "aggs": {
+                "child_range": {
+                    "range": {
+                        "field": "score",
+                        "ranges": [
+                            {"to": 3.0},
+                            {"from": 3.0, "to": 20.0}
+                        ]
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let res = crate::aggregation::tests::exec_request(agg_parent_more, &index)?;
+    assert_eq!(
+        res["parent_range"]["buckets"],
+        json!([
+            {"key": "*-3", "doc_count": 1, "to": 3.0,
+                "child_range": {"buckets": [
+                    {"key": "*-3", "doc_count": 1, "to": 3.0},
+                    {"key": "3-20", "doc_count": 0, "from": 3.0, "to": 20.0},
+                    {"key": "20-*", "doc_count": 0, "from": 20.0}
+                ]}
+            },
+            {"key": "3-7", "doc_count": 3, "from": 3.0, "to": 7.0,
+                "child_range": {"buckets": [
+                    {"key": "*-3", "doc_count": 0, "to": 3.0},
+                    {"key": "3-20", "doc_count": 3, "from": 3.0, "to": 20.0},
+                    {"key": "20-*", "doc_count": 0, "from": 20.0}
+                ]}
+            },
+            {"key": "7-11", "doc_count": 1, "from": 7.0, "to": 11.0,
+                "child_range": {"buckets": [
+                    {"key": "*-3", "doc_count": 0, "to": 3.0},
+                    {"key": "3-20", "doc_count": 1, "from": 3.0, "to": 20.0},
+                    {"key": "20-*", "doc_count": 0, "from": 20.0}
+                ]}
+            },
+            {"key": "11-20", "doc_count": 2, "from": 11.0, "to": 20.0,
+                "child_range": {"buckets": [
+                    {"key": "*-3", "doc_count": 0, "to": 3.0},
+                    {"key": "3-20", "doc_count": 2, "from": 3.0, "to": 20.0},
+                    {"key": "20-*", "doc_count": 0, "from": 20.0}
+                ]}
+            },
+            {"key": "20-*", "doc_count": 2, "from": 20.0,
+                "child_range": {"buckets": [
+                    {"key": "*-3", "doc_count": 0, "to": 3.0},
+                    {"key": "3-20", "doc_count": 0, "from": 3.0, "to": 20.0},
+                    {"key": "20-*", "doc_count": 2, "from": 20.0}
+                ]}
+            }
+        ])
+    );
+
+    // Case B: child has more buckets than parent
+    // Parent: terms on text (2 buckets)
+    // Child: range with 4 buckets
+    let agg_child_more: Aggregations = serde_json::from_value(json!({
+        "parent_terms": {
+            "terms": {"field": "text"},
+            "aggs": {
+                "child_range": {
+                    "range": {
+                        "field": "score",
+                        "ranges": [
+                            {"to": 3.0},
+                            {"from": 3.0, "to": 7.0},
+                            {"from": 7.0, "to": 20.0}
+                        ]
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let res = crate::aggregation::tests::exec_request(agg_child_more, &index)?;
+
+    assert_eq!(
+        res["parent_terms"],
+        json!({
+            "buckets": [
+                {
+                    "key": "cool",
+                    "doc_count": 7,
+                    "child_range": {
+                        "buckets": [
+                            {"key": "*-3", "doc_count": 1, "to": 3.0},
+                            {"key": "3-7", "doc_count": 2, "from": 3.0, "to": 7.0},
+                            {"key": "7-20", "doc_count": 3, "from": 7.0, "to": 20.0},
+                            {"key": "20-*", "doc_count": 1, "from": 20.0}
+                        ]
+                    }
+                },
+                {
+                    "key": "nohit",
+                    "doc_count": 2,
+                    "child_range": {
+                        "buckets": [
+                            {"key": "*-3", "doc_count": 0, "to": 3.0},
+                            {"key": "3-7", "doc_count": 1, "from": 3.0, "to": 7.0},
+                            {"key": "7-20", "doc_count": 0, "from": 7.0, "to": 20.0},
+                            {"key": "20-*", "doc_count": 1, "from": 20.0}
+                        ]
+                    }
+                }
+            ],
+            "doc_count_error_upper_bound": 0,
+            "sum_other_doc_count": 0
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_histogram_as_subagg_parent_more_vs_child_more() -> crate::Result<()> {
+    let index = get_test_index_2_segments(false)?;
+
+    // Case A: parent has more buckets than child
+    // Parent: range with several ranges
+    // Child: histogram with large interval (single bucket per parent)
+    let agg_parent_more: Aggregations = serde_json::from_value(json!({
+        "parent_range": {
+            "range": {
+                "field": "score",
+                "ranges": [
+                    {"to": 3.0},
+                    {"from": 3.0, "to": 7.0},
+                    {"from": 7.0, "to": 11.0},
+                    {"from": 11.0, "to": 20.0},
+                    {"from": 20.0}
+                ]
+            },
+            "aggs": {
+                "child_hist": {"histogram": {"field": "score", "interval": 100.0}}
+            }
+        }
+    }))
+    .unwrap();
+    let res = crate::aggregation::tests::exec_request(agg_parent_more, &index)?;
+    assert_eq!(
+        res["parent_range"]["buckets"],
+        json!([
+            {"key": "*-3", "doc_count": 1, "to": 3.0,
+                "child_hist": {"buckets": [ {"key": 0.0, "doc_count": 1} ]}
+            },
+            {"key": "3-7", "doc_count": 3, "from": 3.0, "to": 7.0,
+                "child_hist": {"buckets": [ {"key": 0.0, "doc_count": 3} ]}
+            },
+            {"key": "7-11", "doc_count": 1, "from": 7.0, "to": 11.0,
+                "child_hist": {"buckets": [ {"key": 0.0, "doc_count": 1} ]}
+            },
+            {"key": "11-20", "doc_count": 2, "from": 11.0, "to": 20.0,
+                "child_hist": {"buckets": [ {"key": 0.0, "doc_count": 2} ]}
+            },
+            {"key": "20-*", "doc_count": 2, "from": 20.0,
+                "child_hist": {"buckets": [ {"key": 0.0, "doc_count": 2} ]}
+            }
+        ])
+    );
+
+    // Case B: child has more buckets than parent
+    // Parent: terms on text -> 2 buckets
+    // Child: histogram with small interval -> multiple buckets including empties
+    let agg_child_more: Aggregations = serde_json::from_value(json!({
+        "parent_terms": {
+            "terms": {"field": "text"},
+            "aggs": {
+                "child_hist": {"histogram": {"field": "score", "interval": 10.0}}
+            }
+        }
+    }))
+    .unwrap();
+    let res = crate::aggregation::tests::exec_request(agg_child_more, &index)?;
+    assert_eq!(
+        res["parent_terms"],
+        json!({
+            "buckets": [
+                {
+                    "key": "cool",
+                    "doc_count": 7,
+                    "child_hist": {
+                        "buckets": [
+                            {"key": 0.0, "doc_count": 4},
+                            {"key": 10.0, "doc_count": 2},
+                            {"key": 20.0, "doc_count": 0},
+                            {"key": 30.0, "doc_count": 0},
+                            {"key": 40.0, "doc_count": 1}
+                        ]
+                    }
+                },
+                {
+                    "key": "nohit",
+                    "doc_count": 2,
+                    "child_hist": {
+                        "buckets": [
+                            {"key": 0.0, "doc_count": 1},
+                            {"key": 10.0, "doc_count": 0},
+                            {"key": 20.0, "doc_count": 0},
+                            {"key": 30.0, "doc_count": 0},
+                            {"key": 40.0, "doc_count": 1}
+                        ]
+                    }
+                }
+            ],
+            "doc_count_error_upper_bound": 0,
+            "sum_other_doc_count": 0
+        })
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_date_histogram_as_subagg_parent_more_vs_child_more() -> crate::Result<()> {
+    let index = get_test_index_2_segments(false)?;
+
+    // Case A: parent has more buckets than child
+    // Parent: range with several buckets
+    // Child: date_histogram with 30d -> single bucket per parent
+    let agg_parent_more: Aggregations = serde_json::from_value(json!({
+        "parent_range": {
+            "range": {
+                "field": "score",
+                "ranges": [
+                    {"to": 3.0},
+                    {"from": 3.0, "to": 7.0},
+                    {"from": 7.0, "to": 11.0},
+                    {"from": 11.0, "to": 20.0},
+                    {"from": 20.0}
+                ]
+            },
+            "aggs": {
+                "child_date_hist": {"date_histogram": {"field": "date", "fixed_interval": "30d"}}
+            }
+        }
+    }))
+    .unwrap();
+    let res = crate::aggregation::tests::exec_request(agg_parent_more, &index)?;
+    let buckets = res["parent_range"]["buckets"].as_array().unwrap();
+    // Verify each parent bucket has exactly one child date bucket with matching doc_count
+    for bucket in buckets {
+        let parent_count = bucket["doc_count"].as_u64().unwrap();
+        let child_buckets = bucket["child_date_hist"]["buckets"].as_array().unwrap();
+        assert_eq!(child_buckets.len(), 1);
+        assert_eq!(child_buckets[0]["doc_count"], parent_count);
+    }
+
+    // Case B: child has more buckets than parent
+    // Parent: terms on text (2 buckets)
+    // Child: date_histogram with 1d -> multiple buckets
+    let agg_child_more: Aggregations = serde_json::from_value(json!({
+        "parent_terms": {
+            "terms": {"field": "text"},
+            "aggs": {
+                "child_date_hist": {"date_histogram": {"field": "date", "fixed_interval": "1d"}}
+            }
+        }
+    }))
+    .unwrap();
+    let res = crate::aggregation::tests::exec_request(agg_child_more, &index)?;
+    let buckets = res["parent_terms"]["buckets"].as_array().unwrap();
+
+    // cool bucket
+    assert_eq!(buckets[0]["key"], "cool");
+    let cool_buckets = buckets[0]["child_date_hist"]["buckets"].as_array().unwrap();
+    assert_eq!(cool_buckets.len(), 3);
+    assert_eq!(cool_buckets[0]["doc_count"], 1); // day 0
+    assert_eq!(cool_buckets[1]["doc_count"], 4); // day 1
+    assert_eq!(cool_buckets[2]["doc_count"], 2); // day 2
+
+    // nohit bucket
+    assert_eq!(buckets[1]["key"], "nohit");
+    let nohit_buckets = buckets[1]["child_date_hist"]["buckets"].as_array().unwrap();
+    assert_eq!(nohit_buckets.len(), 2);
+    assert_eq!(nohit_buckets[0]["doc_count"], 1); // day 1
+    assert_eq!(nohit_buckets[1]["doc_count"], 1); // day 2
+
+    Ok(())
+}
 
 fn get_avg_req(field_name: &str) -> Aggregation {
     serde_json::from_value(json!({
@@ -26,6 +454,10 @@ fn get_collector(agg_req: Aggregations) -> AggregationCollector {
 }
 
 // *** EVERY BUCKET-TYPE SHOULD BE TESTED HERE ***
+// Note: The flushng part of these  tests are outdated, since the buffering change after converting
+// the collection into one collector per request instead of per bucket.
+//
+// However they are useful as they test a complex aggregation requests.
 fn test_aggregation_flushing(
     merge_segments: bool,
     use_distributed_collector: bool,
@@ -38,8 +470,9 @@ fn test_aggregation_flushing(
 
     let reader = index.reader()?;
 
-    assert_eq!(DOC_BLOCK_SIZE, 64);
-    // In the tree we cache Documents of DOC_BLOCK_SIZE, before passing them down as one block.
+    assert_eq!(COLLECT_BLOCK_BUFFER_LEN, 64);
+    // In the tree we cache documents of COLLECT_BLOCK_BUFFER_LEN before passing them down as one
+    // block.
     //
     // Build a request so that on the first level we have one full cache, which is then flushed.
     // The same cache should have some residue docs at the end, which are flushed (Range 0-70)
@@ -110,6 +543,16 @@ fn test_aggregation_flushing(
                 }
             }
         }
+    },
+    "cardinality_string_id":{
+        "cardinality": {
+            "field": "string_id"
+        }
+    },
+    "cardinality_score":{
+        "cardinality": {
+            "field": "score"
+        }
     }
     });
 
@@ -118,10 +561,8 @@ fn test_aggregation_flushing(
             .unwrap();
 
     let agg_res: AggregationResults = if use_distributed_collector {
-        let collector = DistributedAggregationCollector::from_aggs(
-            agg_req.clone(),
-            AggregationLimits::default(),
-        );
+        let collector =
+            DistributedAggregationCollector::from_aggs(agg_req.clone(), Default::default());
 
         let searcher = reader.searcher();
         let intermediate_agg_result = searcher.search(&AllQuery, &collector).unwrap();
@@ -136,7 +577,7 @@ fn test_aggregation_flushing(
                 .expect("Post deserialization failed");
 
         intermediate_agg_result
-            .into_final_result(agg_req, &Default::default())
+            .into_final_result(agg_req, Default::default())
             .unwrap()
     } else {
         let collector = get_collector(agg_req);
@@ -212,6 +653,9 @@ fn test_aggregation_flushing(
         )
     );
 
+    assert_eq!(res["cardinality_string_id"]["value"], 2.0);
+    assert_eq!(res["cardinality_score"]["value"], 80.0);
+
     Ok(())
 }
 
@@ -221,6 +665,82 @@ fn test_aggregation_flushing_variants() {
     test_aggregation_flushing(false, true).unwrap();
     test_aggregation_flushing(true, false).unwrap();
     test_aggregation_flushing(true, true).unwrap();
+}
+
+// Regression test for https://github.com/quickwit-oss/tantivy/issues/2992
+//
+// A skewed terms bucket over <100 terms uses the low-cardinality (Vec) sub-agg buffer. A dominant
+// term keeps crossing the periodic flush threshold (every 2048 docs), which used to drop the
+// cached doc ids of the minority buckets before collecting them — corrupting their metric
+// sub-aggregations while their doc counts stayed exact.
+#[test]
+fn test_terms_sub_agg_flushing_skewed_buckets() -> crate::Result<()> {
+    use std::collections::HashMap;
+
+    // 89 minority terms + 1 dominant term = 90 distinct terms, staying below
+    // MAX_NUM_TERMS_FOR_LOWCARD_SUBAGG (100) so the low-cardinality Vec sub-agg buffer is used.
+    const NUM_MINORITY_TERMS: usize = 89;
+
+    let mut values: Vec<(f64, String)> = Vec::new();
+    let mut minority_idx = 0usize;
+    // Enough docs to cross the 2048 flush threshold multiple times. The minority docs are
+    // sprinkled among the dominant ones so they land in different flush windows.
+    for i in 0..5000u64 {
+        if i % 25 == 0 {
+            let term = format!("minority_{:02}", minority_idx % NUM_MINORITY_TERMS);
+            minority_idx += 1;
+            values.push(((i % 13 + 1) as f64, term));
+        } else {
+            values.push((7.0, "dominant".to_string()));
+        }
+    }
+
+    let mut truth: HashMap<String, (u64, f64)> = HashMap::new();
+    for (score, term) in &values {
+        let entry = truth.entry(term.clone()).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += *score;
+    }
+    // Sanity check on the shape of the generated data.
+    assert_eq!(truth.len(), NUM_MINORITY_TERMS + 1);
+
+    let index = get_test_index_from_values_and_terms(false, &[values])?;
+    let reader = index.reader()?;
+
+    let agg_req: Aggregations = serde_json::from_value(json!({
+        "my_terms": {
+            "terms": { "field": "string_id", "size": 100 },
+            "aggs": {
+                "sum_score": { "sum": { "field": "score" } }
+            }
+        }
+    }))
+    .unwrap();
+
+    let collector = get_collector(agg_req);
+    let searcher = reader.searcher();
+    let agg_res = searcher.search(&AllQuery, &collector)?;
+    let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+
+    let buckets = res["my_terms"]["buckets"].as_array().unwrap();
+    // size 100 >= 90 distinct terms, so every bucket is returned.
+    assert_eq!(buckets.len(), truth.len());
+    for bucket in buckets {
+        let key = bucket["key"].as_str().unwrap();
+        let (true_count, true_sum) = truth[key];
+        assert_eq!(
+            bucket["doc_count"].as_u64().unwrap(),
+            true_count,
+            "doc_count mismatch for {key}"
+        );
+        assert_eq!(
+            bucket["sum_score"]["value"].as_f64().unwrap(),
+            true_sum,
+            "sum sub-agg mismatch for {key}"
+        );
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -447,7 +967,7 @@ fn test_aggregation_level2(
 
         let searcher = reader.searcher();
         let res = searcher.search(&term_query, &collector).unwrap();
-        res.into_final_result(agg_req.clone(), &Default::default())
+        res.into_final_result(agg_req.clone(), Default::default())
             .unwrap()
     } else {
         let collector = get_collector(agg_req.clone());
@@ -857,7 +1377,7 @@ fn test_aggregation_on_json_object_mixed_types() {
         .add_document(doc!(json => json!({"mixed_type": "blue", "mixed_price": 5.0})))
         .unwrap();
     index_writer.commit().unwrap();
-    // => Segment with all boolen
+    // => Segment with all boolean
     index_writer
         .add_document(doc!(json => json!({"mixed_type": true, "mixed_price": "no_price"})))
         .unwrap();
@@ -926,15 +1446,246 @@ fn test_aggregation_on_json_object_mixed_types() {
           },
           "termagg": {
             "buckets": [
-              { "doc_count": 1, "key": 10.0, "min_price": { "value": 10.0 } },
+              { "doc_count": 1, "key": 10, "min_price": { "value": 10.0 } },
               { "doc_count": 3, "key": "blue", "min_price": { "value": 5.0 } },
               { "doc_count": 2, "key": "red", "min_price": { "value": 1.0 } },
               { "doc_count": 1, "key": -20.5, "min_price": { "value": -20.5 } },
-              { "doc_count": 2, "key": 1.0, "key_as_string": "true", "min_price": { "value": null } },
+              { "doc_count": 2, "key": 1, "key_as_string": "true", "min_price": { "value": null } },
             ],
             "sum_other_doc_count": 0
           }
         }
         )
     );
+}
+
+#[test]
+fn test_aggregation_on_json_object_mixed_numerical_segments() {
+    let mut schema_builder = Schema::builder();
+    let json = schema_builder.add_json_field("json", FAST);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+    // => Segment with all values f64 numeric
+    index_writer
+        .add_document(doc!(json => json!({"mixed_price": 10.5})))
+        .unwrap();
+    // Gets converted to f64!
+    index_writer
+        .add_document(doc!(json => json!({"mixed_price": 10})))
+        .unwrap();
+    index_writer.commit().unwrap();
+    // => Segment with all values i64 numeric
+    index_writer
+        .add_document(doc!(json => json!({"mixed_price": 10})))
+        .unwrap();
+    index_writer.commit().unwrap();
+
+    index_writer.commit().unwrap();
+
+    // All bucket types
+    let agg_req_str = r#"
+    {
+        "termagg": {
+            "terms": {
+                "field": "json.mixed_price"
+            }
+        }
+    } "#;
+    let agg: Aggregations = serde_json::from_str(agg_req_str).unwrap();
+    let aggregation_collector = get_collector(agg);
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+
+    let aggregation_results = searcher.search(&AllQuery, &aggregation_collector).unwrap();
+    let aggregation_res_json = serde_json::to_value(aggregation_results).unwrap();
+    use pretty_assertions::assert_eq;
+    assert_eq!(
+        &aggregation_res_json,
+        &serde_json::json!({
+          "termagg": {
+            "buckets": [
+              { "doc_count": 2, "key": 10},
+              { "doc_count": 1, "key": 10.5},
+            ],
+            "doc_count_error_upper_bound": 0,
+            "sum_other_doc_count": 0
+          }
+        }
+        )
+    );
+}
+
+#[test]
+fn test_aggregation_field_validation_helper() {
+    // Test the standalone validation helper function for field validation
+    let index = get_test_index_2_segments(false).unwrap();
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    let segment_reader = searcher.segment_reader(0);
+
+    // Test with invalid field
+    let agg_req: Aggregations = serde_json::from_str(
+        r#"{
+        "avg_test": {
+            "avg": { "field": "nonexistent_field" }
+        }
+    }"#,
+    )
+    .unwrap();
+
+    let result =
+        crate::aggregation::agg_req::validate_aggregation_fields_exist(&agg_req, segment_reader);
+    assert!(result.is_err());
+    match result {
+        Err(crate::TantivyError::FieldNotFound(field_name)) => {
+            assert_eq!(field_name, "nonexistent_field");
+        }
+        _ => panic!("Expected FieldNotFound error, got: {:?}", result),
+    }
+
+    // Test with valid field
+    let agg_req: Aggregations = serde_json::from_str(
+        r#"{
+        "avg_test": {
+            "avg": { "field": "score" }
+        }
+    }"#,
+    )
+    .unwrap();
+
+    let result =
+        crate::aggregation::agg_req::validate_aggregation_fields_exist(&agg_req, segment_reader);
+    assert!(result.is_ok());
+}
+
+// "a" has low scores (p50 ≈ 1.5), "b" has high scores (p50 ≈ 99.5).
+// With order by p50 desc and segment_size=1, the segment collector should retain only "b".
+#[test]
+fn test_percentile_order_segment_level() -> crate::Result<()> {
+    let index = get_test_index_from_values_and_terms(
+        false,
+        &[vec![
+            (1.0, "a".to_string()),
+            (2.0, "a".to_string()),
+            (99.0, "b".to_string()),
+            (100.0, "b".to_string()),
+        ]],
+    )?;
+
+    let agg_req: Aggregations = serde_json::from_value(serde_json::json!({
+        "my_terms": {
+            "terms": {
+                "field": "string_id",
+                "size": 1,
+                "segment_size": 1,
+                "order": { "my_pct.50": "desc" }
+            },
+            "aggs": {
+                "my_pct": { "percentiles": { "field": "score_f64", "percents": [50] } }
+            }
+        }
+    }))
+    .unwrap();
+
+    let collector = DistributedAggregationCollector::from_aggs(agg_req, Default::default());
+    let reader = index.reader()?;
+    let intermediate = reader.searcher().search(&AllQuery, &collector)?;
+
+    let IntermediateAggregationResult::Bucket(IntermediateBucketResult::Terms { buckets }) =
+        intermediate.aggs_res.get("my_terms").unwrap()
+    else {
+        panic!("expected terms bucket");
+    };
+    assert_eq!(
+        buckets.entries.len(),
+        1,
+        "segment_size=1 should retain only one bucket"
+    );
+    assert!(
+        buckets
+            .entries
+            .iter()
+            .any(|(key, _)| key == &IntermediateKey::Str("b".to_string())),
+        "\"b\" (higher p50) should survive, not \"a\""
+    );
+    assert!(
+        buckets.sum_other_doc_count > 0,
+        "pruned docs should be accounted for"
+    );
+
+    Ok(())
+}
+
+// Same setup with two segments. Both terms survive segment-level pruning (segment_size=2).
+// After merging, prune_intermediate_results with size=1 should keep only "b".
+#[test]
+fn test_percentile_order_prune_intermediate() -> crate::Result<()> {
+    let index = get_test_index_from_values_and_terms(
+        false,
+        &[
+            vec![
+                (1.0, "a".to_string()),
+                (2.0, "a".to_string()),
+                (99.0, "b".to_string()),
+                (100.0, "b".to_string()),
+            ],
+            vec![(3.0, "a".to_string()), (98.0, "b".to_string())],
+        ],
+    )?;
+
+    let agg_req: Aggregations = serde_json::from_value(serde_json::json!({
+        "my_terms": {
+            "terms": {
+                "field": "string_id",
+                "size": 1,
+                "segment_size": 2,
+                "order": { "my_pct.50": "desc" }
+            },
+            "aggs": {
+                "my_pct": { "percentiles": { "field": "score_f64", "percents": [50] } }
+            }
+        }
+    }))
+    .unwrap();
+
+    let collector = DistributedAggregationCollector::from_aggs(agg_req.clone(), Default::default());
+    let reader = index.reader()?;
+    let mut intermediate = reader.searcher().search(&AllQuery, &collector)?;
+
+    // Both terms should have survived segment-level pruning (segment_size=2).
+    {
+        let IntermediateAggregationResult::Bucket(IntermediateBucketResult::Terms { buckets }) =
+            intermediate.aggs_res.get("my_terms").unwrap()
+        else {
+            panic!("expected terms bucket");
+        };
+        assert_eq!(
+            buckets.entries.len(),
+            2,
+            "both terms should survive segment-level pruning"
+        );
+    }
+
+    intermediate.prune_intermediate_results(&agg_req, PruneMode::Final)?;
+
+    let IntermediateAggregationResult::Bucket(IntermediateBucketResult::Terms { buckets }) =
+        intermediate.aggs_res.get("my_terms").unwrap()
+    else {
+        panic!("expected terms bucket");
+    };
+    assert_eq!(
+        buckets.entries.len(),
+        1,
+        "size=1 should retain only one bucket"
+    );
+    assert!(
+        buckets
+            .entries
+            .iter()
+            .any(|(key, _)| key == &IntermediateKey::Str("b".to_string())),
+        "\"b\" (higher p50) should survive, not \"a\""
+    );
+
+    Ok(())
 }

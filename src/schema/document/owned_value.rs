@@ -1,4 +1,4 @@
-use std::collections::{btree_map, BTreeMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::Ipv6Addr;
 
@@ -8,6 +8,7 @@ use serde::de::{MapAccess, SeqAccess};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::existing_type_impls::can_be_rfc3339_date_time;
 use super::ReferenceValueLeaf;
 use crate::schema::document::{
     ArrayAccess, DeserializeError, ObjectAccess, ReferenceValue, Value, ValueDeserialize,
@@ -45,15 +46,43 @@ pub enum OwnedValue {
     /// A set of values.
     Array(Vec<Self>),
     /// Dynamic object value.
-    Object(BTreeMap<String, Self>),
+    Object(Vec<(String, Self)>),
     /// IpV6 Address. Internally there is no IpV4, it needs to be converted to `Ipv6Addr`.
     IpAddr(Ipv6Addr),
+    /// Opaque payload of a plugin-defined custom field.
+    Custom(Vec<u8>),
 }
 
 impl AsRef<OwnedValue> for OwnedValue {
     #[inline]
     fn as_ref(&self) -> &OwnedValue {
         self
+    }
+}
+
+impl OwnedValue {
+    /// Returns a u8 discriminant value for the `OwnedValue` variant.
+    ///
+    /// This can be used to sort `OwnedValue` instances by their type.
+    pub fn discriminant_value(&self) -> u8 {
+        match self {
+            OwnedValue::Null => 0,
+            OwnedValue::Str(_) => 1,
+            OwnedValue::PreTokStr(_) => 2,
+            // It is key to make sure U64, I64, F64 are grouped together in there, otherwise we
+            // might be breaking transivity.
+            OwnedValue::U64(_) => 3,
+            OwnedValue::I64(_) => 4,
+            OwnedValue::F64(_) => 5,
+            OwnedValue::Bool(_) => 6,
+            OwnedValue::Date(_) => 7,
+            OwnedValue::Facet(_) => 8,
+            OwnedValue::Bytes(_) => 9,
+            OwnedValue::Array(_) => 10,
+            OwnedValue::Object(_) => 11,
+            OwnedValue::IpAddr(_) => 12,
+            OwnedValue::Custom(_) => 13,
+        }
     }
 }
 
@@ -65,15 +94,16 @@ impl<'a> Value<'a> for &'a OwnedValue {
         match self {
             OwnedValue::Null => ReferenceValueLeaf::Null.into(),
             OwnedValue::Str(val) => ReferenceValueLeaf::Str(val).into(),
-            OwnedValue::PreTokStr(val) => ReferenceValueLeaf::PreTokStr(val).into(),
+            OwnedValue::PreTokStr(val) => ReferenceValueLeaf::PreTokStr(val.clone().into()).into(),
             OwnedValue::U64(val) => ReferenceValueLeaf::U64(*val).into(),
             OwnedValue::I64(val) => ReferenceValueLeaf::I64(*val).into(),
             OwnedValue::F64(val) => ReferenceValueLeaf::F64(*val).into(),
             OwnedValue::Bool(val) => ReferenceValueLeaf::Bool(*val).into(),
             OwnedValue::Date(val) => ReferenceValueLeaf::Date(*val).into(),
-            OwnedValue::Facet(val) => ReferenceValueLeaf::Facet(val).into(),
+            OwnedValue::Facet(val) => ReferenceValueLeaf::Facet(val.encoded_str()).into(),
             OwnedValue::Bytes(val) => ReferenceValueLeaf::Bytes(val).into(),
             OwnedValue::IpAddr(val) => ReferenceValueLeaf::IpAddr(*val).into(),
+            OwnedValue::Custom(val) => ReferenceValueLeaf::Custom(val).into(),
             OwnedValue::Array(array) => ReferenceValue::Array(array.iter()),
             OwnedValue::Object(object) => ReferenceValue::Object(ObjectMapIter(object.iter())),
         }
@@ -148,10 +178,10 @@ impl ValueDeserialize for OwnedValue {
 
             fn visit_object<'de, A>(&self, mut access: A) -> Result<Self::Value, DeserializeError>
             where A: ObjectAccess<'de> {
-                let mut elements = BTreeMap::new();
+                let mut elements = Vec::with_capacity(access.size_hint());
 
                 while let Some((key, value)) = access.next_entry()? {
-                    elements.insert(key, value);
+                    elements.push((key, value));
                 }
 
                 Ok(OwnedValue::Object(elements))
@@ -167,6 +197,7 @@ impl Eq for OwnedValue {}
 impl serde::Serialize for OwnedValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
+        use serde::ser::SerializeMap;
         match *self {
             OwnedValue::Null => serializer.serialize_unit(),
             OwnedValue::Str(ref v) => serializer.serialize_str(v),
@@ -180,7 +211,13 @@ impl serde::Serialize for OwnedValue {
             }
             OwnedValue::Facet(ref facet) => facet.serialize(serializer),
             OwnedValue::Bytes(ref bytes) => serializer.serialize_str(&BASE64.encode(bytes)),
-            OwnedValue::Object(ref obj) => obj.serialize(serializer),
+            OwnedValue::Object(ref obj) => {
+                let mut map = serializer.serialize_map(Some(obj.len()))?;
+                for (k, v) in obj {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
             OwnedValue::IpAddr(ref ip_v6) => {
                 // Ensure IpV4 addresses get serialized as IpV4, but excluding IpV6 loopback.
                 if let Some(ip_v4) = ip_v6.to_ipv4_mapped() {
@@ -190,6 +227,10 @@ impl serde::Serialize for OwnedValue {
                 }
             }
             OwnedValue::Array(ref array) => array.serialize(serializer),
+            // Custom payloads are opaque; render them as base64 for display/debug. They never
+            // round-trip through serde (they are populated programmatically), so this is lossy
+            // by design.
+            OwnedValue::Custom(ref bytes) => serializer.serialize_str(&BASE64.encode(bytes)),
         }
     }
 }
@@ -248,12 +289,10 @@ impl<'de> serde::Deserialize<'de> for OwnedValue {
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where A: MapAccess<'de> {
-                let mut object = BTreeMap::new();
-
+                let mut object = map.size_hint().map(Vec::with_capacity).unwrap_or_default();
                 while let Some((key, value)) = map.next_entry()? {
-                    object.insert(key, value);
+                    object.push((key, value));
                 }
-
                 Ok(OwnedValue::Object(object))
             }
         }
@@ -272,11 +311,14 @@ impl<'a, V: Value<'a>> From<ReferenceValue<'a, V>> for OwnedValue {
                 ReferenceValueLeaf::I64(val) => OwnedValue::I64(val),
                 ReferenceValueLeaf::F64(val) => OwnedValue::F64(val),
                 ReferenceValueLeaf::Date(val) => OwnedValue::Date(val),
-                ReferenceValueLeaf::Facet(val) => OwnedValue::Facet(val.clone()),
+                ReferenceValueLeaf::Facet(val) => {
+                    OwnedValue::Facet(Facet::from_encoded_string(val.to_string()))
+                }
                 ReferenceValueLeaf::Bytes(val) => OwnedValue::Bytes(val.to_vec()),
                 ReferenceValueLeaf::IpAddr(val) => OwnedValue::IpAddr(val),
                 ReferenceValueLeaf::Bool(val) => OwnedValue::Bool(val),
-                ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(val.clone()),
+                ReferenceValueLeaf::PreTokStr(val) => OwnedValue::PreTokStr(*val.clone()),
+                ReferenceValueLeaf::Custom(val) => OwnedValue::Custom(val.to_vec()),
             },
             ReferenceValue::Array(val) => {
                 OwnedValue::Array(val.map(|v| v.as_value().into()).collect())
@@ -363,18 +405,9 @@ impl From<PreTokenizedString> for OwnedValue {
 
 impl From<BTreeMap<String, OwnedValue>> for OwnedValue {
     fn from(object: BTreeMap<String, OwnedValue>) -> OwnedValue {
-        OwnedValue::Object(object)
+        let key_values = object.into_iter().collect();
+        OwnedValue::Object(key_values)
     }
-}
-
-fn can_be_rfc3339_date_time(text: &str) -> bool {
-    if let Some(&first_byte) = text.as_bytes().first() {
-        if first_byte.is_ascii_digit() {
-            return true;
-        }
-    }
-
-    false
 }
 
 impl From<serde_json::Value> for OwnedValue {
@@ -395,17 +428,12 @@ impl From<serde_json::Value> for OwnedValue {
             }
             serde_json::Value::String(text) => {
                 if can_be_rfc3339_date_time(&text) {
-                    match OffsetDateTime::parse(&text, &Rfc3339) {
-                        Ok(dt) => {
-                            match dt.checked_to_offset(time::UtcOffset::UTC) {
-                                Some(dt_utc) => Self::Date(DateTime::from_utc(dt_utc)),
-                                None => {
-                                    warn!("Failed to convert datetime {} to UTC", text);
-                                    Self::Str(text)
-                                }
-                            }
-                        }
-                        Err(_) => Self::Str(text),
+                    match OffsetDateTime::parse(&text, &Rfc3339)
+                        .ok()
+                        .and_then(|dt| DateTime::try_from_utc(dt.to_offset(time::UtcOffset::UTC)))
+                    {
+                        Some(dt) => Self::Date(dt),
+                        None => Self::Str(text),
                     }
                 } else {
                     Self::Str(text)
@@ -422,18 +450,16 @@ impl From<serde_json::Value> for OwnedValue {
 
 impl From<serde_json::Map<String, serde_json::Value>> for OwnedValue {
     fn from(map: serde_json::Map<String, serde_json::Value>) -> Self {
-        let mut object = BTreeMap::new();
-
-        for (key, value) in map {
-            object.insert(key, OwnedValue::from(value));
-        }
-
+        let object: Vec<(String, OwnedValue)> = map
+            .into_iter()
+            .map(|(key, value)| (key, OwnedValue::from(value)))
+            .collect();
         OwnedValue::Object(object)
     }
 }
 
 /// A wrapper type for iterating over a serde_json object producing reference values.
-pub struct ObjectMapIter<'a>(btree_map::Iter<'a, String, OwnedValue>);
+pub struct ObjectMapIter<'a>(std::slice::Iter<'a, (String, OwnedValue)>);
 
 impl<'a> Iterator for ObjectMapIter<'a> {
     type Item = (&'a str, &'a OwnedValue);
@@ -471,6 +497,7 @@ mod tests {
         let mut doc = TantivyDocument::default();
         doc.add_bytes(bytes_field, "".as_bytes());
         let json_string = doc.to_json(&schema);
+
         assert_eq!(json_string, r#"{"my_bytes":[""]}"#);
     }
 
@@ -506,5 +533,22 @@ mod tests {
         // The time zone information gets lost by conversion into `Value::Date` and
         // implicitly becomes UTC.
         assert_eq!(serialized_value_json, r#""1996-12-20T01:39:57Z""#);
+    }
+
+    #[test]
+    fn test_from_json_out_of_range_date_is_str() {
+        for text in ["1601-01-01T00:00:00Z", "9999-12-31T23:59:59Z"] {
+            assert_eq!(
+                OwnedValue::from(serde_json::json!(text)),
+                OwnedValue::Str(text.to_string())
+            );
+        }
+        let in_range = "2026-06-30T17:20:27Z";
+        assert_eq!(
+            OwnedValue::from(serde_json::json!(in_range)),
+            OwnedValue::Date(DateTime::from_utc(
+                OffsetDateTime::parse(in_range, &Rfc3339).unwrap()
+            ))
+        );
     }
 }

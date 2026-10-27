@@ -6,9 +6,10 @@ use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
 use crate::index::SegmentReader;
+use crate::postings::TermInfo;
 use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
-use crate::termdict::{TermDictionary, TermStreamer};
+use crate::termdict::{TermDictionary, TermStreamer, WithoutKeys};
 use crate::{DocId, Score, TantivyError};
 
 /// A weight struct for Fuzzy Term and Regex Queries
@@ -51,9 +52,10 @@ where
     fn automaton_stream<'a>(
         &'a self,
         term_dict: &'a TermDictionary,
-    ) -> io::Result<TermStreamer<'a, &'a A>> {
+    ) -> io::Result<TermStreamer<'a, &'a A, WithoutKeys>> {
         let automaton: &A = &self.automaton;
-        let mut term_stream_builder = term_dict.search(automaton);
+        // Matching terms are only used for their `TermInfo`.
+        let mut term_stream_builder = term_dict.search(automaton).without_keys();
 
         if let Some(json_path_bytes) = &self.json_path_bytes {
             term_stream_builder = term_stream_builder.ge(json_path_bytes);
@@ -63,6 +65,18 @@ where
         }
 
         term_stream_builder.into_stream()
+    }
+
+    /// Returns the term infos that match the automaton
+    pub fn get_match_term_infos(&self, reader: &SegmentReader) -> crate::Result<Vec<TermInfo>> {
+        let inverted_index = reader.inverted_index(self.field)?;
+        let term_dict = inverted_index.terms();
+        let mut term_stream = self.automaton_stream(term_dict)?;
+        let mut term_infos = Vec::new();
+        while term_stream.advance() {
+            term_infos.push(term_stream.value().clone());
+        }
+        Ok(term_infos)
     }
 }
 

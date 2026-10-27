@@ -6,7 +6,11 @@ use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
 use crate::schema::{Term, Type};
 use crate::TantivyError::InvalidArgument;
 
-pub(crate) struct DfaWrapper(pub DFA);
+/// The Levenshtein automaton a [`FuzzyTermQuery`] matches terms with.
+///
+/// Obtained from [`FuzzyTermQuery::automaton`], e.g. to stream the term dictionary
+/// and collect the terms the query expands to.
+pub struct DfaWrapper(pub(crate) DFA);
 
 impl Automaton for DfaWrapper {
     type State = u32;
@@ -67,7 +71,7 @@ impl Automaton for DfaWrapper {
 ///     {
 ///         let term = Term::from_field_text(title, "Diary");
 ///         let query = FuzzyTermQuery::new(term, 1, true);
-///         let (top_docs, count) = searcher.search(&query, &(TopDocs::with_limit(2), Count)).unwrap();
+///         let (top_docs, count) = searcher.search(&query, &(TopDocs::with_limit(2).order_by_score(), Count)).unwrap();
 ///         assert_eq!(count, 2);
 ///         assert_eq!(top_docs.len(), 2);
 ///     }
@@ -109,7 +113,21 @@ impl FuzzyTermQuery {
         }
     }
 
-    fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
+    /// Returns the automaton this query matches terms with.
+    ///
+    /// For a JSON term, it matches the term's text only, not its JSON path.
+    ///
+    /// ```rust
+    /// use tantivy::query::{DfaWrapper, FuzzyTermQuery};
+    /// use tantivy::schema::{Schema, TEXT};
+    /// use tantivy::Term;
+    ///
+    /// let mut schema_builder = Schema::builder();
+    /// let title = schema_builder.add_text_field("title", TEXT);
+    /// let query = FuzzyTermQuery::new(Term::from_field_text(title, "diary"), 1, true);
+    /// let _automaton: DfaWrapper = query.automaton().unwrap();
+    /// ```
+    pub fn automaton(&self) -> crate::Result<DfaWrapper> {
         static AUTOMATON_BUILDER: [[OnceCell<LevenshteinAutomatonBuilder>; 2]; 3] = [
             [OnceCell::new(), OnceCell::new()],
             [OnceCell::new(), OnceCell::new()],
@@ -138,8 +156,7 @@ impl FuzzyTermQuery {
                 if json_path_type != Type::Str {
                     return Err(InvalidArgument(format!(
                         "The fuzzy term query requires a string path type for a json term. Found \
-                         {:?}",
-                        json_path_type
+                         {json_path_type:?}"
                     )));
                 }
             }
@@ -159,18 +176,19 @@ impl FuzzyTermQuery {
         } else {
             automaton_builder.build_dfa(term_text)
         };
+        Ok(DfaWrapper(automaton))
+    }
 
-        if let Some((json_path_bytes, _)) = term_value.as_json() {
+    fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
+        let automaton = self.automaton()?;
+        if let Some((json_path_bytes, _)) = self.term.value().as_json() {
             Ok(AutomatonWeight::new_for_json_path(
                 self.term.field(),
-                DfaWrapper(automaton),
+                automaton,
                 json_path_bytes,
             ))
         } else {
-            Ok(AutomatonWeight::new(
-                self.term.field(),
-                DfaWrapper(automaton),
-            ))
+            Ok(AutomatonWeight::new(self.term.field(), automaton))
         }
     }
 }
@@ -189,6 +207,30 @@ mod test {
     use crate::query::QueryParser;
     use crate::schema::{Schema, STORED, TEXT};
     use crate::{assert_nearly_equals, Index, IndexWriter, TantivyDocument, Term};
+
+    #[test]
+    pub fn test_fuzzy_automaton_streams_expanded_terms() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(title => "The Diary of a Dairy Cow"))?;
+        index_writer.add_document(doc!(title => "A Daily Log"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let query = FuzzyTermQuery::new(Term::from_field_text(title, "diary"), 1, true);
+        let automaton = query.automaton()?;
+        let inverted_index = searcher.segment_reader(0).inverted_index(title)?;
+        let mut stream = inverted_index.terms().search(automaton).into_stream()?;
+        let mut terms = Vec::new();
+        while stream.advance() {
+            terms.push(String::from_utf8(stream.key().to_vec()).unwrap());
+        }
+        assert_eq!(terms, vec!["dairy", "diary"]);
+        assert_eq!(searcher.search(&query, &Count)?, 1);
+        Ok(())
+    }
 
     #[test]
     pub fn test_fuzzy_json_path() -> crate::Result<()> {
@@ -242,7 +284,8 @@ mod test {
         {
             let term = get_json_path_term("attributes.aa:japan")?;
             let fuzzy_query = FuzzyTermQuery::new(term, 2, true);
-            let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             assert_eq!(top_docs[0].1.doc_id, 1, "Expected the second document");
         }
@@ -253,7 +296,8 @@ mod test {
             let term = get_json_path_term("attributes.a:japon")?;
 
             let fuzzy_query = FuzzyTermQuery::new(term, 1, true);
-            let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             assert_eq!(top_docs[0].1.doc_id, 0, "Expected the first document");
         }
@@ -263,7 +307,8 @@ mod test {
             let term = get_json_path_term("attributes.a:jap")?;
 
             let fuzzy_query = FuzzyTermQuery::new(term, 1, true);
-            let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 0, "Expected no document");
         }
 
@@ -293,7 +338,8 @@ mod test {
         {
             let term = Term::from_field_text(country_field, "japon");
             let fuzzy_query = FuzzyTermQuery::new(term, 1, true);
-            let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             let (score, _) = top_docs[0];
             assert_nearly_equals!(1.0, score);
@@ -304,7 +350,8 @@ mod test {
             let term = Term::from_field_text(country_field, "jap");
 
             let fuzzy_query = FuzzyTermQuery::new(term, 1, true);
-            let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 0, "Expected no document");
         }
 
@@ -312,7 +359,8 @@ mod test {
         {
             let term = Term::from_field_text(country_field, "jap");
             let fuzzy_query = FuzzyTermQuery::new_prefix(term, 1, true);
-            let top_docs = searcher.search(&fuzzy_query, &TopDocs::with_limit(2))?;
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             let (score, _) = top_docs[0];
             assert_nearly_equals!(1.0, score);

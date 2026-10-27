@@ -1,9 +1,10 @@
 //! Tantivy can (if instructed to do so in the schema) store the term positions in a given field.
+//!
 //! This position is expressed as token ordinal. For instance,
 //! In "The beauty and the beast", the term "the" appears in position 0 and position 3.
 //! This information is useful to run phrase queries.
 //!
-//! The [position](crate::SegmentComponent::Positions) file contains all of the
+//! The [position](crate::index::SegmentComponent::Positions) file contains all of the
 //! bitpacked positions delta, for all terms of a given field, one term after the other.
 //!
 //! Each term is encoded independently.
@@ -38,9 +39,7 @@ pub use self::serializer::PositionSerializer;
 const COMPRESSION_BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 #[cfg(test)]
-pub mod tests {
-
-    use std::iter;
+pub(crate) mod tests {
 
     use proptest::prelude::*;
     use proptest::sample::select;
@@ -205,7 +204,7 @@ pub mod tests {
     #[test]
     fn test_position() -> crate::Result<()> {
         const CONST_VAL: u32 = 9u32;
-        let positions_delta: Vec<u32> = iter::repeat(CONST_VAL).take(2_000_000).collect();
+        let positions_delta: Vec<u32> = std::iter::repeat_n(CONST_VAL, 2_000_000).collect();
         let positions_data = create_positions_data(&positions_delta[..])?;
         assert_eq!(positions_data.len(), 1_015_627);
         let mut position_reader = PositionReader::open(positions_data)?;

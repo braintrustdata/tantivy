@@ -1,19 +1,25 @@
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::sync::Arc;
+
+#[cfg(feature = "quickwit")]
+use futures_util::{future::Either, FutureExt};
 
 use crate::TantivyError;
 
-/// Search executor whether search request are single thread or multithread.
-///
-/// We don't expose Rayon thread pool directly here for several reasons.
-///
-/// First dependency hell. It is not a good idea to expose the
-/// API of a dependency, knowing it might conflict with a different version
-/// used by the client. Second, we may stop using rayon in the future.
+/// Executor makes it possible to run tasks in single thread or
+/// in a thread pool.
+#[derive(Clone)]
 pub enum Executor {
     /// Single thread variant of an Executor
     SingleThread,
     /// Thread pool variant of an Executor
-    ThreadPool(ThreadPool),
+    ThreadPool(Arc<rayon::ThreadPool>),
+}
+
+#[cfg(feature = "quickwit")]
+impl From<Arc<rayon::ThreadPool>> for Executor {
+    fn from(thread_pool: Arc<rayon::ThreadPool>) -> Self {
+        Executor::ThreadPool(thread_pool)
+    }
 }
 
 impl Executor {
@@ -24,29 +30,33 @@ impl Executor {
 
     /// Creates an Executor that dispatches the tasks in a thread pool.
     pub fn multi_thread(num_threads: usize, prefix: &'static str) -> crate::Result<Executor> {
-        let pool = ThreadPoolBuilder::new()
+        let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(move |num| format!("{prefix}{num}"))
             .build()?;
-        Ok(Executor::ThreadPool(pool))
+        Ok(Executor::ThreadPool(Arc::new(pool)))
     }
 
     /// Perform a map in the thread pool.
     ///
     /// Regardless of the executor (`SingleThread` or `ThreadPool`), panics in the task
     /// will propagate to the caller.
-    pub fn map<
+    pub fn map<A, R, F>(&self, f: F, args: impl Iterator<Item = A>) -> crate::Result<Vec<R>>
+    where
         A: Send,
         R: Send,
-        AIterator: Iterator<Item = A>,
         F: Sized + Sync + Fn(A) -> crate::Result<R>,
-    >(
-        &self,
-        f: F,
-        args: AIterator,
-    ) -> crate::Result<Vec<R>> {
+    {
         match self {
-            Executor::SingleThread => args.map(f).collect::<crate::Result<_>>(),
+            Executor::SingleThread => {
+                // Avoid `collect`, since the stacktrace is blown up by it, which makes profiling
+                // harder.
+                let mut result = Vec::with_capacity(args.size_hint().0);
+                for arg in args {
+                    result.push(f(arg)?);
+                }
+                Ok(result)
+            }
             Executor::ThreadPool(pool) => {
                 let args: Vec<A> = args.collect();
                 let num_fruits = args.len();
@@ -67,8 +77,7 @@ impl Executor {
                                 if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
                                     error!(
                                         "Failed to send search task. It probably means all search \
-                                         threads have panicked. {:?}",
-                                        err
+                                         threads have panicked. {err:?}"
                                     );
                                 }
                             });
@@ -140,11 +149,39 @@ impl Executor {
             })?
         })
     }
+
+    /// Spawn a task on the pool, returning a future completing on task success.
+    ///
+    /// If the task panics, returns `Err(())`.
+    #[cfg(feature = "quickwit")]
+    #[allow(clippy::result_unit_err)] // `Err(())` only signals a panic; no error info to convey.
+    pub fn spawn_blocking<T: Send + 'static>(
+        &self,
+        cpu_intensive_task: impl FnOnce() -> T + Send + 'static,
+    ) -> impl std::future::Future<Output = Result<T, ()>> {
+        match self {
+            Executor::SingleThread => Either::Left(std::future::ready(Ok(cpu_intensive_task()))),
+            Executor::ThreadPool(pool) => {
+                let (sender, receiver) = oneshot::channel();
+                let parent_span = tracing::Span::current();
+                pool.spawn(move || {
+                    let _parent_span_guard = parent_span.enter();
+                    if sender.is_closed() {
+                        return;
+                    }
+                    let task_result = cpu_intensive_task();
+                    let _ = sender.send(task_result);
+                });
+
+                let res = receiver.map(|res| res.map_err(|_| ()));
+                Either::Right(res)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::Executor;
 
     #[test]
@@ -330,5 +367,63 @@ mod tests {
             assert_eq!(result.1, i * 100 + 2);
             assert_eq!(result.2, i * 100 + 3);
         }
+    }
+
+    #[cfg(feature = "quickwit")]
+    #[test]
+    fn test_cancel_cpu_intensive_tasks() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let counter: Arc<AtomicU64> = Default::default();
+
+        let other_counter: Arc<AtomicU64> = Default::default();
+
+        let mut futures = Vec::new();
+        let mut other_futures = Vec::new();
+
+        let (tx, rx) = crossbeam_channel::bounded::<()>(0);
+        let rx = Arc::new(rx);
+        let executor = Executor::multi_thread(3, "search-test").unwrap();
+        for _ in 0..1000 {
+            let counter_clone: Arc<AtomicU64> = counter.clone();
+            let other_counter_clone: Arc<AtomicU64> = other_counter.clone();
+
+            let rx_clone = rx.clone();
+            let rx_clone2 = rx.clone();
+            let fut = executor.spawn_blocking(move || {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = rx_clone.recv();
+            });
+            futures.push(fut);
+            let other_fut = executor.spawn_blocking(move || {
+                other_counter_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = rx_clone2.recv();
+            });
+            other_futures.push(other_fut);
+        }
+
+        // We execute 100 futures.
+        for _ in 0..100 {
+            tx.send(()).unwrap();
+        }
+
+        let counter_val = counter.load(Ordering::SeqCst);
+        let other_counter_val = other_counter.load(Ordering::SeqCst);
+        assert!(counter_val >= 30);
+        assert!(other_counter_val >= 30);
+
+        drop(other_futures);
+
+        // We execute 100 futures.
+        for _ in 0..100 {
+            tx.send(()).unwrap();
+        }
+
+        let counter_val2 = counter.load(Ordering::SeqCst);
+        assert!(counter_val2 >= counter_val + 100 - 6);
+
+        let other_counter_val2 = other_counter.load(Ordering::SeqCst);
+        assert!(other_counter_val2 <= other_counter_val + 6);
     }
 }

@@ -2,7 +2,7 @@ use std::io;
 
 use common::{BinarySerializable, FixedSize, HasLen};
 
-use super::{Decompressor, DOC_STORE_VERSION};
+use super::{Decompressor, DocStoreVersion, DOC_STORE_VERSION};
 use crate::directory::FileSlice;
 
 /// Bit in [`DocStoreFooter::decompressor_options`] recording whether the segment's blocks
@@ -14,6 +14,7 @@ const DICTIONARY_USED_FLAG: u8 = 1 << 0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocStoreFooter {
     pub offset: u64,
+    pub doc_store_version: DocStoreVersion,
     pub decompressor: Decompressor,
     pub decompressor_options: u8,
 }
@@ -34,9 +35,11 @@ impl BinarySerializable for DocStoreFooter {
     }
 
     fn deserialize<R: io::Read>(reader: &mut R) -> io::Result<Self> {
-        let doc_store_version = u32::deserialize(reader)?;
-        if doc_store_version != DOC_STORE_VERSION {
-            panic!("actual doc store version: {doc_store_version}, expected: {DOC_STORE_VERSION}");
+        let doc_store_version = DocStoreVersion::deserialize(reader)?;
+        if doc_store_version > DOC_STORE_VERSION {
+            panic!(
+                "actual doc store version: {doc_store_version}, max_supported: {DOC_STORE_VERSION}"
+            );
         }
         let offset = u64::deserialize(reader)?;
         let compressor_id = u8::deserialize(reader)?;
@@ -45,6 +48,7 @@ impl BinarySerializable for DocStoreFooter {
         reader.read_exact(&mut skip_buf)?;
         Ok(DocStoreFooter {
             offset,
+            doc_store_version,
             decompressor: Decompressor::from_id(compressor_id),
             decompressor_options,
         })
@@ -56,7 +60,12 @@ impl FixedSize for DocStoreFooter {
 }
 
 impl DocStoreFooter {
-    pub fn new(offset: u64, decompressor: Decompressor, dictionary_used: bool) -> Self {
+    pub fn new(
+        offset: u64,
+        decompressor: Decompressor,
+        doc_store_version: DocStoreVersion,
+        dictionary_used: bool,
+    ) -> Self {
         let decompressor_options = if dictionary_used {
             DICTIONARY_USED_FLAG
         } else {
@@ -64,6 +73,7 @@ impl DocStoreFooter {
         };
         DocStoreFooter {
             offset,
+            doc_store_version,
             decompressor,
             decompressor_options,
         }

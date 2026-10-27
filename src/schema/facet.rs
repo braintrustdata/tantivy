@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::str;
 use std::string::FromUtf8Error;
 
-use common::BinarySerializable;
+use common::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::de::Error as _;
@@ -169,7 +169,7 @@ impl Facet {
 
     /// Extract path from the `Facet`.
     pub fn to_path(&self) -> Vec<&str> {
-        self.encoded_str().split(|c| c == FACET_SEP_CHAR).collect()
+        self.encoded_str().split(FACET_SEP_CHAR).collect()
     }
 
     /// This function is the inverse of Facet::from(&str).

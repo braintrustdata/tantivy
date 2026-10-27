@@ -1,14 +1,15 @@
 use super::agg_req::Aggregations;
-use super::agg_req_with_accessor::AggregationsWithAccessor;
 use super::agg_result::AggregationResults;
-use super::buf_collector::BufAggregationCollector;
+use super::buffered_sub_aggs::LowCardBufferedSubAggs;
 use super::intermediate_agg_result::IntermediateAggregationResults;
-use super::segment_agg_result::{
-    build_segment_agg_collector, AggregationLimits, SegmentAggregationCollector,
+use super::AggContextParams;
+// group buffering strategy is chosen explicitly by callers; no need to hash-group on the fly.
+use crate::aggregation::agg_data::{
+    build_aggregations_data_from_req, build_segment_agg_collectors, AggregationsSegmentCtx,
 };
-use crate::aggregation::agg_req_with_accessor::get_aggs_with_segment_accessor_and_validate;
 use crate::collector::{Collector, SegmentCollector};
-use crate::{DocId, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::index::SegmentReader;
+use crate::{DocId, SegmentOrdinal, TantivyError};
 
 /// The default max bucket count, before the aggregation fails.
 pub const DEFAULT_BUCKET_LIMIT: u32 = 65000;
@@ -21,7 +22,7 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 500_000_000;
 /// The collector collects all aggregations by the underlying aggregation request.
 pub struct AggregationCollector {
     agg: Aggregations,
-    limits: AggregationLimits,
+    context: AggContextParams,
 }
 
 impl AggregationCollector {
@@ -29,8 +30,8 @@ impl AggregationCollector {
     ///
     /// Aggregation fails when the limits in `AggregationLimits` is exceeded. (memory limit and
     /// bucket limit)
-    pub fn from_aggs(agg: Aggregations, limits: AggregationLimits) -> Self {
-        Self { agg, limits }
+    pub fn from_aggs(agg: Aggregations, context: AggContextParams) -> Self {
+        Self { agg, context }
     }
 }
 
@@ -44,7 +45,7 @@ impl AggregationCollector {
 /// into the final `AggregationResults` via the `into_final_result()` method.
 pub struct DistributedAggregationCollector {
     agg: Aggregations,
-    limits: AggregationLimits,
+    context: AggContextParams,
 }
 
 impl DistributedAggregationCollector {
@@ -52,8 +53,8 @@ impl DistributedAggregationCollector {
     ///
     /// Aggregation fails when the limits in `AggregationLimits` is exceeded. (memory limit and
     /// bucket limit)
-    pub fn from_aggs(agg: Aggregations, limits: AggregationLimits) -> Self {
-        Self { agg, limits }
+    pub fn from_aggs(agg: Aggregations, context: AggContextParams) -> Self {
+        Self { agg, context }
     }
 }
 
@@ -71,7 +72,7 @@ impl Collector for DistributedAggregationCollector {
             &self.agg,
             reader,
             segment_local_id,
-            &self.limits,
+            &self.context,
         )
     }
 
@@ -101,7 +102,7 @@ impl Collector for AggregationCollector {
             &self.agg,
             reader,
             segment_local_id,
-            &self.limits,
+            &self.context,
         )
     }
 
@@ -114,7 +115,7 @@ impl Collector for AggregationCollector {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit> {
         let res = merge_fruits(segment_fruits)?;
-        res.into_final_result(self.agg.clone(), &self.limits)
+        res.into_final_result(self.agg.clone(), self.context.limits.clone())
     }
 }
 
@@ -134,8 +135,8 @@ fn merge_fruits(
 
 /// `AggregationSegmentCollector` does the aggregation collection on a segment.
 pub struct AggregationSegmentCollector {
-    aggs_with_accessor: AggregationsWithAccessor,
-    agg_collector: BufAggregationCollector,
+    aggs_with_accessor: AggregationsSegmentCtx,
+    agg_collector: LowCardBufferedSubAggs,
     error: Option<TantivyError>,
 }
 
@@ -146,14 +147,18 @@ impl AggregationSegmentCollector {
         agg: &Aggregations,
         reader: &SegmentReader,
         segment_ordinal: SegmentOrdinal,
-        limits: &AggregationLimits,
+        context: &AggContextParams,
     ) -> crate::Result<Self> {
-        let mut aggs_with_accessor =
-            get_aggs_with_segment_accessor_and_validate(agg, reader, segment_ordinal, limits)?;
-        let result =
-            BufAggregationCollector::new(build_segment_agg_collector(&mut aggs_with_accessor)?);
+        let agg_tree = build_aggregations_data_from_req(agg, reader, segment_ordinal, context)?;
+        let mut agg_data = AggregationsSegmentCtx::new(context.clone());
+        let mut result =
+            LowCardBufferedSubAggs::new(build_segment_agg_collectors(&mut agg_data, agg_tree)?);
+        result
+            .get_sub_agg_collector()
+            .prepare_max_bucket(0, &agg_data)?; // prepare for bucket zero
+
         Ok(AggregationSegmentCollector {
-            aggs_with_accessor,
+            aggs_with_accessor: agg_data,
             agg_collector: result,
             error: None,
         })
@@ -168,26 +173,31 @@ impl SegmentCollector for AggregationSegmentCollector {
         if self.error.is_some() {
             return;
         }
-        if let Err(err) = self
+        self.agg_collector.push(0, doc);
+        match self
             .agg_collector
-            .collect(doc, &mut self.aggs_with_accessor)
+            .check_flush_local(&mut self.aggs_with_accessor)
         {
-            self.error = Some(err);
+            Ok(_) => {}
+            Err(e) => {
+                self.error = Some(e);
+            }
         }
     }
-
-    /// The query pushes the documents to the collector via this method.
-    ///
-    /// Only valid for Collectors that ignore docs
     fn collect_block(&mut self, docs: &[DocId]) {
         if self.error.is_some() {
             return;
         }
-        if let Err(err) = self
-            .agg_collector
-            .collect_block(docs, &mut self.aggs_with_accessor)
-        {
-            self.error = Some(err);
+
+        match self.agg_collector.get_sub_agg_collector().collect(
+            0,
+            docs,
+            &mut self.aggs_with_accessor,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                self.error = Some(e);
+            }
         }
     }
 
@@ -198,10 +208,13 @@ impl SegmentCollector for AggregationSegmentCollector {
         self.agg_collector.flush(&mut self.aggs_with_accessor)?;
 
         let mut sub_aggregation_res = IntermediateAggregationResults::default();
-        Box::new(self.agg_collector).add_intermediate_aggregation_result(
-            &self.aggs_with_accessor,
-            &mut sub_aggregation_res,
-        )?;
+        self.agg_collector
+            .get_sub_agg_collector()
+            .add_intermediate_aggregation_result(
+                &self.aggs_with_accessor,
+                &mut sub_aggregation_res,
+                0,
+            )?;
 
         Ok(sub_aggregation_res)
     }

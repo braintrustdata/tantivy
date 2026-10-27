@@ -180,7 +180,7 @@ impl MoreLikeThis {
                 let facets: Vec<&str> = values
                     .iter()
                     .map(|value| {
-                        value.as_facet().map(|f| f.encoded_str()).ok_or_else(|| {
+                        value.as_facet().ok_or_else(|| {
                             TantivyError::InvalidArgument("invalid field value".to_string())
                         })
                     })
@@ -209,7 +209,7 @@ impl MoreLikeThis {
                     }
                 };
 
-                // TOOD: Validate these changed align with the HEAD branch.
+                // TODO: Validate these changed align with the HEAD branch.
                 for value in values {
                     if let Some(text) = value.as_str() {
                         let tokenizer = match &mut tokenizer_opt {
@@ -220,7 +220,7 @@ impl MoreLikeThis {
                         let mut token_stream = tokenizer.token_stream(text);
                         token_stream.process(sink);
                     } else if let Some(tok_str) = value.as_pre_tokenized_text() {
-                        let mut token_stream = PreTokenizedStream::from(tok_str.clone());
+                        let mut token_stream = PreTokenizedStream::from(*tok_str.clone());
                         token_stream.process(sink);
                     }
                 }
@@ -241,7 +241,7 @@ impl MoreLikeThis {
                     let timestamp = value.as_datetime().ok_or_else(|| {
                         TantivyError::InvalidArgument("invalid value".to_string())
                     })?;
-                    let term = Term::from_field_date(field, timestamp);
+                    let term = Term::from_field_date_for_search(field, timestamp);
                     *term_frequencies.entry(term).or_insert(0) += 1;
                 }
             }
@@ -295,7 +295,7 @@ impl MoreLikeThis {
         self.stop_words.contains(&word)
     }
 
-    /// Couputes the score for each term while ignoring not useful terms
+    /// Computes the score for each term while ignoring not useful terms
     fn create_score_term(
         &self,
         searcher: &Searcher,

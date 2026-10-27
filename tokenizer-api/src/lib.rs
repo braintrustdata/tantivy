@@ -1,5 +1,5 @@
 //! Tokenizer are in charge of chopping text into a stream of tokens
-//! ready for indexing. This is an seperate crate from tantivy, so implementors don't need to update
+//! ready for indexing. This is an separate crate from tantivy, so implementers don't need to update
 //! for each new tantivy version.
 //!
 //! To add support for a tokenizer, implement the [`Tokenizer`] trait.
@@ -63,7 +63,7 @@ pub trait Tokenizer: 'static + Clone + Send + Sync {
 /// Simple wrapper of `Box<dyn TokenStream + 'a>`.
 pub struct BoxTokenStream<'a>(Box<dyn TokenStream + 'a>);
 
-impl<'a> TokenStream for BoxTokenStream<'a> {
+impl TokenStream for BoxTokenStream<'_> {
     fn advance(&mut self) -> bool {
         self.0.advance()
     }
@@ -90,7 +90,7 @@ impl<'a> Deref for BoxTokenStream<'a> {
         &*self.0
     }
 }
-impl<'a> DerefMut for BoxTokenStream<'a> {
+impl DerefMut for BoxTokenStream<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut *self.0
     }

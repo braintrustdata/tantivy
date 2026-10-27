@@ -2,29 +2,71 @@ use std::io::{self, Read};
 use std::ops::Range;
 
 use common::OwnedBytes;
+#[cfg(feature = "zstd-compression")]
 use zstd::bulk::Decompressor;
 
 pub struct BlockReader {
     buffer: Vec<u8>,
+    #[cfg(feature = "zstd-compression")]
     decompressor: Option<Decompressor<'static>>,
     reader: OwnedBytes,
+    next_readers: std::vec::IntoIter<(OwnedBytes, u64)>,
     offset: usize,
+    /// First term ordinal of the slice we just moved to, taken once by the caller.
+    ///
+    /// When an automaton prunes blocks, the slices handed to us are not contiguous, so a
+    /// caller counting terms cannot know the ordinal it is at. Each slice therefore carries
+    /// the ordinal of its first term; consecutive blocks merged into one slice stay
+    /// contiguous, so counting within a slice remains correct.
+    pending_first_ordinal: Option<u64>,
 }
 
 impl BlockReader {
     pub fn new(reader: OwnedBytes) -> BlockReader {
         BlockReader {
             buffer: Vec::new(),
+            #[cfg(feature = "zstd-compression")]
             decompressor: None,
             reader,
+            next_readers: Vec::new().into_iter(),
             offset: 0,
+            pending_first_ordinal: None,
         }
     }
 
+    /// Starts reading an independent input, retaining the buffer and decompression context.
     pub(crate) fn reset(&mut self, reader: OwnedBytes) {
         self.buffer.clear();
         self.reader = reader;
+        self.next_readers = Vec::new().into_iter();
         self.offset = 0;
+        self.pending_first_ordinal = None;
+    }
+
+    /// Build a reader over non-contiguous slices, each labelled with the term ordinal of its
+    /// first term. See [`BlockReader::take_first_ordinal`].
+    pub fn from_multiple_blocks(readers: Vec<(OwnedBytes, u64)>) -> BlockReader {
+        let mut next_readers = readers.into_iter();
+        let (reader, first_ordinal) = next_readers
+            .next()
+            .unwrap_or_else(|| (OwnedBytes::empty(), 0));
+        BlockReader {
+            buffer: Vec::new(),
+            #[cfg(feature = "zstd-compression")]
+            decompressor: None,
+            reader,
+            next_readers,
+            offset: 0,
+            pending_first_ordinal: Some(first_ordinal),
+        }
+    }
+
+    /// The first term ordinal of the slice most recently moved to, if it has not been taken yet.
+    ///
+    /// Returns `Some` exactly once per slice, on the first term read from it, so a caller can
+    /// reset its ordinal counter instead of incrementing across the gap left by pruned blocks.
+    pub fn take_first_ordinal(&mut self) -> Option<u64> {
+        self.pending_first_ordinal.take()
     }
 
     pub fn deserialize_u64(&mut self) -> u64 {
@@ -42,45 +84,70 @@ impl BlockReader {
         self.offset = 0;
         self.buffer.clear();
 
-        let block_len = match self.reader.len() {
-            0 => return Ok(false),
-            1..=3 => {
+        loop {
+            let block_len = match self.reader.len() {
+                0 => {
+                    // we are out of data for this block. Check if we have another block after
+                    match self.next_readers.next() {
+                        Some((new_reader, first_ordinal)) => {
+                            self.reader = new_reader;
+                            self.pending_first_ordinal = Some(first_ordinal);
+                            continue;
+                        }
+                        _ => {
+                            return Ok(false);
+                        }
+                    }
+                }
+                1..=3 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to read block_len",
+                    ));
+                }
+                _ => self.reader.read_u32() as usize,
+            };
+            if block_len <= 1 {
+                return Ok(false);
+            }
+            let compress = self.reader.read_u8();
+            let block_len = block_len - 1;
+
+            if self.reader.len() < block_len {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "failed to read block_len",
-                ))
+                    "failed to read block content",
+                ));
             }
-            _ => self.reader.read_u32() as usize,
-        };
-        if block_len <= 1 {
-            return Ok(false);
-        }
-        let compress = self.reader.read_u8();
-        let block_len = block_len - 1;
+            if compress == 1 {
+                #[cfg(feature = "zstd-compression")]
+                {
+                    let required_capacity =
+                        Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
+                    self.buffer.reserve(required_capacity);
+                    let decompressor = match &mut self.decompressor {
+                        Some(decompressor) => decompressor,
+                        slot @ None => slot.insert(Decompressor::new()?),
+                    };
+                    decompressor
+                        .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
 
-        if self.reader.len() < block_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "failed to read block content",
-            ));
-        }
-        if compress == 1 {
-            let required_capacity =
-                Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
-            self.buffer.reserve(required_capacity);
-            let decompressor = match &mut self.decompressor {
-                Some(decompressor) => decompressor,
-                slot @ None => slot.insert(Decompressor::new()?),
-            };
-            decompressor.decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
+                    self.reader.advance(block_len);
+                }
 
-            self.reader.advance(block_len);
-        } else {
-            self.buffer.resize(block_len, 0u8);
-            self.reader.read_exact(&mut self.buffer[..])?;
-        }
+                if cfg!(not(feature = "zstd-compression")) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "zstd-compression feature is not enabled",
+                    ));
+                }
+            } else {
+                self.buffer.resize(block_len, 0u8);
+                self.reader.read_exact(&mut self.buffer[..])?;
+            }
 
-        Ok(true)
+            return Ok(true);
+        }
     }
 
     #[inline(always)]
@@ -120,7 +187,7 @@ impl io::Read for BlockReader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "zstd-compression"))]
 mod tests {
     use super::*;
 

@@ -25,8 +25,8 @@
 //! Most users should not access the `StoreReader` directly
 //! and should rely on either
 //!
-//! - at the segment level, the
-//! [`SegmentReader`'s `doc` method](../struct.SegmentReader.html#method.doc)
+//! - at the segment level, the [`SegmentReader`'s `doc`
+//!   method](../struct.SegmentReader.html#method.doc)
 //! - at the index level, the [`Searcher::doc()`](crate::Searcher::doc) method
 
 mod compressors;
@@ -35,6 +35,7 @@ mod decompressors;
 mod dictionary_cache;
 mod footer;
 mod index;
+pub mod plugin;
 mod reader;
 mod writer;
 pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
@@ -42,13 +43,14 @@ pub(crate) use self::compressors::resolve_segment_dictionary;
 #[cfg(all(feature = "zstd-compression", test))]
 pub(crate) use self::dictionary_cache::clear_for_test as clear_dictionary_cache_for_test;
 pub use self::decompressors::Decompressor;
-pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
+pub use self::plugin::{StorePlugin, StorePluginWriter};
 pub use self::reader::{CacheStats, StoreReader};
+pub(crate) use self::reader::{DocStoreVersion, DOCSTORE_CACHE_CAPACITY};
 pub use self::writer::StoreWriter;
 mod store_compressor;
 
 /// Doc store version in footer to handle format changes.
-pub(crate) const DOC_STORE_VERSION: u32 = 1;
+pub(crate) const DOC_STORE_VERSION: DocStoreVersion = DocStoreVersion::V2;
 
 #[cfg(feature = "lz4-compression")]
 mod compression_lz4_block;
@@ -59,7 +61,7 @@ mod compression_zstd_block;
 pub use self::compression_zstd_block::{compress_whole, decompress_whole};
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
 
     use std::path::Path;
     use std::sync::Arc;
@@ -67,9 +69,8 @@ pub mod tests {
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
     use crate::fastfield::AliveBitSet;
-    use crate::schema::document::Value;
     use crate::schema::{
-        self, Schema, TantivyDocument, TextFieldIndexing, TextOptions, STORED, TEXT,
+        self, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value, STORED, TEXT,
     };
     use crate::{Index, IndexSettings, IndexWriter, Term};
 
@@ -119,8 +120,8 @@ pub mod tests {
                     .unwrap();
             for i in 0..num_docs {
                 let mut doc = TantivyDocument::default();
-                doc.add_field_value(field_body, LOREM.to_string());
-                doc.add_field_value(field_title, format!("Doc {i}"));
+                doc.add_text(field_body, LOREM);
+                doc.add_text(field_title, format!("Doc {i}"));
                 store_writer.store(&doc, &schema).unwrap();
             }
             store_writer.close().unwrap();
@@ -129,6 +130,7 @@ pub mod tests {
     }
 
     const NUM_DOCS: usize = 1_000;
+
     #[test]
     fn test_doc_store_iter_with_delete_bug_1077() -> crate::Result<()> {
         // this will cover deletion of the first element in a checkpoint
@@ -140,16 +142,17 @@ pub mod tests {
         let directory = RamDirectory::create();
         let store_wrt = directory.open_write(path)?;
         let schema =
-            write_lorem_ipsum_store(store_wrt, NUM_DOCS, Compressor::Lz4, BLOCK_SIZE, true);
+            write_lorem_ipsum_store(store_wrt, NUM_DOCS, Compressor::default(), BLOCK_SIZE, true);
         let field_title = schema.get_field("title").unwrap();
         let store_file = directory.open_read(path)?;
         let store = StoreReader::open(store_file, 10, None)?;
         for i in 0..NUM_DOCS as u32 {
             assert_eq!(
-                *store
+                store
                     .get::<TantivyDocument>(i)?
                     .get_first(field_title)
                     .unwrap()
+                    .as_value()
                     .as_str()
                     .unwrap(),
                 format!("Doc {i}")
@@ -158,7 +161,13 @@ pub mod tests {
 
         for doc in store.iter::<TantivyDocument>(Some(&alive_bitset)) {
             let doc = doc?;
-            let title_content = doc.get_first(field_title).unwrap().as_str().unwrap();
+            let title_content = doc
+                .get_first(field_title)
+                .unwrap()
+                .as_value()
+                .as_str()
+                .unwrap()
+                .to_string();
             if !title_content.starts_with("Doc ") {
                 panic!("unexpected title_content {title_content}");
             }
@@ -513,7 +522,7 @@ pub mod tests {
             dictionary: Some(ZstdDictionary::Path(dict_b_path)),
         });
 
-        // Drive the merge directly through `IndexMerger`/`SegmentSerializer`, the same building
+        // Drive the merge directly through `IndexMerger`, the same building
         // blocks `SegmentUpdater::merge` uses (`indexer/segment_updater.rs`), rather than through
         // `IndexWriter::merge`'s scheduling: under `cfg(test)`, a scheduled merge that returns an
         // `Err` deliberately panics inside a rayon worker instead of surfacing a `Result`
@@ -526,10 +535,8 @@ pub mod tests {
             &segments[..],
         )?;
         let merged_segment = index.new_segment();
-        let segment_serializer =
-            crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
-        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
-        let merge_result = merger.write(segment_serializer, None);
+        crate::store::plugin::take_stacked_segments_for_test(); // reset from any prior test
+        let merge_result = merger.write(&merged_segment, None);
         assert!(
             merge_result.is_ok(),
             "merge should succeed -- decompressing each segment with its own recorded \
@@ -537,7 +544,7 @@ pub mod tests {
              corruption; got {merge_result:?}"
         );
         assert_eq!(
-            crate::indexer::merger::take_stacked_segments_for_test(),
+            crate::store::plugin::take_stacked_segments_for_test(),
             0,
             "correctness here depends entirely on the recompress path actually running -- \
              neither segment may take the raw-copy stacking shortcut when its recorded \
@@ -607,7 +614,7 @@ pub mod tests {
             dictionary: None,
         });
 
-        // Drive the merge directly through `IndexMerger`/`SegmentSerializer`; see the rotation
+        // Drive the merge directly through `IndexMerger`; see the rotation
         // test above for why this bypasses `IndexWriter::merge`'s scheduling.
         let segments = index.searchable_segments().expect("Searchable segments failed.");
         let merger = crate::indexer::merger::IndexMerger::open(
@@ -616,10 +623,8 @@ pub mod tests {
             &segments[..],
         )?;
         let merged_segment = index.new_segment();
-        let segment_serializer =
-            crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
-        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
-        let merge_result = merger.write(segment_serializer, None);
+        crate::store::plugin::take_stacked_segments_for_test(); // reset from any prior test
+        let merge_result = merger.write(&merged_segment, None);
         assert!(
             merge_result.is_ok(),
             "merge should succeed -- decompressing each segment with its own recorded \
@@ -627,7 +632,7 @@ pub mod tests {
              corruption; got {merge_result:?}"
         );
         assert_eq!(
-            crate::indexer::merger::take_stacked_segments_for_test(),
+            crate::store::plugin::take_stacked_segments_for_test(),
             0,
             "correctness here depends entirely on the recompress path actually running -- \
              neither segment may take the raw-copy stacking shortcut when its recorded \
@@ -664,7 +669,7 @@ pub mod tests {
             }),
             ..Default::default()
         };
-        let mut index = Index::builder()
+        let index = Index::builder()
             .schema(schema)
             .settings(settings)
             .open_or_create(ram_directory)?;
@@ -694,16 +699,14 @@ pub mod tests {
             &segments[..],
         )?;
         let merged_segment = index.new_segment();
-        let segment_serializer =
-            crate::indexer::SegmentSerializer::for_segment(merged_segment, true)?;
-        crate::indexer::merger::take_stacked_segments_for_test(); // reset from any prior test
-        let merge_result = merger.write(segment_serializer, None);
+        crate::store::plugin::take_stacked_segments_for_test(); // reset from any prior test
+        let merge_result = merger.write(&merged_segment, None);
         assert!(
             merge_result.is_ok(),
             "merge of same-dictionary segments should succeed; got {merge_result:?}"
         );
         assert_eq!(
-            crate::indexer::merger::take_stacked_segments_for_test(),
+            crate::store::plugin::take_stacked_segments_for_test(),
             2,
             "both segments share the merge target's dictionary and should take the fast \
              block-stacking path, not decompress/recompress"

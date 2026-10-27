@@ -7,7 +7,7 @@ use crate::{DocId, Score};
 
 /// Query that matches all of the documents.
 ///
-/// All of the document get the score 1.0.
+/// All of the documents get the score 1.0.
 #[derive(Clone, Debug)]
 pub struct AllQuery;
 
@@ -22,11 +22,12 @@ pub struct AllWeight;
 
 impl Weight for AllWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
-        let all_scorer = AllScorer {
-            doc: 0u32,
-            max_doc: reader.max_doc(),
-        };
-        Ok(Box::new(BoostScorer::new(all_scorer, boost)))
+        let all_scorer = AllScorer::new(reader.max_doc());
+        if boost != 1.0 {
+            Ok(Box::new(BoostScorer::new(all_scorer, boost)))
+        } else {
+            Ok(Box::new(all_scorer))
+        }
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -43,6 +44,14 @@ pub struct AllScorer {
     max_doc: DocId,
 }
 
+impl AllScorer {
+    /// Creates a new AllScorer with `max_doc` docs.
+    pub fn new(max_doc: DocId) -> AllScorer {
+        let doc = if max_doc == 0u32 { TERMINATED } else { 0 };
+        AllScorer { doc, max_doc }
+    }
+}
+
 impl DocSet for AllScorer {
     #[inline(always)]
     fn advance(&mut self) -> DocId {
@@ -51,6 +60,15 @@ impl DocSet for AllScorer {
             return TERMINATED;
         }
         self.doc += 1;
+        self.doc
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        debug_assert!(target >= self.doc);
+        self.doc = target;
+        if self.doc >= self.max_doc {
+            self.doc = TERMINATED;
+        }
         self.doc
     }
 
@@ -88,6 +106,7 @@ impl DocSet for AllScorer {
 }
 
 impl Scorer for AllScorer {
+    #[inline]
     fn score(&mut self) -> Score {
         1.0
     }

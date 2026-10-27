@@ -38,11 +38,12 @@ impl PathToUnorderedId {
     #[cold]
     fn insert_new_path(&mut self, path: &str) -> u32 {
         let next_id = self.map.len() as u32;
-        self.map.insert(path.to_string(), next_id);
+        let new_path = path.to_string();
+        self.map.insert(new_path, next_id);
         next_id
     }
 
-    /// Retuns ids which reflect the lexical order of the paths.
+    /// Returns ids which reflect the lexical order of the paths.
     ///
     /// The returned vec can be indexed with the unordered id to get the ordered id.
     pub(crate) fn unordered_id_to_ordered_id(&self) -> Vec<OrderedPathId> {
@@ -56,7 +57,7 @@ impl PathToUnorderedId {
         result
     }
 
-    /// Retuns the paths so they can be queried by the ordered id (which is the index).
+    /// Returns the paths so they can be queried by the ordered id (which is the index).
     pub(crate) fn ordered_id_to_path(&self) -> Vec<&str> {
         let mut paths = self.map.keys().map(String::as_str).collect::<Vec<_>>();
         paths.sort_unstable();

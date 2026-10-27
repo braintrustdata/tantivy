@@ -2,7 +2,7 @@ use proptest::prelude::*;
 use proptest::{prop_oneof, proptest};
 
 use super::*;
-use crate::{ColumnarReader, ColumnarWriter, DynamicColumnHandle};
+use crate::{ColumnIndex, ColumnarReader, ColumnarWriter, DynamicColumnHandle};
 
 #[test]
 fn test_optional_index_bug_2293() {
@@ -30,6 +30,25 @@ fn test_optional_index_with_num_docs(num_docs: u32) {
 #[test]
 fn test_dense_block_threshold() {
     assert_eq!(super::DENSE_BLOCK_THRESHOLD, 5_120);
+}
+
+#[test]
+fn test_next_non_null_doc_across_sparse_and_dense_blocks() {
+    let mut populated_docs = vec![1, 4, ELEMENTS_PER_BLOCK - 1];
+    populated_docs.extend((0..6_000).map(|doc| ELEMENTS_PER_BLOCK + doc));
+    let index = OptionalIndex::for_test(ELEMENTS_PER_BLOCK * 2, &populated_docs);
+
+    assert_eq!(index.next_non_null_doc(0), Some(1));
+    assert_eq!(index.next_non_null_doc(3), Some(4));
+    assert_eq!(
+        index.next_non_null_doc(ELEMENTS_PER_BLOCK),
+        Some(ELEMENTS_PER_BLOCK)
+    );
+    assert_eq!(
+        index.next_non_null_doc(ELEMENTS_PER_BLOCK + 100),
+        Some(ELEMENTS_PER_BLOCK + 100)
+    );
+    assert_eq!(index.next_non_null_doc(ELEMENTS_PER_BLOCK + 6_000), None);
 }
 
 fn random_bitvec() -> BoxedStrategy<Vec<bool>> {
@@ -112,8 +131,8 @@ fn test_null_index(data: &[bool]) {
         .map(|(pos, _val)| pos as u32)
         .collect();
     let mut select_iter = null_index.select_cursor();
-    for i in 0..orig_idx_with_value.len() {
-        assert_eq!(select_iter.select(i as u32), orig_idx_with_value[i]);
+    for (i, expected) in orig_idx_with_value.iter().enumerate() {
+        assert_eq!(select_iter.select(i as u32), *expected);
     }
 
     let step_size = (orig_idx_with_value.len() / 100).max(1);
@@ -123,6 +142,11 @@ fn test_null_index(data: &[bool]) {
 
     // 100 samples
     let step_size = (data.len() / 100).max(1);
+    let sampled_doc_ids: Vec<DocId> = (0..data.len())
+        .step_by(step_size)
+        .map(|doc_id| doc_id as DocId)
+        .collect();
+    assert_rank_if_exists_batch_matches_scalar(&null_index, &sampled_doc_ids);
     for (pos, value) in data.iter().enumerate().step_by(step_size) {
         assert_eq!(null_index.contains(pos as u32), *value);
     }
@@ -141,6 +165,98 @@ fn test_optional_index_translate() {
     let optional_index = OptionalIndex::for_test(4, &[0, 2]);
     assert_eq!(optional_index.rank_if_exists(0), Some(0));
     assert_eq!(optional_index.rank_if_exists(2), Some(1));
+}
+
+fn assert_rank_if_exists_batch_matches_scalar(optional_index: &OptionalIndex, doc_ids: &[DocId]) {
+    let mut expected_doc_ids = vec![u32::MAX];
+    let mut expected_row_ids = vec![u32::MAX];
+    for &doc_id in doc_ids {
+        if let Some(row_id) = optional_index.rank_if_exists(doc_id) {
+            expected_doc_ids.push(doc_id);
+            expected_row_ids.push(row_id);
+        }
+    }
+
+    let mut actual_doc_ids = vec![u32::MAX];
+    let mut actual_row_ids = vec![u32::MAX];
+    optional_index.rank_if_exists_batch(doc_ids, &mut actual_doc_ids, &mut actual_row_ids);
+    assert_eq!(actual_doc_ids, expected_doc_ids);
+    assert_eq!(actual_row_ids, expected_row_ids);
+
+    let mut column_doc_ids = vec![u32::MAX];
+    let mut column_row_ids = vec![u32::MAX];
+    ColumnIndex::Optional(optional_index.clone()).docids_to_rowids(
+        doc_ids,
+        &mut column_doc_ids,
+        &mut column_row_ids,
+    );
+    assert_eq!(column_doc_ids, expected_doc_ids);
+    assert_eq!(column_row_ids, expected_row_ids);
+}
+
+#[test]
+fn test_optional_index_rank_if_exists_batch_sparse_blocks() {
+    let row_ids = [
+        1,
+        3,
+        10,
+        20,
+        30,
+        40,
+        50,
+        ELEMENTS_PER_BLOCK - 1,
+        2 * ELEMENTS_PER_BLOCK + 2,
+        2 * ELEMENTS_PER_BLOCK + 200,
+    ];
+    let optional_index = OptionalIndex::for_test(3 * ELEMENTS_PER_BLOCK, &row_ids);
+
+    let sorted_doc_ids = [
+        0,
+        1,
+        2,
+        3,
+        3,
+        49,
+        50,
+        ELEMENTS_PER_BLOCK - 1,
+        ELEMENTS_PER_BLOCK,
+        ELEMENTS_PER_BLOCK + 1,
+        2 * ELEMENTS_PER_BLOCK + 1,
+        2 * ELEMENTS_PER_BLOCK + 2,
+        2 * ELEMENTS_PER_BLOCK + 199,
+        2 * ELEMENTS_PER_BLOCK + 200,
+        3 * ELEMENTS_PER_BLOCK,
+    ];
+    assert_rank_if_exists_batch_matches_scalar(&optional_index, &sorted_doc_ids);
+
+    // Arbitrary input order and duplicate doc ids retain the scalar lookup semantics.
+    let unsorted_doc_ids = [
+        2 * ELEMENTS_PER_BLOCK + 200,
+        3,
+        ELEMENTS_PER_BLOCK,
+        1,
+        3,
+        u32::MAX,
+        50,
+    ];
+    assert_rank_if_exists_batch_matches_scalar(&optional_index, &unsorted_doc_ids);
+}
+
+#[test]
+fn test_optional_index_rank_if_exists_batch_dense_and_sparse_blocks() {
+    let mut row_ids: Vec<RowId> = (0..6_000).collect();
+    row_ids.extend([ELEMENTS_PER_BLOCK + 5, 2 * ELEMENTS_PER_BLOCK + 7]);
+    let optional_index = OptionalIndex::for_test(2 * ELEMENTS_PER_BLOCK + 8, row_ids.as_slice());
+    let doc_ids = [
+        0,
+        1,
+        5_999,
+        6_000,
+        ELEMENTS_PER_BLOCK - 1,
+        ELEMENTS_PER_BLOCK + 5,
+        2 * ELEMENTS_PER_BLOCK + 7,
+    ];
+    assert_rank_if_exists_batch_matches_scalar(&optional_index, &doc_ids);
 }
 
 #[test]
@@ -166,7 +282,11 @@ fn test_optional_index_large() {
 fn test_optional_index_iter_aux(row_ids: &[RowId], num_rows: RowId) {
     let optional_index = OptionalIndex::for_test(num_rows, row_ids);
     assert_eq!(optional_index.num_docs(), num_rows);
-    assert!(optional_index.iter_rows().eq(row_ids.iter().copied()));
+    assert!(
+        optional_index
+            .iter_non_null_docs()
+            .eq(row_ids.iter().copied())
+    );
 }
 
 #[test]
@@ -220,175 +340,4 @@ fn test_optional_index_for_tests() {
     assert!(optional_index.contains(2));
     assert!(!optional_index.contains(3));
     assert_eq!(optional_index.num_docs(), 4);
-}
-
-#[cfg(all(test, feature = "unstable"))]
-mod bench {
-
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-    use test::Bencher;
-
-    use super::*;
-
-    const TOTAL_NUM_VALUES: u32 = 1_000_000;
-    fn gen_bools(fill_ratio: f64) -> OptionalIndex {
-        let mut out = Vec::new();
-        let mut rng: StdRng = StdRng::from_seed([1u8; 32]);
-        let vals: Vec<RowId> = (0..TOTAL_NUM_VALUES)
-            .map(|_| rng.gen_bool(fill_ratio))
-            .enumerate()
-            .filter(|(_pos, val)| *val)
-            .map(|(pos, _)| pos as RowId)
-            .collect();
-        serialize_optional_index(&&vals[..], TOTAL_NUM_VALUES, &mut out).unwrap();
-
-        open_optional_index(OwnedBytes::new(out)).unwrap()
-    }
-
-    fn random_range_iterator(
-        start: u32,
-        end: u32,
-        avg_step_size: u32,
-        avg_deviation: u32,
-    ) -> impl Iterator<Item = u32> {
-        let mut rng: StdRng = StdRng::from_seed([1u8; 32]);
-        let mut current = start;
-        std::iter::from_fn(move || {
-            current += rng.gen_range(avg_step_size - avg_deviation..=avg_step_size + avg_deviation);
-            if current >= end {
-                None
-            } else {
-                Some(current)
-            }
-        })
-    }
-
-    fn n_percent_step_iterator(percent: f32, num_values: u32) -> impl Iterator<Item = u32> {
-        let ratio = percent / 100.0;
-        let step_size = (1f32 / ratio) as u32;
-        let deviation = step_size - 1;
-        random_range_iterator(0, num_values, step_size, deviation)
-    }
-
-    fn walk_over_data(codec: &OptionalIndex, avg_step_size: u32) -> Option<u32> {
-        walk_over_data_from_positions(
-            codec,
-            random_range_iterator(0, TOTAL_NUM_VALUES, avg_step_size, 0),
-        )
-    }
-
-    fn walk_over_data_from_positions(
-        codec: &OptionalIndex,
-        positions: impl Iterator<Item = u32>,
-    ) -> Option<u32> {
-        let mut dense_idx: Option<u32> = None;
-        for idx in positions {
-            dense_idx = dense_idx.or(codec.rank_if_exists(idx));
-        }
-        dense_idx
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_1percent_filled_10percent_hit(bench: &mut Bencher) {
-        let codec = gen_bools(0.01f64);
-        bench.iter(|| walk_over_data(&codec, 100));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_5percent_filled_10percent_hit(bench: &mut Bencher) {
-        let codec = gen_bools(0.05f64);
-        bench.iter(|| walk_over_data(&codec, 100));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_5percent_filled_1percent_hit(bench: &mut Bencher) {
-        let codec = gen_bools(0.05f64);
-        bench.iter(|| walk_over_data(&codec, 1000));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_full_scan_1percent_filled(bench: &mut Bencher) {
-        let codec = gen_bools(0.01f64);
-        bench.iter(|| walk_over_data_from_positions(&codec, 0..TOTAL_NUM_VALUES));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_full_scan_10percent_filled(bench: &mut Bencher) {
-        let codec = gen_bools(0.1f64);
-        bench.iter(|| walk_over_data_from_positions(&codec, 0..TOTAL_NUM_VALUES));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_full_scan_90percent_filled(bench: &mut Bencher) {
-        let codec = gen_bools(0.9f64);
-        bench.iter(|| walk_over_data_from_positions(&codec, 0..TOTAL_NUM_VALUES));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_10percent_filled_1percent_hit(bench: &mut Bencher) {
-        let codec = gen_bools(0.1f64);
-        bench.iter(|| walk_over_data(&codec, 100));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_50percent_filled_1percent_hit(bench: &mut Bencher) {
-        let codec = gen_bools(0.5f64);
-        bench.iter(|| walk_over_data(&codec, 100));
-    }
-
-    #[bench]
-    fn bench_translate_orig_to_codec_90percent_filled_1percent_hit(bench: &mut Bencher) {
-        let codec = gen_bools(0.9f64);
-        bench.iter(|| walk_over_data(&codec, 100));
-    }
-
-    #[bench]
-    fn bench_translate_codec_to_orig_1percent_filled_0comma005percent_hit(bench: &mut Bencher) {
-        bench_translate_codec_to_orig_util(0.01f64, 0.005f32, bench);
-    }
-
-    #[bench]
-    fn bench_translate_codec_to_orig_10percent_filled_0comma005percent_hit(bench: &mut Bencher) {
-        bench_translate_codec_to_orig_util(0.1f64, 0.005f32, bench);
-    }
-
-    #[bench]
-    fn bench_translate_codec_to_orig_1percent_filled_10percent_hit(bench: &mut Bencher) {
-        bench_translate_codec_to_orig_util(0.01f64, 10f32, bench);
-    }
-
-    #[bench]
-    fn bench_translate_codec_to_orig_1percent_filled_full_scan(bench: &mut Bencher) {
-        bench_translate_codec_to_orig_util(0.01f64, 100f32, bench);
-    }
-
-    fn bench_translate_codec_to_orig_util(
-        percent_filled: f64,
-        percent_hit: f32,
-        bench: &mut Bencher,
-    ) {
-        let codec = gen_bools(percent_filled);
-        let num_non_nulls = codec.num_non_nulls();
-        let idxs: Vec<u32> = if percent_hit == 100.0f32 {
-            (0..num_non_nulls).collect()
-        } else {
-            n_percent_step_iterator(percent_hit, num_non_nulls).collect()
-        };
-        let mut output = vec![0u32; idxs.len()];
-        bench.iter(|| {
-            output.copy_from_slice(&idxs[..]);
-            codec.select_batch(&mut output);
-        });
-    }
-
-    #[bench]
-    fn bench_translate_codec_to_orig_90percent_filled_0comma005percent_hit(bench: &mut Bencher) {
-        bench_translate_codec_to_orig_util(0.9f64, 0.005, bench);
-    }
-
-    #[bench]
-    fn bench_translate_codec_to_orig_90percent_filled_full_scan(bench: &mut Bencher) {
-        bench_translate_codec_to_orig_util(0.9f64, 100.0f32, bench);
-    }
 }
