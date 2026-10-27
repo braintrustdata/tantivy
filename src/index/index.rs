@@ -26,8 +26,7 @@ use crate::index::{
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
 };
-use crate::indexer::segment_updater::save_metas;
-use crate::indexer::segment_updater::DEFAULT_NUM_MERGE_THREADS;
+use crate::indexer::segment_updater::{save_metas, DEFAULT_NUM_MERGE_THREADS};
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::plugin::SegmentPlugin;
 use crate::reader::{IndexReader, IndexReaderBuilder};

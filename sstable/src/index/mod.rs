@@ -27,9 +27,11 @@ impl SSTableIndex {
         index_slice: FileSlice,
     ) -> io::Result<Self> {
         let index = match version {
-            2 => SSTableIndex::V2(v2::SSTableIndex::load(index_slice.read_bytes()?).map_err(
-                |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
-            )?),
+            2 => {
+                SSTableIndex::V2(v2::SSTableIndex::load(index_slice.read_bytes()?).map_err(
+                    |_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"),
+                )?)
+            }
             3 => {
                 if index_slice.len() < 8 {
                     return Err(io::Error::new(

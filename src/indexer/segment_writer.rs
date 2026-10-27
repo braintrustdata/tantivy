@@ -308,7 +308,8 @@ mod tests {
         let directory = RamDirectory::create();
         let store_wrt = directory.open_write(path).unwrap();
 
-        let mut store_writer = StoreWriter::new(store_wrt, Compressor::None, 0, false, None).unwrap();
+        let mut store_writer =
+            StoreWriter::new(store_wrt, Compressor::None, 0, false, None).unwrap();
         store_writer.store(&doc, &schema).unwrap();
         store_writer.close().unwrap();
 

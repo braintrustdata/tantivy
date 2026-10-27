@@ -327,11 +327,7 @@ impl LazyNode {
     }
 
     fn first_transition(&self) -> Option<usize> {
-        if self.ntrans == 0 {
-            None
-        } else {
-            Some(0)
-        }
+        if self.ntrans == 0 { None } else { Some(0) }
     }
 
     fn next_transition(&self, transition_idx: usize) -> Option<usize> {

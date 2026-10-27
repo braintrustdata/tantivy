@@ -147,7 +147,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         } else {
             // if operations are sync, we assume latency is almost null, and there is no point in
             // merging across holes
-            let blocks = self.get_block_iterator_for_range_and_automaton(key_range, automaton, 0)?;
+            let blocks =
+                self.get_block_iterator_for_range_and_automaton(key_range, automaton, 0)?;
             let data = blocks
                 .map(|block_addr| {
                     let first_ordinal = block_addr.first_ordinal;
@@ -619,7 +620,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
-    pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> StreamerBuilder<'a, TSSTable, A>
+    pub fn search<'a, A: Automaton + 'a>(
+        &'a self,
+        automaton: A,
+    ) -> StreamerBuilder<'a, TSSTable, A>
     where
         A::State: Clone,
     {
@@ -682,12 +686,13 @@ mod tests {
             let always_allowed_range = self.always_allowed_range.lock().unwrap();
             let allowed =
                 allowed_range.contains(&range.start) && allowed_range.contains(&(range.end - 1));
-            let always_allowed = always_allowed_range
-                .as_ref()
-                .is_some_and(|always_allowed_range| {
-                    always_allowed_range.contains(&range.start)
-                        && always_allowed_range.contains(&(range.end - 1))
-                });
+            let always_allowed =
+                always_allowed_range
+                    .as_ref()
+                    .is_some_and(|always_allowed_range| {
+                        always_allowed_range.contains(&range.start)
+                            && always_allowed_range.contains(&(range.end - 1))
+                    });
             if !allowed && !always_allowed {
                 return Err(std::io::Error::other(format!(
                     "invalid range, allowed {allowed_range:?}, requested {range:?}"

@@ -198,7 +198,9 @@ impl StorePluginWriter {
         } else {
             let path = ctx.segment.relative_path(SegmentComponent::Store);
             let store_write = directory.open_write(&path)?;
-            let dictionary = settings.docstore_compression.resolve_dictionary(directory)?;
+            let dictionary = settings
+                .docstore_compression
+                .resolve_dictionary(directory)?;
             StoreWriter::new(
                 store_write,
                 settings.docstore_compression.clone(),
@@ -271,8 +273,8 @@ impl PluginWriter for StorePluginWriter {
                 // Read from temp store and write in new order
                 let store_read = StoreReader::open(
                     segment.open_read(SegmentComponent::TempStore)?,
-                    1, /* The docstore is configured to have one doc per block, and each doc is
-                        * accessed only once: we don't need caching. */
+                    1,    /* The docstore is configured to have one doc per block, and each doc
+                           * is accessed only once: we don't need caching. */
                     None, // TempStore is always written with Compressor::None, no dictionary.
                 )?;
                 for old_doc_id in doc_id_map.iter_old_doc_ids() {

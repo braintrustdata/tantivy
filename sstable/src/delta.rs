@@ -87,8 +87,7 @@ impl DeltaKeyComparator {
 }
 
 pub struct DeltaWriter<W, TValueWriter>
-where
-    W: io::Write,
+where W: io::Write
 {
     block: Vec<u8>,
     write: CountingWriter<BufWriter<W>>,
@@ -256,8 +255,7 @@ pub struct DeltaReader<TValueReader> {
 }
 
 impl<TValueReader> DeltaReader<TValueReader>
-where
-    TValueReader: value::ValueReader,
+where TValueReader: value::ValueReader
 {
     pub fn new(reader: OwnedBytes) -> Self {
         DeltaReader {
@@ -370,9 +368,10 @@ mod tests {
 
     #[test]
     fn test_decoder_discards_partial_block_state() {
+        use common::OwnedBytes;
+
         use super::DeltaWriter;
         use crate::value::U64MonotonicValueWriter;
-        use common::OwnedBytes;
 
         let encode = |entries: &[(usize, &[u8], u64)]| {
             let mut output = Vec::new();

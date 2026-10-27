@@ -183,7 +183,10 @@ mod tests {
         let segment_collector = collector.for_segment(0, segment_reader)?;
         assert_eq!(segment_collector.topn_computer.buffer_capacity(), 6);
 
-        let top_docs = searcher.search(&AllQuery, &TopDocs::with_limit(100).and_offset(1).order_by_score())?;
+        let top_docs = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(100).and_offset(1).order_by_score(),
+        )?;
         assert_eq!(top_docs.len(), 2);
         Ok(())
     }

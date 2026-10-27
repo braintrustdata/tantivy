@@ -1014,11 +1014,12 @@ mod tests {
         };
 
         // Create TopHitsSegmentCollector - it should be capped to segment_size (2)
-        let segment_collector = super::TopHitsSegmentCollector::from_req(super::TopHitsAggReqData {
-            segment_size,
-            req,
-            ..Default::default()
-        });
+        let segment_collector =
+            super::TopHitsSegmentCollector::from_req(super::TopHitsAggReqData {
+                segment_size,
+                req,
+                ..Default::default()
+            });
 
         // The internal TopNComputer should have been created with capped size (2)
         // Buffer capacity should be 2 * capped_size = 2 * 2 = 4

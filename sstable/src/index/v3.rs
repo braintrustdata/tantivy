@@ -728,8 +728,8 @@ fn find_best_slope(elements: impl Iterator<Item = (usize, u64)> + Clone) -> (u32
 mod tests {
     use std::sync::Arc;
 
-    use common::file_slice::FileSlice;
     use common::OwnedBytes;
+    use common::file_slice::FileSlice;
 
     use super::*;
     use crate::block_match_automaton::tests::EqBuffer;

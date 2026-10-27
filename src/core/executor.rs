@@ -117,8 +117,8 @@ impl Executor {
                 let res = op();
                 fruit_sender.send(res).map_err(|_| {
                     TantivyError::InternalError(
-                        "Failed to send search task. It probably means all search \
-                     threads have panicked."
+                        "Failed to send search task. It probably means all search threads have \
+                         panicked."
                             .to_string(),
                     )
                 })?;
@@ -131,8 +131,8 @@ impl Executor {
                     match fruit_sender.send(res) {
                         Ok(_) => (),
                         Err(_) => error!(
-                            "Failed to send search task. It probably means all search \
-                     threads have panicked."
+                            "Failed to send search task. It probably means all search threads \
+                             have panicked."
                         ),
                     }
                 });
@@ -142,8 +142,8 @@ impl Executor {
         Ok(move || {
             fruit_receiver.recv().map_err(|_| {
                 TantivyError::InternalError(
-                    "Failed to send search task. It probably means all search \
-                     threads have panicked."
+                    "Failed to send search task. It probably means all search threads have \
+                     panicked."
                         .to_string(),
                 )
             })?

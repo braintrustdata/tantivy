@@ -337,8 +337,8 @@ impl StoreReader {
             let deserializer =
                 BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
                     .map_err(crate::TantivyError::from)?;
-            let doc = TantivyDocument::deserialize(deserializer)
-                .map_err(crate::TantivyError::from)?;
+            let doc =
+                TantivyDocument::deserialize(deserializer).map_err(crate::TantivyError::from)?;
             let mut buffer = Vec::new();
             BinaryDocumentSerializer::new(&mut buffer, schema).serialize_doc(&doc)?;
             Ok(OwnedBytes::new(buffer))
