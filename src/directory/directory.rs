@@ -191,6 +191,18 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
         self.atomic_read(path)
     }
 
+    /// Whether this directory guarantees that the dictionary stored at `path` really is
+    /// content-addressed (its bytes hash to its name), so `ZstdDictionary` loads can skip
+    /// recomputing the SHA-256 of every multi-megabyte dictionary they read back.
+    ///
+    /// Defaults to `false`, which keeps the verification. Only return `true` for paths whose
+    /// writers are known to name them by content (i.e. only ever `ZstdDictionary::seed`).
+    /// Wrappers should forward it; not forwarding is safe, it just keeps the verification.
+    #[doc(hidden)]
+    fn trusts_content_addressed_path(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// Atomically replace the content of a file with data.
     ///
     /// This calls ensure that reads can never *observe*
