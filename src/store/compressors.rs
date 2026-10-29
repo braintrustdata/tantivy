@@ -219,7 +219,8 @@ impl ZstdDictionary {
         let compressed = directory
             .atomic_read(std::path::Path::new(path))
             .map_err(open_read_error_to_io_error)?;
-        Self::decompress_verify_and_cache(path, &compressed)
+        let verify = !directory.trusts_content_addressed_path(std::path::Path::new(path));
+        Self::decompress_verify_and_cache(path, &compressed, verify)
     }
 
     /// [`ZstdDictionary::load_internal`], awaiting the read rather than blocking on it. See
@@ -235,7 +236,8 @@ impl ZstdDictionary {
             .atomic_read_async(std::path::Path::new(path))
             .await
             .map_err(open_read_error_to_io_error)?;
-        Self::decompress_verify_and_cache(path, &compressed)
+        let verify = !directory.trusts_content_addressed_path(std::path::Path::new(path));
+        Self::decompress_verify_and_cache(path, &compressed, verify)
     }
 
     /// Everything the blocking and awaiting loads do *before* the read: validate the path, then
@@ -255,12 +257,14 @@ impl ZstdDictionary {
     }
 
     /// Everything the blocking and awaiting loads do *after* the read: decompress, verify that
-    /// the bytes really do hash to `path`, and cache them. CPU-bound only, no I/O, so both paths
-    /// share it verbatim -- this is the half where a divergence between them would silently
-    /// weaken the cache's safety invariant.
+    /// the bytes really do hash to `path` (unless the directory vouches for it, see
+    /// `Directory::trusts_content_addressed_path`), and cache them. CPU-bound only, no I/O, so
+    /// both paths share it verbatim -- this is the half where a divergence between them would
+    /// silently weaken the cache's safety invariant.
     fn decompress_verify_and_cache(
         path: &str,
         compressed: &[u8],
+        verify: bool,
     ) -> io::Result<std::sync::Arc<[u8]>> {
         let bytes: std::sync::Arc<[u8]> =
             std::sync::Arc::from(super::decompress_whole(compressed)?);
@@ -273,17 +277,19 @@ impl ZstdDictionary {
         // name for what was actually read and comparing it against `path`. A mismatch means
         // caching under `path` would be unsafe (two different directories could then poison each
         // other's cache entry under the same literal name) -- refuse rather than cache it.
-        let expected_path = content_addressed_dictionary_path(&bytes);
-        if expected_path != path {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "dictionary at {path:?} does not hash to its own path (expected \
-                     {expected_path:?}) -- refusing to cache it under a name that doesn't \
-                     uniquely identify its content, since the dictionary cache is process-wide \
-                     and keyed by path alone"
-                ),
-            ));
+        if verify {
+            let expected_path = content_addressed_dictionary_path(&bytes);
+            if expected_path != path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "dictionary at {path:?} does not hash to its own path (expected \
+                         {expected_path:?}) -- refusing to cache it under a name that doesn't \
+                         uniquely identify its content, since the dictionary cache is process-wide \
+                         and keyed by path alone"
+                    ),
+                ));
+            }
         }
 
         // Racing with another thread's concurrent miss for the same path is fine: both decompress
@@ -962,6 +968,7 @@ mod tests {
         inner: crate::directory::RamDirectory,
         blocking_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         awaited_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        trusted: bool,
     }
 
     impl ReadCountingDirectory {
@@ -970,6 +977,7 @@ mod tests {
                 inner: crate::directory::RamDirectory::create(),
                 blocking_reads: Default::default(),
                 awaited_reads: Default::default(),
+                trusted: false,
             }
         }
 
@@ -1040,12 +1048,40 @@ mod tests {
             self.inner.sync_directory()
         }
 
+        fn trusts_content_addressed_path(&self, _path: &std::path::Path) -> bool {
+            self.trusted
+        }
+
         fn watch(
             &self,
             watch_callback: crate::directory::WatchCallback,
         ) -> crate::Result<crate::directory::WatchHandle> {
             self.inner.watch(watch_callback)
         }
+    }
+
+    #[test]
+    fn zstd_dictionary_load_skips_hash_verification_for_trusted_directories() {
+        use crate::directory::Directory;
+
+        clear_dictionary_cache_for_test();
+        let mut directory = ReadCountingDirectory::create();
+        let content = b"trusted content that does not hash to its literal path".to_vec();
+        let compressed = super::super::compression_zstd_block::compress_whole(&content).unwrap();
+        let path = "trusted-not-a-hash.bin.zst";
+        directory
+            .atomic_write(std::path::Path::new(path), &compressed)
+            .unwrap();
+        let dict = ZstdDictionary::Path(path.to_string());
+
+        let err = dict.load(&directory).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        directory.trusted = true;
+        assert_eq!(&*dict.load(&directory).unwrap(), content.as_slice());
+        clear_dictionary_cache_for_test();
+        let loaded = futures::executor::block_on(dict.load_async(&directory)).unwrap();
+        assert_eq!(&*loaded, content.as_slice());
     }
 
     #[test]
