@@ -335,6 +335,50 @@ pub trait ObjectAccess<'de> {
     }
 }
 
+/// Controls string ownership and allocation hints during binary deserialization.
+pub trait StringRead<R: Read> {
+    /// Reads a string from the input.
+    fn read_string(reader: &mut R) -> Result<Cow<'_, str>, DeserializeError>;
+
+    /// Bounds a container's allocation hint for the input.
+    fn size_hint(reader: &R, length: usize) -> usize;
+}
+
+/// Reads owned strings from an arbitrary reader.
+pub struct OwnedStrings;
+
+impl<R: Read> StringRead<R> for OwnedStrings {
+    fn read_string(reader: &mut R) -> Result<Cow<'_, str>, DeserializeError> {
+        Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
+            reader,
+        )?))
+    }
+
+    fn size_hint(_reader: &R, length: usize) -> usize {
+        length
+    }
+}
+
+/// Borrows strings from an input slice.
+pub struct BorrowedStrings;
+
+impl StringRead<&[u8]> for BorrowedStrings {
+    fn read_string<'a>(reader: &'a mut &[u8]) -> Result<Cow<'a, str>, DeserializeError> {
+        let len =
+            usize::try_from(VInt::deserialize(reader)?.val()).map_err(DeserializeError::custom)?;
+        let text = reader.get(..len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated stored string")
+        })?;
+        let text = std::str::from_utf8(text).map_err(DeserializeError::custom)?;
+        *reader = &reader[len..];
+        Ok(Cow::Borrowed(text))
+    }
+
+    fn size_hint(reader: &&[u8], length: usize) -> usize {
+        length.min(reader.len())
+    }
+}
+
 /// The document deserializer used to read the tantivy documents serialized with
 /// `BinarySerializable`.
 ///
@@ -342,31 +386,32 @@ pub trait ObjectAccess<'de> {
 /// deserialize each field of the document from the provided reader (`R`).
 ///
 /// TODO: Switch to slice instead?
-pub struct BinaryDocumentDeserializer<'de, R> {
+pub struct BinaryDocumentDeserializer<'de, R, M = OwnedStrings> {
     length: usize,
     position: usize,
     reader: &'de mut R,
-    read_string: fn(&mut R) -> Result<Cow<'de, str>, DeserializeError>,
-    size_hint: fn(&R, usize) -> usize,
+    mode: PhantomData<M>,
 }
 
-impl<'de, R> BinaryDocumentDeserializer<'de, R>
-where R: Read
-{
-    /// Attempts to create a new document deserializer from a given reader.
+impl<'de, R: Read> BinaryDocumentDeserializer<'de, R> {
     pub(crate) fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
+        Self::new(reader)
+    }
+}
+
+impl<'de, R, M> BinaryDocumentDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
+{
+    fn new(reader: &'de mut R) -> Result<Self, DeserializeError> {
         let length = VInt::deserialize(reader)?;
 
         Ok(Self {
             length: length.val() as usize,
             position: 0,
             reader,
-            read_string: |reader| {
-                Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
-                    reader,
-                )?))
-            },
-            size_hint: |_, length| length,
+            mode: PhantomData,
         })
     }
 
@@ -377,33 +422,21 @@ where R: Read
     }
 }
 
-fn borrowed_string<'de>(reader: &mut &'de [u8]) -> Result<Cow<'de, str>, DeserializeError> {
-    let len =
-        usize::try_from(VInt::deserialize(reader)?.val()).map_err(DeserializeError::custom)?;
-    let text = reader
-        .get(..len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated stored string"))?;
-    let text = std::str::from_utf8(text).map_err(DeserializeError::custom)?;
-    *reader = &reader[len..];
-    Ok(Cow::Borrowed(text))
-}
-
-impl<'a, 'de: 'a> BinaryDocumentDeserializer<'a, &'de [u8]> {
+impl<'a, 'de: 'a> BinaryDocumentDeserializer<'a, &'de [u8], BorrowedStrings> {
     /// Creates a deserializer that borrows strings from the remaining input slice.
     pub fn from_slice(reader: &'a mut &'de [u8]) -> Result<Self, DeserializeError> {
-        let mut deserializer = Self::from_reader(reader)?;
-        deserializer.read_string = borrowed_string;
-        deserializer.size_hint = |reader, length| length.min(reader.len());
-        Ok(deserializer)
+        Self::new(reader)
     }
 }
 
-impl<'de, R> DocumentDeserializer<'de> for BinaryDocumentDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> DocumentDeserializer<'de> for BinaryDocumentDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
     #[inline]
     fn size_hint(&self) -> usize {
-        (self.size_hint)(self.reader, self.length)
+        M::size_hint(self.reader, self.length)
     }
 
     fn next_field<V: ValueDeserialize>(&mut self) -> Result<Option<(Field, V)>, DeserializeError> {
@@ -420,9 +453,7 @@ where R: Read
 
         let field = Field::deserialize(self.reader).map_err(DeserializeError::from)?;
 
-        let mut deserializer = BinaryValueDeserializer::from_reader(self.reader)?;
-        deserializer.read_string = self.read_string;
-        deserializer.size_hint = self.size_hint;
+        let deserializer = BinaryValueDeserializer::<_, M>::from_reader(self.reader)?;
         let value = seed.deserialize(deserializer)?;
 
         self.position += 1;
@@ -433,17 +464,17 @@ where R: Read
 
 /// A single value deserializer that deserializes a value serialized with `BinarySerializable`.
 /// TODO: Improve docs
-pub struct BinaryValueDeserializer<'de, R> {
+pub struct BinaryValueDeserializer<'de, R, M = OwnedStrings> {
     value_type: ValueType,
     reader: &'de mut R,
-    read_string: fn(&mut R) -> Result<Cow<'de, str>, DeserializeError>,
-    size_hint: fn(&R, usize) -> usize,
+    mode: PhantomData<M>,
 }
 
-impl<'de, R> BinaryValueDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> BinaryValueDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
-    /// Attempts to create a new value deserializer from a given reader.
     fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
         let type_code = <u8 as BinarySerializable>::deserialize(reader)?;
 
@@ -488,12 +519,7 @@ where R: Read
         Ok(Self {
             value_type,
             reader,
-            read_string: |reader| {
-                Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
-                    reader,
-                )?))
-            },
-            size_hint: |_, length| length,
+            mode: PhantomData,
         })
     }
 
@@ -509,18 +535,17 @@ where R: Read
     }
 }
 
-impl<'a, 'de: 'a> BinaryValueDeserializer<'a, &'de [u8]> {
+impl<'a, 'de: 'a> BinaryValueDeserializer<'a, &'de [u8], BorrowedStrings> {
     /// Creates a deserializer that borrows strings from the remaining input slice.
     pub fn from_slice(reader: &'a mut &'de [u8]) -> Result<Self, DeserializeError> {
-        let mut deserializer = Self::from_reader(reader)?;
-        deserializer.read_string = borrowed_string;
-        deserializer.size_hint = |reader, length| length.min(reader.len());
-        Ok(deserializer)
+        Self::from_reader(reader)
     }
 }
 
-impl<'de, R> ValueDeserializer<'de> for BinaryValueDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> ValueDeserializer<'de> for BinaryValueDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
     fn deserialize_null(self) -> Result<(), DeserializeError> {
         self.validate_type(ValueType::Null)?;
@@ -529,7 +554,7 @@ where R: Read
 
     fn deserialize_string(self) -> Result<String, DeserializeError> {
         self.validate_type(ValueType::String)?;
-        (self.read_string)(self.reader).map(Cow::into_owned)
+        M::read_string(self.reader).map(Cow::into_owned)
     }
 
     fn deserialize_u64(self) -> Result<u64, DeserializeError> {
@@ -586,7 +611,7 @@ where R: Read
     where V: ValueVisitor {
         match self.value_type {
             ValueType::Null => visitor.visit_null(),
-            ValueType::String => match (self.read_string)(self.reader)? {
+            ValueType::String => match M::read_string(self.reader)? {
                 Cow::Borrowed(val) => visitor.visit_borrowed_str(val),
                 Cow::Owned(val) => visitor.visit_string(val),
             },
@@ -627,15 +652,11 @@ where R: Read
                 visitor.visit_pre_tokenized_string(val)
             }
             ValueType::Array => {
-                let mut access = BinaryArrayDeserializer::from_reader(self.reader)?;
-                access.read_string = self.read_string;
-                access.size_hint = self.size_hint;
+                let access = BinaryArrayDeserializer::<_, M>::from_reader(self.reader)?;
                 visitor.visit_array(access)
             }
             ValueType::Object => {
-                let mut access = BinaryObjectDeserializer::from_reader(self.reader)?;
-                access.inner.read_string = self.read_string;
-                access.inner.size_hint = self.size_hint;
+                let access = BinaryObjectDeserializer::<_, M>::from_reader(self.reader)?;
                 visitor.visit_object(access)
             }
             #[allow(deprecated)]
@@ -651,16 +672,17 @@ where R: Read
 
 /// A deserializer for an array of values serialized with `BinarySerializable`.
 /// TODO: Improve docs
-pub struct BinaryArrayDeserializer<'de, R> {
+pub struct BinaryArrayDeserializer<'de, R, M = OwnedStrings> {
     length: usize,
     position: usize,
     reader: &'de mut R,
-    read_string: fn(&mut R) -> Result<Cow<'de, str>, DeserializeError>,
-    size_hint: fn(&R, usize) -> usize,
+    mode: PhantomData<M>,
 }
 
-impl<'de, R> BinaryArrayDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> BinaryArrayDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
     /// Attempts to create a new array deserializer from a given reader.
     fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
@@ -670,12 +692,7 @@ where R: Read
             length: length.val() as usize,
             position: 0,
             reader,
-            read_string: |reader| {
-                Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
-                    reader,
-                )?))
-            },
-            size_hint: |_, length| length,
+            mode: PhantomData,
         })
     }
 
@@ -686,12 +703,14 @@ where R: Read
     }
 }
 
-impl<'de, R> ArrayAccess<'de> for BinaryArrayDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> ArrayAccess<'de> for BinaryArrayDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
     #[inline]
     fn size_hint(&self) -> usize {
-        (self.size_hint)(self.reader, self.length)
+        M::size_hint(self.reader, self.length)
     }
 
     fn next_element<V: ValueDeserialize>(&mut self) -> Result<Option<V>, DeserializeError> {
@@ -706,9 +725,7 @@ where R: Read
             return Ok(None);
         }
 
-        let mut deserializer = BinaryValueDeserializer::from_reader(self.reader)?;
-        deserializer.read_string = self.read_string;
-        deserializer.size_hint = self.size_hint;
+        let deserializer = BinaryValueDeserializer::<_, M>::from_reader(self.reader)?;
         let value = seed.deserialize(deserializer)?;
 
         // Advance the position cursor.
@@ -719,26 +736,30 @@ where R: Read
 }
 
 /// A deserializer for a object consisting of key-value pairs.
-pub struct BinaryObjectDeserializer<'de, R> {
+pub struct BinaryObjectDeserializer<'de, R, M = OwnedStrings> {
     /// The inner deserializer.
     ///
     /// Internally an object is just represented by an array
     /// in the format of `[key, value, key, value, key, value]`.
-    inner: BinaryArrayDeserializer<'de, R>,
+    inner: BinaryArrayDeserializer<'de, R, M>,
 }
 
-impl<'de, R> BinaryObjectDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> BinaryObjectDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
     /// Attempts to create a new object deserializer from a given reader.
     fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
-        let inner = BinaryArrayDeserializer::from_reader(reader)?;
+        let inner = BinaryArrayDeserializer::<_, M>::from_reader(reader)?;
         Ok(Self { inner })
     }
 }
 
-impl<'de, R> ObjectAccess<'de> for BinaryObjectDeserializer<'de, R>
-where R: Read
+impl<'de, R, M> ObjectAccess<'de> for BinaryObjectDeserializer<'de, R, M>
+where
+    R: Read,
+    M: StringRead<R>,
 {
     #[inline]
     /// A indicator as to how many values are in the object.
@@ -1085,7 +1106,7 @@ mod tests {
         let value = <OwnedValue as ValueDeserialize>::deserialize(deserializer).unwrap();
         assert!(slice.is_empty());
         let mut cursor = Cursor::new(buffer);
-        let deserializer = BinaryValueDeserializer::from_reader(&mut cursor).unwrap();
+        let deserializer = BinaryValueDeserializer::<_>::from_reader(&mut cursor).unwrap();
         let owned = <OwnedValue as ValueDeserialize>::deserialize(deserializer).unwrap();
         assert_eq!(value, owned);
         value
@@ -1123,6 +1144,7 @@ mod tests {
             &self,
             mut access: A,
         ) -> Result<(), DeserializeError> {
+            assert!(access.size_hint() <= self.input.len());
             while access.next_element_seed(*self)?.is_some() {}
             Ok(())
         }
@@ -1131,6 +1153,7 @@ mod tests {
             &self,
             mut access: A,
         ) -> Result<(), DeserializeError> {
+            assert!(access.size_hint() <= self.input.len());
             while access.next_entry_seed(*self, *self)?.is_some() {}
             Ok(())
         }
@@ -1188,6 +1211,30 @@ mod tests {
             panic!("object")
         };
         assert!(matches!(object.get("date"), Some(OwnedValue::Date(_))));
+    }
+
+    #[test]
+    fn test_slice_bounds_document_and_nested_container_hints() {
+        let mut bytes = Vec::new();
+        VInt(u64::MAX).serialize(&mut bytes).unwrap();
+        let mut input = bytes.as_slice();
+        let mut deserializer = BinaryDocumentDeserializer::from_slice(&mut input).unwrap();
+        assert_eq!(deserializer.size_hint(), 0);
+        assert!(deserializer.next_field::<OwnedValue>().is_err());
+
+        for container in [type_codes::ARRAY_CODE, type_codes::OBJECT_CODE] {
+            let mut bytes = vec![type_codes::ARRAY_CODE];
+            VInt(1).serialize(&mut bytes).unwrap();
+            bytes.push(container);
+            VInt(u64::MAX).serialize(&mut bytes).unwrap();
+            let visitor = BorrowedStrings {
+                input: &bytes,
+                strings: RefCell::new(Vec::new()),
+            };
+            let mut input = bytes.as_slice();
+            let deserializer = BinaryValueDeserializer::from_slice(&mut input).unwrap();
+            assert!(deserializer.deserialize_any(&visitor).is_err());
+        }
     }
 
     #[test]
