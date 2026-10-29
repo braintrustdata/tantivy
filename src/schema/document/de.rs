@@ -348,12 +348,14 @@ pub trait StringRead<R: Read> {
 pub struct OwnedStrings;
 
 impl<R: Read> StringRead<R> for OwnedStrings {
+    #[inline]
     fn read_string(reader: &mut R) -> Result<Cow<'_, str>, DeserializeError> {
         Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
             reader,
         )?))
     }
 
+    #[inline]
     fn size_hint(_reader: &R, length: usize) -> usize {
         length
     }
@@ -363,6 +365,7 @@ impl<R: Read> StringRead<R> for OwnedStrings {
 pub struct BorrowedStrings;
 
 impl StringRead<&[u8]> for BorrowedStrings {
+    #[inline]
     fn read_string<'a>(reader: &'a mut &[u8]) -> Result<Cow<'a, str>, DeserializeError> {
         let len =
             usize::try_from(VInt::deserialize(reader)?.val()).map_err(DeserializeError::custom)?;
@@ -374,6 +377,7 @@ impl StringRead<&[u8]> for BorrowedStrings {
         Ok(Cow::Borrowed(text))
     }
 
+    #[inline]
     fn size_hint(reader: &&[u8], length: usize) -> usize {
         length.min(reader.len())
     }
