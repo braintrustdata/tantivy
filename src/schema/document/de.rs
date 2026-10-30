@@ -7,6 +7,7 @@
 //! The motivation behind this API is to provide a easy to implement and
 //! efficient way of deserializing a potentially arbitrarily nested object.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::io;
@@ -18,7 +19,6 @@ use std::sync::Arc;
 use columnar::MonotonicallyMappableToU128;
 use common::{u64_to_f64, BinarySerializable, DateTime, VInt};
 
-use super::se::BinaryObjectSerializer;
 use super::{OwnedValue, Value};
 use crate::schema::document::type_codes;
 use crate::schema::{Facet, Field};
@@ -79,11 +79,38 @@ pub trait DocumentDeserializer<'de> {
 
     /// Attempts to deserialize the next field in the document.
     fn next_field<V: ValueDeserialize>(&mut self) -> Result<Option<(Field, V)>, DeserializeError>;
+
+    /// Deserializes the next field using caller-provided state.
+    fn next_field_seed<S: ValueDeserializeSeed>(
+        &mut self,
+        _seed: S,
+    ) -> Result<Option<(Field, S::Value)>, DeserializeError> {
+        Err(DeserializeError::custom(
+            "Document deserializer does not support seeds",
+        ))
+    }
+}
+
+/// Deserializes a value using caller-provided state.
+pub trait ValueDeserializeSeed {
+    /// The value produced by this seed.
+    type Value;
+
+    /// Deserializes a value with this seed's state.
+    fn deserialize<'de, D>(self, deserializer: D) -> Result<Self::Value, DeserializeError>
+    where D: ValueDeserializer<'de>;
+}
+
+impl<T: ValueDeserialize> ValueDeserializeSeed for PhantomData<T> {
+    type Value = T;
+
+    fn deserialize<'de, D>(self, deserializer: D) -> Result<T, DeserializeError>
+    where D: ValueDeserializer<'de> {
+        T::deserialize(deserializer)
+    }
 }
 
 /// The core trait for deserializing values.
-///
-/// TODO: Improve docs
 pub trait ValueDeserialize: Sized {
     /// Attempts to deserialize Self from a given value deserializer.
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, DeserializeError>
@@ -180,7 +207,13 @@ pub trait ValueVisitor {
     }
 
     #[inline]
-    /// Called when the deserializer visits a string value.
+    /// Visits a string borrowed from the input. Defaults to an owned string visit.
+    fn visit_borrowed_str(&self, val: &str) -> Result<Self::Value, DeserializeError> {
+        self.visit_string(val.to_owned())
+    }
+
+    #[inline]
+    /// Called when the deserializer visits an owned string value.
     fn visit_string(&self, _val: String) -> Result<Self::Value, DeserializeError> {
         Err(DeserializeError::UnsupportedType(ValueType::String))
     }
@@ -267,6 +300,16 @@ pub trait ArrayAccess<'de> {
 
     /// Attempts to deserialize the next element in the sequence.
     fn next_element<V: ValueDeserialize>(&mut self) -> Result<Option<V>, DeserializeError>;
+
+    /// Deserializes the next element using caller-provided state.
+    fn next_element_seed<S: ValueDeserializeSeed>(
+        &mut self,
+        _seed: S,
+    ) -> Result<Option<S::Value>, DeserializeError> {
+        Err(DeserializeError::custom(
+            "Array deserializer does not support seeds",
+        ))
+    }
 }
 
 /// TODO: Improve docs
@@ -279,6 +322,17 @@ pub trait ObjectAccess<'de> {
 
     /// Attempts to deserialize the next key-value pair in the object.
     fn next_entry<V: ValueDeserialize>(&mut self) -> Result<Option<(String, V)>, DeserializeError>;
+
+    /// Deserializes the next entry using separate key and value seeds.
+    fn next_entry_seed<K: ValueDeserializeSeed, V: ValueDeserializeSeed>(
+        &mut self,
+        _key: K,
+        _value: V,
+    ) -> Result<Option<(K::Value, V::Value)>, DeserializeError> {
+        Err(DeserializeError::custom(
+            "Object deserializer does not support seeds",
+        ))
+    }
 }
 
 /// The document deserializer used to read the tantivy documents serialized with
@@ -292,6 +346,8 @@ pub struct BinaryDocumentDeserializer<'de, R> {
     length: usize,
     position: usize,
     reader: &'de mut R,
+    read_string: fn(&mut R) -> Result<Cow<'de, str>, DeserializeError>,
+    size_hint: fn(&R, usize) -> usize,
 }
 
 impl<'de, R> BinaryDocumentDeserializer<'de, R>
@@ -305,6 +361,12 @@ where R: Read
             length: length.val() as usize,
             position: 0,
             reader,
+            read_string: |reader| {
+                Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
+                    reader,
+                )?))
+            },
+            size_hint: |_, length| length,
         })
     }
 
@@ -315,23 +377,53 @@ where R: Read
     }
 }
 
+fn borrowed_string<'de>(reader: &mut &'de [u8]) -> Result<Cow<'de, str>, DeserializeError> {
+    let len =
+        usize::try_from(VInt::deserialize(reader)?.val()).map_err(DeserializeError::custom)?;
+    let text = reader
+        .get(..len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated stored string"))?;
+    let text = std::str::from_utf8(text).map_err(DeserializeError::custom)?;
+    *reader = &reader[len..];
+    Ok(Cow::Borrowed(text))
+}
+
+impl<'a, 'de: 'a> BinaryDocumentDeserializer<'a, &'de [u8]> {
+    /// Creates a deserializer that borrows strings from the remaining input slice.
+    pub fn from_slice(reader: &'a mut &'de [u8]) -> Result<Self, DeserializeError> {
+        let mut deserializer = Self::from_reader(reader)?;
+        deserializer.read_string = borrowed_string;
+        deserializer.size_hint = |reader, length| length.min(reader.len());
+        Ok(deserializer)
+    }
+}
+
 impl<'de, R> DocumentDeserializer<'de> for BinaryDocumentDeserializer<'de, R>
 where R: Read
 {
     #[inline]
     fn size_hint(&self) -> usize {
-        self.length
+        (self.size_hint)(self.reader, self.length)
     }
 
     fn next_field<V: ValueDeserialize>(&mut self) -> Result<Option<(Field, V)>, DeserializeError> {
+        self.next_field_seed(PhantomData::<V>)
+    }
+
+    fn next_field_seed<S: ValueDeserializeSeed>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<(Field, S::Value)>, DeserializeError> {
         if self.is_complete() {
             return Ok(None);
         }
 
         let field = Field::deserialize(self.reader).map_err(DeserializeError::from)?;
 
-        let deserializer = BinaryValueDeserializer::from_reader(self.reader)?;
-        let value = V::deserialize(deserializer)?;
+        let mut deserializer = BinaryValueDeserializer::from_reader(self.reader)?;
+        deserializer.read_string = self.read_string;
+        deserializer.size_hint = self.size_hint;
+        let value = seed.deserialize(deserializer)?;
 
         self.position += 1;
 
@@ -344,6 +436,8 @@ where R: Read
 pub struct BinaryValueDeserializer<'de, R> {
     value_type: ValueType,
     reader: &'de mut R,
+    read_string: fn(&mut R) -> Result<Cow<'de, str>, DeserializeError>,
+    size_hint: fn(&R, usize) -> usize,
 }
 
 impl<'de, R> BinaryValueDeserializer<'de, R>
@@ -391,7 +485,16 @@ where R: Read
             }
         };
 
-        Ok(Self { value_type, reader })
+        Ok(Self {
+            value_type,
+            reader,
+            read_string: |reader| {
+                Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
+                    reader,
+                )?))
+            },
+            size_hint: |_, length| length,
+        })
     }
 
     fn validate_type(&self, expected_type: ValueType) -> Result<(), DeserializeError> {
@@ -406,6 +509,16 @@ where R: Read
     }
 }
 
+impl<'a, 'de: 'a> BinaryValueDeserializer<'a, &'de [u8]> {
+    /// Creates a deserializer that borrows strings from the remaining input slice.
+    pub fn from_slice(reader: &'a mut &'de [u8]) -> Result<Self, DeserializeError> {
+        let mut deserializer = Self::from_reader(reader)?;
+        deserializer.read_string = borrowed_string;
+        deserializer.size_hint = |reader, length| length.min(reader.len());
+        Ok(deserializer)
+    }
+}
+
 impl<'de, R> ValueDeserializer<'de> for BinaryValueDeserializer<'de, R>
 where R: Read
 {
@@ -416,7 +529,7 @@ where R: Read
 
     fn deserialize_string(self) -> Result<String, DeserializeError> {
         self.validate_type(ValueType::String)?;
-        <String as BinarySerializable>::deserialize(self.reader).map_err(DeserializeError::from)
+        (self.read_string)(self.reader).map(Cow::into_owned)
     }
 
     fn deserialize_u64(self) -> Result<u64, DeserializeError> {
@@ -473,10 +586,10 @@ where R: Read
     where V: ValueVisitor {
         match self.value_type {
             ValueType::Null => visitor.visit_null(),
-            ValueType::String => {
-                let val = self.deserialize_string()?;
-                visitor.visit_string(val)
-            }
+            ValueType::String => match (self.read_string)(self.reader)? {
+                Cow::Borrowed(val) => visitor.visit_borrowed_str(val),
+                Cow::Owned(val) => visitor.visit_string(val),
+            },
             ValueType::U64 => {
                 let val = self.deserialize_u64()?;
                 visitor.visit_u64(val)
@@ -514,32 +627,23 @@ where R: Read
                 visitor.visit_pre_tokenized_string(val)
             }
             ValueType::Array => {
-                let access = BinaryArrayDeserializer::from_reader(self.reader)?;
+                let mut access = BinaryArrayDeserializer::from_reader(self.reader)?;
+                access.read_string = self.read_string;
+                access.size_hint = self.size_hint;
                 visitor.visit_array(access)
             }
             ValueType::Object => {
-                let access = BinaryObjectDeserializer::from_reader(self.reader)?;
+                let mut access = BinaryObjectDeserializer::from_reader(self.reader)?;
+                access.inner.read_string = self.read_string;
+                access.inner.size_hint = self.size_hint;
                 visitor.visit_object(access)
             }
             #[allow(deprecated)]
             ValueType::JSONObject => {
-                // This is a compatibility layer
-                // The implementation is slow, but is temporary anyways
                 let mut de = serde_json::Deserializer::from_reader(self.reader);
-                let json_map = <serde_json::Map::<String, serde_json::Value> as serde::Deserialize>::deserialize(&mut de).map_err(|err| DeserializeError::Custom(err.to_string()))?;
-                let mut out = Vec::new();
-                let mut serializer = BinaryObjectSerializer::begin(json_map.len(), &mut out)?;
-                for (key, val) in json_map {
-                    let val: OwnedValue = val.into();
-                    serializer.serialize_entry(&key, (&val).as_value())?;
-                }
-                serializer.end()?;
-
-                let out_rc = std::rc::Rc::new(out);
-                let mut slice: &[u8] = &out_rc;
-                let access = BinaryObjectDeserializer::from_reader(&mut slice)?;
-
-                visitor.visit_object(access)
+                let json_map = <serde_json::Map<String, serde_json::Value> as serde::Deserialize>::deserialize(&mut de)
+                    .map_err(DeserializeError::custom)?;
+                OwnedValue::from(serde_json::Value::Object(json_map)).deserialize_any(visitor)
             }
         }
     }
@@ -551,6 +655,8 @@ pub struct BinaryArrayDeserializer<'de, R> {
     length: usize,
     position: usize,
     reader: &'de mut R,
+    read_string: fn(&mut R) -> Result<Cow<'de, str>, DeserializeError>,
+    size_hint: fn(&R, usize) -> usize,
 }
 
 impl<'de, R> BinaryArrayDeserializer<'de, R>
@@ -564,6 +670,12 @@ where R: Read
             length: length.val() as usize,
             position: 0,
             reader,
+            read_string: |reader| {
+                Ok(Cow::Owned(<String as BinarySerializable>::deserialize(
+                    reader,
+                )?))
+            },
+            size_hint: |_, length| length,
         })
     }
 
@@ -579,16 +691,25 @@ where R: Read
 {
     #[inline]
     fn size_hint(&self) -> usize {
-        self.length
+        (self.size_hint)(self.reader, self.length)
     }
 
     fn next_element<V: ValueDeserialize>(&mut self) -> Result<Option<V>, DeserializeError> {
+        self.next_element_seed(PhantomData::<V>)
+    }
+
+    fn next_element_seed<S: ValueDeserializeSeed>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, DeserializeError> {
         if self.is_complete() {
             return Ok(None);
         }
 
-        let deserializer = BinaryValueDeserializer::from_reader(self.reader)?;
-        let value = V::deserialize(deserializer)?;
+        let mut deserializer = BinaryValueDeserializer::from_reader(self.reader)?;
+        deserializer.read_string = self.read_string;
+        deserializer.size_hint = self.size_hint;
+        let value = seed.deserialize(deserializer)?;
 
         // Advance the position cursor.
         self.position += 1;
@@ -632,18 +753,146 @@ where R: Read
 
     /// Attempts to deserialize the next key-value pair in the object.
     fn next_entry<V: ValueDeserialize>(&mut self) -> Result<Option<(String, V)>, DeserializeError> {
+        self.next_entry_seed(PhantomData::<String>, PhantomData::<V>)
+    }
+
+    fn next_entry_seed<K: ValueDeserializeSeed, V: ValueDeserializeSeed>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<Option<(K::Value, V::Value)>, DeserializeError> {
         if self.inner.is_complete() {
             return Ok(None);
         }
-
-        let key = self.inner.next_element::<String>()?.expect(
-            "Deserializer should not be empty as it is not marked as complete, this is a bug",
-        );
-        let value = self.inner.next_element::<V>()?.expect(
-            "Deserializer should not be empty as it is not marked as complete, this is a bug",
-        );
-
+        let key = self
+            .inner
+            .next_element_seed(key)?
+            .ok_or_else(|| DeserializeError::custom("Missing object key"))?;
+        let value = self
+            .inner
+            .next_element_seed(value)?
+            .ok_or_else(|| DeserializeError::custom("Missing object value"))?;
         Ok(Some((key, value)))
+    }
+}
+
+fn owned_value_type(value: &OwnedValue) -> ValueType {
+    match value {
+        OwnedValue::Null => ValueType::Null,
+        OwnedValue::Str(_) => ValueType::String,
+        OwnedValue::U64(_) => ValueType::U64,
+        OwnedValue::I64(_) => ValueType::I64,
+        OwnedValue::F64(_) => ValueType::F64,
+        OwnedValue::Date(_) => ValueType::DateTime,
+        OwnedValue::Facet(_) => ValueType::Facet,
+        OwnedValue::Bytes(_) => ValueType::Bytes,
+        OwnedValue::IpAddr(_) => ValueType::IpAddr,
+        OwnedValue::Bool(_) => ValueType::Bool,
+        OwnedValue::PreTokStr(_) => ValueType::PreTokStr,
+        OwnedValue::Array(_) => ValueType::Array,
+        OwnedValue::Object(_) => ValueType::Object,
+    }
+}
+
+macro_rules! deserialize_owned_scalar {
+    ($method:ident, $variant:ident, $ty:ty, $kind:ident) => {
+        fn $method(self) -> Result<$ty, DeserializeError> {
+            match self {
+                OwnedValue::$variant(value) => Ok(value),
+                value => Err(DeserializeError::TypeMismatch {
+                    expected: ValueType::$kind,
+                    actual: owned_value_type(&value),
+                }),
+            }
+        }
+    };
+}
+
+impl<'de> ValueDeserializer<'de> for OwnedValue {
+    fn deserialize_null(self) -> Result<(), DeserializeError> {
+        match self {
+            OwnedValue::Null => Ok(()),
+            value => Err(DeserializeError::TypeMismatch {
+                expected: ValueType::Null,
+                actual: owned_value_type(&value),
+            }),
+        }
+    }
+
+    deserialize_owned_scalar!(deserialize_string, Str, String, String);
+    deserialize_owned_scalar!(deserialize_u64, U64, u64, U64);
+    deserialize_owned_scalar!(deserialize_i64, I64, i64, I64);
+    deserialize_owned_scalar!(deserialize_f64, F64, f64, F64);
+    deserialize_owned_scalar!(deserialize_datetime, Date, DateTime, DateTime);
+    deserialize_owned_scalar!(deserialize_facet, Facet, Facet, Facet);
+    deserialize_owned_scalar!(deserialize_bytes, Bytes, Vec<u8>, Bytes);
+    deserialize_owned_scalar!(deserialize_ip_address, IpAddr, Ipv6Addr, IpAddr);
+    deserialize_owned_scalar!(deserialize_bool, Bool, bool, Bool);
+    deserialize_owned_scalar!(
+        deserialize_pre_tokenized_string,
+        PreTokStr,
+        PreTokenizedString,
+        PreTokStr
+    );
+
+    fn deserialize_any<V: ValueVisitor>(self, visitor: V) -> Result<V::Value, DeserializeError> {
+        match self {
+            OwnedValue::Null => visitor.visit_null(),
+            OwnedValue::Str(value) => visitor.visit_string(value),
+            OwnedValue::U64(value) => visitor.visit_u64(value),
+            OwnedValue::I64(value) => visitor.visit_i64(value),
+            OwnedValue::F64(value) => visitor.visit_f64(value),
+            OwnedValue::Date(value) => visitor.visit_datetime(value),
+            OwnedValue::Facet(value) => visitor.visit_facet(value),
+            OwnedValue::Bytes(value) => visitor.visit_bytes(value),
+            OwnedValue::IpAddr(value) => visitor.visit_ip_address(value),
+            OwnedValue::Bool(value) => visitor.visit_bool(value),
+            OwnedValue::PreTokStr(value) => visitor.visit_pre_tokenized_string(value),
+            OwnedValue::Array(values) => visitor.visit_array(values.into_iter()),
+            OwnedValue::Object(values) => visitor.visit_object(values.into_iter()),
+        }
+    }
+}
+
+impl<'de> ArrayAccess<'de> for std::vec::IntoIter<OwnedValue> {
+    fn size_hint(&self) -> usize {
+        self.len()
+    }
+
+    fn next_element<V: ValueDeserialize>(&mut self) -> Result<Option<V>, DeserializeError> {
+        self.next_element_seed(PhantomData::<V>)
+    }
+
+    fn next_element_seed<S: ValueDeserializeSeed>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, DeserializeError> {
+        self.next().map(|value| seed.deserialize(value)).transpose()
+    }
+}
+
+impl<'de> ObjectAccess<'de> for std::collections::btree_map::IntoIter<String, OwnedValue> {
+    fn size_hint(&self) -> usize {
+        self.len()
+    }
+
+    fn next_entry<V: ValueDeserialize>(&mut self) -> Result<Option<(String, V)>, DeserializeError> {
+        self.next_entry_seed(PhantomData::<String>, PhantomData::<V>)
+    }
+
+    fn next_entry_seed<K: ValueDeserializeSeed, V: ValueDeserializeSeed>(
+        &mut self,
+        key_seed: K,
+        value_seed: V,
+    ) -> Result<Option<(K::Value, V::Value)>, DeserializeError> {
+        self.next()
+            .map(|(key, value)| {
+                Ok((
+                    key_seed.deserialize(OwnedValue::Str(key))?,
+                    value_seed.deserialize(value)?,
+                ))
+            })
+            .transpose()
     }
 }
 
@@ -810,6 +1059,7 @@ impl<T: ValueDeserialize> ValueDeserialize for Vec<(String, T)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::Cursor;
 
     use serde_json::Number;
@@ -830,9 +1080,131 @@ mod tests {
     }
 
     fn deserialize_value(buffer: Vec<u8>) -> crate::schema::OwnedValue {
+        let mut slice = buffer.as_slice();
+        let deserializer = BinaryValueDeserializer::from_slice(&mut slice).unwrap();
+        let value = <OwnedValue as ValueDeserialize>::deserialize(deserializer).unwrap();
+        assert!(slice.is_empty());
         let mut cursor = Cursor::new(buffer);
         let deserializer = BinaryValueDeserializer::from_reader(&mut cursor).unwrap();
-        crate::schema::OwnedValue::deserialize(deserializer).expect("Deserialize value")
+        let owned = <OwnedValue as ValueDeserialize>::deserialize(deserializer).unwrap();
+        assert_eq!(value, owned);
+        value
+    }
+
+    struct BorrowedStrings<'a> {
+        input: &'a [u8],
+        strings: RefCell<Vec<String>>,
+    }
+
+    impl ValueDeserializeSeed for &BorrowedStrings<'_> {
+        type Value = ();
+
+        fn deserialize<'de, D: ValueDeserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<(), DeserializeError> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    impl ValueVisitor for &BorrowedStrings<'_> {
+        type Value = ();
+
+        fn visit_borrowed_str(&self, value: &str) -> Result<(), DeserializeError> {
+            let start = self.input.as_ptr() as usize;
+            let end = start + self.input.len();
+            assert!((start..=end).contains(&(value.as_ptr() as usize)));
+            assert!(value.as_ptr() as usize + value.len() <= end);
+            self.strings.borrow_mut().push(value.to_owned());
+            Ok(())
+        }
+
+        fn visit_array<'de, A: ArrayAccess<'de>>(
+            &self,
+            mut access: A,
+        ) -> Result<(), DeserializeError> {
+            while access.next_element_seed(*self)?.is_some() {}
+            Ok(())
+        }
+
+        fn visit_object<'de, A: ObjectAccess<'de>>(
+            &self,
+            mut access: A,
+        ) -> Result<(), DeserializeError> {
+            while access.next_entry_seed(*self, *self)?.is_some() {}
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_slice_document_borrows_nested_strings_and_keys() {
+        let mut document = crate::TantivyDocument::new();
+        let mut schema = crate::schema::Schema::builder();
+        let field = schema.add_json_field("payload", crate::schema::STORED);
+        let schema = schema.build();
+        document.add_text(field, "hello");
+        document.add_field_value(field, serde_json::json!({"key": ["nested", ""]}));
+        let mut bytes = Vec::new();
+        super::super::se::BinaryDocumentSerializer::new(&mut bytes, &schema)
+            .serialize_doc(&document)
+            .unwrap();
+        let visitor = BorrowedStrings {
+            input: &bytes,
+            strings: RefCell::new(Vec::new()),
+        };
+        let mut input = bytes.as_slice();
+        let mut deserializer = BinaryDocumentDeserializer::from_slice(&mut input).unwrap();
+        assert_eq!(
+            deserializer.next_field_seed(&visitor).unwrap(),
+            Some((field, ()))
+        );
+        assert_eq!(
+            deserializer.next_field_seed(&visitor).unwrap(),
+            Some((field, ()))
+        );
+        assert_eq!(deserializer.next_field_seed(&visitor).unwrap(), None);
+        assert!(input.is_empty());
+        assert_eq!(*visitor.strings.borrow(), ["hello", "key", "nested", ""]);
+
+        let mut input = bytes.as_slice();
+        let decoded = <crate::TantivyDocument as DocumentDeserialize>::deserialize(
+            BinaryDocumentDeserializer::from_slice(&mut input).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, document);
+    }
+
+    #[test]
+    fn test_slice_legacy_json_normalizes_dates() {
+        let json = serde_json::json!({
+            "date": "2024-02-03T12:34:56.123456789+05:30",
+            "nested": ["2024-02-03T07:04:56Z", "not a date"],
+        });
+        let mut bytes = vec![type_codes::JSON_OBJ_CODE];
+        serde_json::to_writer(&mut bytes, &json).unwrap();
+        let decoded = deserialize_value(bytes);
+        assert_eq!(decoded, OwnedValue::from(json));
+        let OwnedValue::Object(object) = decoded else {
+            panic!("object")
+        };
+        assert!(matches!(object.get("date"), Some(OwnedValue::Date(_))));
+    }
+
+    #[test]
+    fn test_slice_rejects_truncated_and_invalid_strings() {
+        let mut oversized_array = vec![type_codes::ARRAY_CODE];
+        VInt(u64::MAX).serialize(&mut oversized_array).unwrap();
+        for bytes in [
+            oversized_array,
+            vec![type_codes::TEXT_CODE, 131, b'a'],
+            vec![type_codes::TEXT_CODE, 129, 255],
+            vec![255],
+            vec![type_codes::OBJECT_CODE, 129, type_codes::TEXT_CODE, 128],
+        ] {
+            let result = BinaryValueDeserializer::from_slice(&mut bytes.as_slice())
+                .and_then(<OwnedValue as ValueDeserialize>::deserialize);
+            assert!(result.is_err(), "{bytes:?}");
+        }
     }
 
     #[test]
