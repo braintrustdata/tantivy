@@ -772,7 +772,8 @@ impl<D: Document> IndexWriter<D> {
         self.send_add_documents_batch(smallvec![AddOperation {
             opstamp,
             document,
-            artifacts: Vec::new()
+            artifacts: Vec::new(),
+            stored_document: None,
         }])?;
         Ok(opstamp)
     }
@@ -837,6 +838,7 @@ impl<D: Document> IndexWriter<D> {
                         opstamp,
                         document,
                         artifacts: Vec::new(),
+                        stored_document: None,
                     };
                     adds.push(add_operation);
                 }
@@ -848,6 +850,20 @@ impl<D: Document> IndexWriter<D> {
                         opstamp,
                         document,
                         artifacts,
+                        stored_document: None,
+                    };
+                    adds.push(add_operation);
+                }
+                UserOperation::AddWithStoredDocument {
+                    document,
+                    stored_document,
+                    artifacts,
+                } => {
+                    let add_operation = AddOperation {
+                        opstamp,
+                        document,
+                        artifacts,
+                        stored_document: Some(stored_document),
                     };
                     adds.push(add_operation);
                 }
@@ -924,6 +940,46 @@ mod tests {
         ];
         let batch_opstamp1 = index_writer.run(operations).unwrap();
         assert_eq!(batch_opstamp1, 2u64);
+    }
+
+    #[test]
+    fn test_add_with_stored_document() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+        let pointer_field = schema_builder.add_bytes_field("pointer", STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.run([
+            UserOperation::AddWithStoredDocument {
+                document: doc!(text_field => "indexed payload"),
+                stored_document: doc!(pointer_field => vec![1u8, 2, 3]),
+                artifacts: Vec::new(),
+            },
+            UserOperation::Add(doc!(text_field => "inline payload")),
+        ])?;
+        index_writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let query_parser = QueryParser::for_index(&index, vec![text_field]);
+        let top_docs =
+            searcher.search(&query_parser.parse_query("indexed")?, &TopDocs::with_limit(2))?;
+        assert_eq!(top_docs.len(), 1);
+        let stored: TantivyDocument = searcher.doc(top_docs[0].1)?;
+        assert!(stored.get_first(text_field).is_none());
+        assert_eq!(
+            stored.get_first(pointer_field).and_then(|value| value.as_bytes()),
+            Some(&[1u8, 2, 3][..])
+        );
+
+        let top_docs =
+            searcher.search(&query_parser.parse_query("inline")?, &TopDocs::with_limit(2))?;
+        assert_eq!(top_docs.len(), 1);
+        let stored: TantivyDocument = searcher.doc(top_docs[0].1)?;
+        assert_eq!(
+            stored.get_first(text_field).and_then(|value| value.as_str()),
+            Some("inline payload")
+        );
+        Ok(())
     }
 
     #[test]
