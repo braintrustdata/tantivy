@@ -94,6 +94,11 @@ impl DocumentDeserialize for DocumentStringBytes {
     }
 }
 
+#[inline]
+fn decode<D: DocumentDeserialize>(input: &mut &[u8]) -> D {
+    D::deserialize(BinaryDocumentDeserializer::from_slice(input).unwrap()).unwrap()
+}
+
 fn benchmark(c: &mut Criterion) {
     for (name, corpus) in [
         ("hdfs", include_str!("hdfs.json")),
@@ -125,17 +130,10 @@ fn benchmark(c: &mut Criterion) {
             .collect();
         for (doc_id, (bytes, expected)) in encoded.iter().zip(&documents).enumerate() {
             let mut input: &[u8] = bytes;
-            let document = TantivyDocument::deserialize(
-                BinaryDocumentDeserializer::from_slice(&mut input).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(&document, expected);
+            assert_eq!(&decode::<TantivyDocument>(&mut input), expected);
             assert!(input.is_empty());
             let mut input: &[u8] = bytes;
-            let count = DocumentStringBytes::deserialize(
-                BinaryDocumentDeserializer::from_slice(&mut input).unwrap(),
-            )
-            .unwrap();
+            let count = decode::<DocumentStringBytes>(&mut input);
             assert_eq!(
                 count.0,
                 store.get::<DocumentStringBytes>(doc_id as u32).unwrap().0
@@ -144,14 +142,11 @@ fn benchmark(c: &mut Criterion) {
         }
         let mut input: &[u8] = &encoded[0];
         let deserializer = BinaryDocumentDeserializer::from_slice(&mut input).unwrap();
-        eprintln!(
-            "{name}: decoder size {} bytes",
-            std::mem::size_of_val(&deserializer)
-        );
         let bytes: usize = encoded.iter().map(|bytes| bytes.len()).sum();
         eprintln!(
-            "{name}: {} documents, {bytes} stored bytes",
-            documents.len()
+            "{name}: {} documents, {bytes} stored bytes, {}-byte decoder",
+            documents.len(),
+            std::mem::size_of_val(&deserializer)
         );
         let mut group = c.benchmark_group(name);
         group.throughput(Throughput::Bytes(bytes as u64));
@@ -159,13 +154,7 @@ fn benchmark(c: &mut Criterion) {
             b.iter(|| {
                 for bytes in &encoded {
                     let mut input: &[u8] = black_box(bytes);
-                    black_box(
-                        DocumentStringBytes::deserialize(
-                            BinaryDocumentDeserializer::from_slice(&mut input).unwrap(),
-                        )
-                        .unwrap()
-                        .0,
-                    );
+                    black_box(decode::<DocumentStringBytes>(&mut input).0);
                 }
             });
         });
@@ -173,12 +162,7 @@ fn benchmark(c: &mut Criterion) {
             b.iter(|| {
                 for bytes in &encoded {
                     let mut input: &[u8] = black_box(bytes);
-                    black_box(
-                        TantivyDocument::deserialize(
-                            BinaryDocumentDeserializer::from_slice(&mut input).unwrap(),
-                        )
-                        .unwrap(),
-                    );
+                    black_box(decode::<TantivyDocument>(&mut input));
                 }
             });
         });

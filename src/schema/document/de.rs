@@ -367,14 +367,7 @@ pub struct BorrowedStrings;
 impl StringRead<&[u8]> for BorrowedStrings {
     #[inline]
     fn read_string<'a>(reader: &'a mut &[u8]) -> Result<Cow<'a, str>, DeserializeError> {
-        let len =
-            usize::try_from(VInt::deserialize(reader)?.val()).map_err(DeserializeError::custom)?;
-        let text = reader.get(..len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated stored string")
-        })?;
-        let text = std::str::from_utf8(text).map_err(DeserializeError::custom)?;
-        *reader = &reader[len..];
-        Ok(Cow::Borrowed(text))
+        borrowed_string(reader)
     }
 
     #[inline]
@@ -398,6 +391,7 @@ pub struct BinaryDocumentDeserializer<'de, R, M = OwnedStrings> {
 }
 
 impl<'de, R: Read> BinaryDocumentDeserializer<'de, R> {
+    /// Attempts to create a new document deserializer from a given reader.
     pub(crate) fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
         Self::new(reader)
     }
@@ -424,6 +418,18 @@ where
     fn is_complete(&self) -> bool {
         self.position >= self.length
     }
+}
+
+#[inline]
+fn borrowed_string<'de>(reader: &mut &'de [u8]) -> Result<Cow<'de, str>, DeserializeError> {
+    let len =
+        usize::try_from(VInt::deserialize(reader)?.val()).map_err(DeserializeError::custom)?;
+    let text = reader
+        .get(..len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "Truncated stored string"))?;
+    let text = std::str::from_utf8(text).map_err(DeserializeError::custom)?;
+    *reader = &reader[len..];
+    Ok(Cow::Borrowed(text))
 }
 
 impl<'a, 'de: 'a> BinaryDocumentDeserializer<'a, &'de [u8], BorrowedStrings> {
@@ -479,6 +485,7 @@ where
     R: Read,
     M: StringRead<R>,
 {
+    /// Attempts to create a new value deserializer from a given reader.
     fn from_reader(reader: &'de mut R) -> Result<Self, DeserializeError> {
         let type_code = <u8 as BinarySerializable>::deserialize(reader)?;
 
