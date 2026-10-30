@@ -311,10 +311,6 @@ impl Directory for ManagedDirectory {
         self.directory.atomic_read_async(path).await
     }
 
-    fn trusts_content_addressed_path(&self, path: &Path) -> bool {
-        self.directory.trusts_content_addressed_path(path)
-    }
-
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
         self.directory.delete(path)
     }

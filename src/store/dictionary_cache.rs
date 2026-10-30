@@ -12,10 +12,9 @@
 //! benefits, since nothing is left alive to serve the next lookup. That's expected, not a bug.
 //!
 //! Safe to key by bare path, with no directory identity in the key, only because the caller (see
-//! `ZstdDictionary::load_internal`) verifies -- not assumes -- that a path is genuinely
-//! content-addressed before ever calling `insert`. This module doesn't know or care about
-//! hashing; it trusts `insert`'s caller to only ever pass a path that really does uniquely
-//! identify `bytes`.
+//! `ZstdDictionary::load_cached`) refuses any path not named by content before ever calling
+//! `insert`. This module doesn't know or care about hashing; it trusts `insert`'s caller to only
+//! ever pass a path that really does uniquely identify `bytes`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
@@ -30,8 +29,8 @@ pub(crate) fn get(path: &str) -> Option<Arc<[u8]>> {
 }
 
 /// Records `bytes` under `path`. Racing with another thread's concurrent insert for the same
-/// path is fine to just overwrite: the caller is responsible for having already verified that
-/// `path` uniquely identifies `bytes`, so any two concurrent inserts for the same path are
+/// path is fine to just overwrite: the caller is responsible for `path` uniquely identifying
+/// `bytes`, so any two concurrent inserts for the same path are
 /// content-identical.
 ///
 /// Also sweeps every dead entry from the map first. This is the only place that ever grows the
