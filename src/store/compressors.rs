@@ -105,7 +105,7 @@ impl<'de> Deserialize<'de> for Compressor {
 /// incompatible segments. `seed` is the *only* way to produce a `Loaded` value -- no
 /// `from_bytes`-style constructor exists, since one would let path and bytes be paired
 /// inconsistently, defeating that guarantee. A `Path`, which can come from anywhere (`meta.json`,
-/// direct construction), gets re-verified on every cold load instead (see `load_internal`).
+/// direct construction), must at least be named like one (see `load_cached`).
 ///
 /// `SegmentUpdater::list_files` protects `path()` from garbage collection for any `Directory` that
 /// routes GC through it (i.e. anything wrapped in `ManagedDirectory`, which is every `Index`).
@@ -123,7 +123,7 @@ pub enum ZstdDictionary {
     /// always share the enum's own `pub` visibility (Rust has no per-field visibility on enum
     /// variants), so `path`/`bytes` living right on `Loaded` would make it publicly
     /// constructible with a mismatched pair -- unlike `Path` above, that mismatch is never
-    /// re-verified (`load` returns `bytes` straight through, see below), so it would silently
+    /// checked (`load` returns `bytes` straight through, see below), so it would silently
     /// defeat the invariant this type exists to hold. Routing through `LoadedZstdDictionary`,
     /// whose fields are private to this module, makes `seed` the only way to produce one.
     Loaded(LoadedZstdDictionary),
@@ -186,13 +186,12 @@ impl ZstdDictionary {
     /// and skip index reads, which share nothing with this).
     ///
     /// Only the read differs. Path validation, the process-wide cache lookup, and the
-    /// decompress-and-verify tail are the same code as the blocking path (see `load_internal`
+    /// decompress-and-cache tail are the same code as the blocking path (see `load_internal`
     /// and `load_internal_async`) -- those are where a divergence between the two would be a
     /// correctness bug, so they are deliberately not duplicated.
     ///
-    /// Note that the decompression and the content-hash verification still run on the calling
-    /// task; they are CPU-bound and cannot be awaited. That is a deliberate trade: for a
-    /// multi-megabyte dictionary they cost a small fraction of the read they follow.
+    /// Note that the decompression still runs on the calling task; it is CPU-bound and cannot be
+    /// awaited.
     pub async fn load_async(
         &self,
         directory: &dyn crate::Directory,
@@ -219,8 +218,7 @@ impl ZstdDictionary {
         let compressed = directory
             .atomic_read(std::path::Path::new(path))
             .map_err(open_read_error_to_io_error)?;
-        let verify = !directory.trusts_content_addressed_path(std::path::Path::new(path));
-        Self::decompress_verify_and_cache(path, &compressed, verify)
+        Self::decompress_and_cache(path, &compressed)
     }
 
     /// [`ZstdDictionary::load_internal`], awaiting the read rather than blocking on it. See
@@ -236,12 +234,17 @@ impl ZstdDictionary {
             .atomic_read_async(std::path::Path::new(path))
             .await
             .map_err(open_read_error_to_io_error)?;
-        let verify = !directory.trusts_content_addressed_path(std::path::Path::new(path));
-        Self::decompress_verify_and_cache(path, &compressed, verify)
+        Self::decompress_and_cache(path, &compressed)
     }
 
     /// Everything the blocking and awaiting loads do *before* the read: validate the path, then
     /// try the process-wide cache. Performs no I/O, so both paths share it verbatim.
+    ///
+    /// The cache is keyed by path alone, which is only safe because paths are content-addressed.
+    /// A fixed literal name (this fork's previous design) would let two indexes in one process
+    /// serve each other's dictionary, so the path must be named the way `seed` names it. The
+    /// content is not re-hashed against the name: `seed` is the only writer, and hashing a
+    /// multi-megabyte dictionary on every cold load costs more than decompressing it.
     fn load_cached(path: &str) -> io::Result<Option<std::sync::Arc<[u8]>>> {
         if !Self::is_safe_and_encodable_relative_path(path) {
             return Err(io::Error::new(
@@ -252,49 +255,28 @@ impl ZstdDictionary {
                 ),
             ));
         }
+        if !is_content_addressed_dictionary_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "dictionary_path must be named by content (dict-<sha256 hex>.bin.zst, see \
+                     `ZstdDictionary::seed`), got {path:?}"
+                ),
+            ));
+        }
 
         Ok(super::dictionary_cache::get(path))
     }
 
-    /// Everything the blocking and awaiting loads do *after* the read: decompress, verify that
-    /// the bytes really do hash to `path` (unless the directory vouches for it, see
-    /// `Directory::trusts_content_addressed_path`), and cache them. CPU-bound only, no I/O, so
-    /// both paths share it verbatim -- this is the half where a divergence between them would
-    /// silently weaken the cache's safety invariant.
-    fn decompress_verify_and_cache(
-        path: &str,
-        compressed: &[u8],
-        verify: bool,
-    ) -> io::Result<std::sync::Arc<[u8]>> {
+    /// Everything the blocking and awaiting loads do *after* the read: decompress and cache.
+    /// CPU-bound only, no I/O, so both paths share it verbatim.
+    fn decompress_and_cache(path: &str, compressed: &[u8]) -> io::Result<std::sync::Arc<[u8]>> {
         let bytes: std::sync::Arc<[u8]> =
             std::sync::Arc::from(super::decompress_whole(compressed)?);
 
-        // The cache's whole safety argument is "the path is content-addressed, so path equality
-        // implies content equality" -- but nothing stops a caller from constructing
-        // `ZstdDictionary::Path` with an arbitrary string (it's a public variant), and a fixed
-        // literal name was literally this fork's previous design. Don't just assume the
-        // invariant holds: verify it, on every cold load, by recomputing the content-addressed
-        // name for what was actually read and comparing it against `path`. A mismatch means
-        // caching under `path` would be unsafe (two different directories could then poison each
-        // other's cache entry under the same literal name) -- refuse rather than cache it.
-        if verify {
-            let expected_path = content_addressed_dictionary_path(&bytes);
-            if expected_path != path {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "dictionary at {path:?} does not hash to its own path (expected \
-                         {expected_path:?}) -- refusing to cache it under a name that doesn't \
-                         uniquely identify its content, since the dictionary cache is process-wide \
-                         and keyed by path alone"
-                    ),
-                ));
-            }
-        }
-
         // Racing with another thread's concurrent miss for the same path is fine: both decompress
-        // independently and both inserts are content-identical (verified above), so simply
-        // overwriting is correct -- no need for single-flight coordination here.
+        // independently and both inserts are content-identical (the path is content-addressed),
+        // so simply overwriting is correct -- no need for single-flight coordination here.
         super::dictionary_cache::insert(path, &bytes);
 
         Ok(bytes)
@@ -339,6 +321,18 @@ fn content_addressed_dictionary_path(bytes: &[u8]) -> String {
     let hash = Sha256::digest(bytes);
     let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("dict-{hex}.bin.zst")
+}
+
+/// Whether `path`'s file name has the shape `content_addressed_dictionary_path` produces.
+fn is_content_addressed_dictionary_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("dict-"))
+        .and_then(|name| name.strip_suffix(".bin.zst"))
+        .is_some_and(|hex| {
+            hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }
 
 impl PartialEq for ZstdDictionary {
@@ -788,13 +782,9 @@ mod tests {
         assert_eq!(first.as_ref(), raw.as_ref());
         drop(first); // last strong ref -- the cache entry is now dead
 
-        // Delete the underlying file. Overwriting it with *different* content, the way this test
-        // used to prove non-staleness, no longer works: `load_internal` now verifies a loaded
-        // dictionary hashes back to its own path, so mismatched content at the same path would
-        // just be (correctly) rejected -- that's a different code path than the one this test
-        // means to exercise. Deleting instead proves the same thing more directly: if the cache
-        // incorrectly served a stale entry instead of reloading, this would still succeed with
-        // the old (correct) content; since it correctly reloads, it must now fail with `NotFound`.
+        // Delete the underlying file: if the cache incorrectly served a stale entry instead of
+        // reloading, this would still succeed with the old content; since it correctly reloads,
+        // it must now fail with `NotFound`.
         directory.delete(std::path::Path::new(&path)).unwrap();
         let err = dict.load(&directory).unwrap_err();
         assert_eq!(
@@ -806,19 +796,17 @@ mod tests {
     }
 
     #[test]
-    fn zstd_dictionary_load_rejects_content_that_does_not_hash_to_its_own_path() {
-        // The cache's safety argument is "the path is content-addressed, so path equality implies
-        // content equality" -- but `ZstdDictionary::Path` is a public variant, constructible with
-        // any string, and a fixed literal name was this fork's own previous design (and remains
-        // possible for any embedder, legacy data, or manual `meta.json` edit). `load_internal`
-        // must not just assume the invariant holds: it verifies it on every cold load, refusing
-        // to cache (or return) bytes whose hash doesn't match the path they were loaded from.
+    fn zstd_dictionary_load_rejects_paths_not_named_by_content() {
+        // `ZstdDictionary::Path` is a public variant, constructible with any string, and a fixed
+        // literal name was this fork's own previous design (and remains possible for any
+        // embedder, legacy data, or manual `meta.json` edit). The cache is keyed by path alone,
+        // so such a name must be refused before anything is read or cached under it.
         use crate::directory::{Directory, RamDirectory};
 
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
-        let content = b"this content does not hash to the literal path below".to_vec();
-        let compressed = super::super::compression_zstd_block::compress_whole(&content).unwrap();
+        let compressed =
+            super::super::compression_zstd_block::compress_whole(b"literal-named content").unwrap();
         directory
             .atomic_write(
                 std::path::Path::new("not-actually-a-hash.bin.zst"),
@@ -828,11 +816,35 @@ mod tests {
 
         let dict = ZstdDictionary::Path("not-actually-a-hash.bin.zst".to_string());
         let err = dict.load(&directory).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
-            err.to_string().contains("does not hash to its own path"),
+            err.to_string().contains("must be named by content"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn zstd_dictionary_load_does_not_rehash_content() {
+        // Only the name's shape is checked; the content is trusted to match it, since `seed` is
+        // the only writer and hashing every cold load costs more than decompressing.
+        use crate::directory::{Directory, RamDirectory};
+
+        clear_dictionary_cache_for_test();
+        let directory = RamDirectory::create();
+        let content = b"content that does not hash to the well-formed name below".to_vec();
+        let path = format!("dict-{}.bin.zst", "ab".repeat(32));
+        directory
+            .atomic_write(
+                std::path::Path::new(&path),
+                &super::super::compression_zstd_block::compress_whole(&content).unwrap(),
+            )
+            .unwrap();
+
+        let dict = ZstdDictionary::Path(path);
+        assert_eq!(&*dict.load(&directory).unwrap(), content.as_slice());
+        clear_dictionary_cache_for_test();
+        let loaded = futures::executor::block_on(dict.load_async(&directory)).unwrap();
+        assert_eq!(&*loaded, content.as_slice());
     }
 
     #[test]
@@ -841,14 +853,11 @@ mod tests {
         // Direct regression test for a reviewer-flagged scenario: two different `Directory`
         // instances (simulating two different open indexes in one process) using the same
         // non-content-addressed literal path, each with their own different bytes at that path.
-        // Before hash verification, whichever loaded first could populate the process-wide cache
-        // under that shared literal key, and the other could then silently receive the wrong
-        // index's bytes on its own lookup for the same key, for as long as that Arc stayed alive.
-        // With verification, neither load can ever succeed: a non-hash-derived shared literal can
-        // never accumulate a valid cache entry in the first place (every insert attempt is
-        // checked against its own content and rejected if it doesn't match) -- so there's no
-        // window in which a correct entry could exist for the other directory to be incorrectly
-        // served.
+        // Without a check, whichever loaded first could populate the process-wide cache under
+        // that shared literal key, and the other could then silently receive the wrong index's
+        // bytes on its own lookup for the same key, for as long as that Arc stayed alive. Since a
+        // literal name is refused outright, neither load can succeed, so nothing is ever cached
+        // under it for the other directory to be incorrectly served.
         use crate::directory::{Directory, RamDirectory};
 
         clear_dictionary_cache_for_test();
@@ -877,12 +886,12 @@ mod tests {
         let dict = ZstdDictionary::Path(shared_literal_path.to_string());
         assert_eq!(
             dict.load(&directory_a).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
             "index A's own load should fail rather than populate the shared cache key"
         );
         assert_eq!(
             dict.load(&directory_b).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
             "index B's load must independently fail too -- it must never receive index A's \
              bytes from the shared cache key, since nothing valid was ever cached there"
         );
@@ -908,7 +917,10 @@ mod tests {
         let directory = RamDirectory::create();
         let compressor = Compressor::Zstd(ZstdCompressor {
             compression_level: None,
-            dictionary: Some(ZstdDictionary::Path("does_not_exist.bin.zst".to_string())),
+            dictionary: Some(ZstdDictionary::Path(format!(
+                "dict-{}.bin.zst",
+                "0".repeat(64)
+            ))),
         });
         let err = compressor.resolve_dictionary(&directory).unwrap_err();
         // A misconfigured `dictionary_path` should be as easy to diagnose as any other
@@ -968,7 +980,6 @@ mod tests {
         inner: crate::directory::RamDirectory,
         blocking_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         awaited_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        trusted: bool,
     }
 
     impl ReadCountingDirectory {
@@ -977,7 +988,6 @@ mod tests {
                 inner: crate::directory::RamDirectory::create(),
                 blocking_reads: Default::default(),
                 awaited_reads: Default::default(),
-                trusted: false,
             }
         }
 
@@ -1048,40 +1058,12 @@ mod tests {
             self.inner.sync_directory()
         }
 
-        fn trusts_content_addressed_path(&self, _path: &std::path::Path) -> bool {
-            self.trusted
-        }
-
         fn watch(
             &self,
             watch_callback: crate::directory::WatchCallback,
         ) -> crate::Result<crate::directory::WatchHandle> {
             self.inner.watch(watch_callback)
         }
-    }
-
-    #[test]
-    fn zstd_dictionary_load_skips_hash_verification_for_trusted_directories() {
-        use crate::directory::Directory;
-
-        clear_dictionary_cache_for_test();
-        let mut directory = ReadCountingDirectory::create();
-        let content = b"trusted content that does not hash to its literal path".to_vec();
-        let compressed = super::super::compression_zstd_block::compress_whole(&content).unwrap();
-        let path = "trusted-not-a-hash.bin.zst";
-        directory
-            .atomic_write(std::path::Path::new(path), &compressed)
-            .unwrap();
-        let dict = ZstdDictionary::Path(path.to_string());
-
-        let err = dict.load(&directory).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-
-        directory.trusted = true;
-        assert_eq!(&*dict.load(&directory).unwrap(), content.as_slice());
-        clear_dictionary_cache_for_test();
-        let loaded = futures::executor::block_on(dict.load_async(&directory)).unwrap();
-        assert_eq!(&*loaded, content.as_slice());
     }
 
     #[test]
@@ -1154,13 +1136,13 @@ mod tests {
     }
 
     #[test]
-    fn load_async_verifies_the_content_hash_like_load_does() {
+    fn load_async_rejects_paths_not_named_by_content_like_load_does() {
         use futures::executor::block_on;
 
         use crate::directory::{Directory, RamDirectory};
 
-        // The decompress-and-verify tail is shared between the two loads precisely so this can't
-        // diverge; assert it through the awaited path rather than trusting that by inspection.
+        // Path validation is shared between the two loads precisely so this can't diverge;
+        // assert it through the awaited path rather than trusting that by inspection.
         clear_dictionary_cache_for_test();
         let directory = RamDirectory::create();
         let literal_path = "dict-not-a-real-content-hash.bin.zst";
@@ -1176,6 +1158,6 @@ mod tests {
 
         let err = block_on(ZstdDictionary::Path(literal_path.to_string()).load_async(&directory))
             .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
