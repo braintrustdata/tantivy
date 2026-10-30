@@ -164,9 +164,9 @@ use std::collections::BTreeMap;
 use std::mem;
 
 pub use self::de::{
-    ArrayAccess, BinaryDocumentDeserializer, BinaryValueDeserializer, DeserializeError,
-    DocumentDeserialize, DocumentDeserializer, ObjectAccess, ValueDeserialize, ValueDeserializeSeed,
-    ValueDeserializer, ValueType, ValueVisitor,
+    ArrayAccess, BinaryDocumentDeserializer, BinaryValueDeserializer, BorrowedStrings,
+    DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess, OwnedStrings,
+    StringRead, ValueDeserialize, ValueDeserializeSeed, ValueDeserializer, ValueType, ValueVisitor,
 };
 pub use self::default_document::{DocParsingError, TantivyDocument};
 pub use self::owned_value::OwnedValue;
