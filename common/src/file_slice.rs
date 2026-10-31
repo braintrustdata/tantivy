@@ -6,7 +6,7 @@ use std::{fmt, io};
 use async_trait::async_trait;
 use ownedbytes::{OwnedBytes, StableDeref};
 
-use crate::{ByteCount, HasLen};
+use crate::{ByteCount, ChunkedBytes, HasLen};
 
 /// Objects that represents files sections in tantivy.
 ///
@@ -30,6 +30,20 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
             io::ErrorKind::Unsupported,
             "Async read is not supported.",
         ))
+    }
+
+    /// Reads a slice of bytes as a list of buffers, without copying them together.
+    ///
+    /// This method may panic if the range requested is invalid.
+    fn read_chunks(&self, range: Range<usize>) -> io::Result<ChunkedBytes> {
+        self.read_bytes(range).map(ChunkedBytes::from)
+    }
+
+    #[doc(hidden)]
+    async fn read_chunks_async(&self, byte_range: Range<usize>) -> io::Result<ChunkedBytes> {
+        self.read_bytes_async(byte_range)
+            .await
+            .map(ChunkedBytes::from)
     }
 }
 
@@ -255,6 +269,46 @@ impl FileSlice {
             .await
     }
 
+    /// Returns all of the data in the `FileSlice` as a list of buffers.
+    pub fn read_chunks(&self) -> io::Result<ChunkedBytes> {
+        self.data.read_chunks(self.range.clone())
+    }
+
+    #[doc(hidden)]
+    pub async fn read_chunks_async(&self) -> io::Result<ChunkedBytes> {
+        self.data.read_chunks_async(self.range.clone()).await
+    }
+
+    /// Reads a specific slice of data as a list of buffers.
+    ///
+    /// This is equivalent to running `file_slice.slice(from, to).read_chunks()`.
+    pub fn read_chunks_slice(&self, range: Range<usize>) -> io::Result<ChunkedBytes> {
+        assert!(
+            range.end <= self.len(),
+            "end of requested range exceeds the fileslice length ({} > {})",
+            range.end,
+            self.len()
+        );
+        self.data
+            .read_chunks(self.range.start + range.start..self.range.start + range.end)
+    }
+
+    #[doc(hidden)]
+    pub async fn read_chunks_slice_async(
+        &self,
+        byte_range: Range<usize>,
+    ) -> io::Result<ChunkedBytes> {
+        assert!(
+            self.range.start + byte_range.end <= self.range.end,
+            "`to` exceeds the fileslice length"
+        );
+        self.data
+            .read_chunks_async(
+                self.range.start + byte_range.start..self.range.start + byte_range.end,
+            )
+            .await
+    }
+
     /// Splits the FileSlice at the given offset and return two file slices.
     /// `file_slice[..split_offset]` and `file_slice[split_offset..]`.
     ///
@@ -312,6 +366,14 @@ impl FileHandle for FileSlice {
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice_async(byte_range).await
+    }
+
+    fn read_chunks(&self, range: Range<usize>) -> io::Result<ChunkedBytes> {
+        self.read_chunks_slice(range)
+    }
+
+    async fn read_chunks_async(&self, byte_range: Range<usize>) -> io::Result<ChunkedBytes> {
+        self.read_chunks_slice_async(byte_range).await
     }
 }
 

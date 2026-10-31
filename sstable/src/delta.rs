@@ -1,7 +1,7 @@
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 
-use common::{CountingWriter, OwnedBytes};
+use common::{ChunkedBytes, CountingWriter, OwnedBytes};
 use zstd::bulk::Compressor;
 
 use super::value::ValueWriter;
@@ -160,7 +160,7 @@ impl<TValueReader: value::ValueReader> Default for DeltaDecoder<TValueReader> {
 
 impl<TValueReader: value::ValueReader> DeltaDecoder<TValueReader> {
     /// Starts an independent input, retaining allocations from previous inputs.
-    pub fn read(&mut self, input: OwnedBytes) -> &mut DeltaReader<TValueReader> {
+    pub fn read(&mut self, input: impl Into<ChunkedBytes>) -> &mut DeltaReader<TValueReader> {
         self.reader.idx = 0;
         self.reader.common_prefix_len = 0;
         self.reader.suffix_range = 0..0;
@@ -181,7 +181,7 @@ impl<TValueReader> DeltaReader<TValueReader>
 where
     TValueReader: value::ValueReader,
 {
-    pub fn new(reader: OwnedBytes) -> Self {
+    pub fn new(reader: impl Into<ChunkedBytes>) -> Self {
         DeltaReader {
             idx: 0,
             common_prefix_len: 0,

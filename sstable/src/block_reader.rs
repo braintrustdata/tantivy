@@ -1,30 +1,46 @@
+use std::borrow::Cow;
 use std::io::{self, Read};
 use std::ops::Range;
 
-use common::OwnedBytes;
+use common::ChunkedBytes;
 use zstd::bulk::Decompressor;
 
 pub struct BlockReader {
     buffer: Vec<u8>,
     decompressor: Option<Decompressor<'static>>,
-    reader: OwnedBytes,
+    reader: ChunkedBytes,
     offset: usize,
 }
 
 impl BlockReader {
-    pub fn new(reader: OwnedBytes) -> BlockReader {
+    pub fn new(reader: impl Into<ChunkedBytes>) -> BlockReader {
         BlockReader {
             buffer: Vec::new(),
             decompressor: None,
-            reader,
+            reader: reader.into(),
             offset: 0,
         }
     }
 
-    pub(crate) fn reset(&mut self, reader: OwnedBytes) {
+    pub(crate) fn reset(&mut self, reader: impl Into<ChunkedBytes>) {
         self.buffer.clear();
-        self.reader = reader;
+        self.reader = reader.into();
         self.offset = 0;
+    }
+
+    fn take(&mut self, len: usize) -> ChunkedBytes {
+        let taken = self.reader.slice(0..len);
+        self.reader = self.reader.slice(len..self.reader.len());
+        taken
+    }
+
+    fn take_array<const N: usize>(&mut self) -> [u8; N] {
+        let mut bytes = [0u8; N];
+        self.take(N)
+            .into_reader()
+            .read_exact(&mut bytes)
+            .expect("the taken range has exactly N bytes");
+        bytes
     }
 
     pub fn deserialize_u64(&mut self) -> u64 {
@@ -50,12 +66,12 @@ impl BlockReader {
                     "failed to read block_len",
                 ))
             }
-            _ => self.reader.read_u32() as usize,
+            _ => u32::from_le_bytes(self.take_array()) as usize,
         };
         if block_len <= 1 {
             return Ok(false);
         }
-        let compress = self.reader.read_u8();
+        let [compress] = self.take_array();
         let block_len = block_len - 1;
 
         if self.reader.len() < block_len {
@@ -64,20 +80,22 @@ impl BlockReader {
                 "failed to read block content",
             ));
         }
+        let block = self.take(block_len);
         if compress == 1 {
-            let required_capacity =
-                Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
+            let compressed = match block.contiguous_slice(0..block_len) {
+                Some(compressed) => Cow::Borrowed(compressed),
+                None => Cow::Owned(block.to_vec()),
+            };
+            let required_capacity = Decompressor::upper_bound(&compressed).unwrap_or(1024 * 1024);
             self.buffer.reserve(required_capacity);
             let decompressor = match &mut self.decompressor {
                 Some(decompressor) => decompressor,
                 slot @ None => slot.insert(Decompressor::new()?),
             };
-            decompressor.decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
-
-            self.reader.advance(block_len);
+            decompressor.decompress_to_buffer(&compressed[..], &mut self.buffer)?;
         } else {
             self.buffer.resize(block_len, 0u8);
-            self.reader.read_exact(&mut self.buffer[..])?;
+            block.into_reader().read_exact(&mut self.buffer[..])?;
         }
 
         Ok(true)
@@ -122,6 +140,8 @@ impl io::Read for BlockReader {
 
 #[cfg(test)]
 mod tests {
+    use common::OwnedBytes;
+
     use super::*;
 
     fn block(data: &[u8], compressed: bool) -> OwnedBytes {
@@ -167,6 +187,32 @@ mod tests {
         reader.reset(block(&large, true));
         assert!(reader.read_block().unwrap());
         assert_eq!(reader.buffer(), large);
+    }
+
+    #[test]
+    fn test_blocks_split_across_chunks_read_like_contiguous_blocks() {
+        let blocks = [
+            (b"plain block".to_vec(), false),
+            ((0..4096).map(|i| (i % 7) as u8).collect::<Vec<_>>(), true),
+            (b"tail".to_vec(), false),
+        ];
+        let encoded: Vec<u8> = blocks
+            .iter()
+            .flat_map(|(data, compressed)| block(data, *compressed).to_vec())
+            .collect();
+        for chunk_len in [1, 2, 3, 5, 7, 64, 1000, encoded.len()] {
+            let mut reader = BlockReader::new(ChunkedBytes::new(
+                encoded
+                    .chunks(chunk_len)
+                    .map(|chunk| OwnedBytes::new(chunk.to_vec()))
+                    .collect(),
+            ));
+            for (data, _) in &blocks {
+                assert!(reader.read_block().unwrap(), "chunk_len={chunk_len}");
+                assert_eq!(reader.buffer(), data.as_slice(), "chunk_len={chunk_len}");
+            }
+            assert!(!reader.read_block().unwrap());
+        }
     }
 
     #[test]
