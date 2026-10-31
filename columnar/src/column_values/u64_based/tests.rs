@@ -1,3 +1,4 @@
+use rand::Rng;
 use proptest::prelude::*;
 use proptest::{prop_oneof, proptest};
 
