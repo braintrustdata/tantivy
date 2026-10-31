@@ -19,7 +19,7 @@ pub use dictionary::Dictionary;
 pub use streamer::{Streamer, StreamerBuilder};
 
 mod block_reader;
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, ChunkedBytes, OwnedBytes};
 
 pub use self::block_reader::BlockReader;
 pub use self::delta::{DeltaDecoder, DeltaReader, DeltaWriter};
@@ -60,11 +60,11 @@ pub trait SSTable: Sized {
         Writer::new(wrt)
     }
 
-    fn delta_reader(reader: OwnedBytes) -> DeltaReader<Self::ValueReader> {
+    fn delta_reader(reader: impl Into<ChunkedBytes>) -> DeltaReader<Self::ValueReader> {
         DeltaReader::new(reader)
     }
 
-    fn reader(reader: OwnedBytes) -> Reader<Self::ValueReader> {
+    fn reader(reader: impl Into<ChunkedBytes>) -> Reader<Self::ValueReader> {
         Reader {
             key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
             delta_reader: Self::delta_reader(reader),

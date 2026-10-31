@@ -65,7 +65,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<Reader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        let data = self
+            .sstable_slice
+            .read_chunks_slice(block_addr.byte_range)?;
         Ok(TSSTable::reader(data))
     }
 
@@ -75,7 +77,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         limit: Option<u64>,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let slice = self.file_slice_for_range(key_range, limit);
-        let data = slice.read_bytes_async().await?;
+        let data = slice.read_chunks_async().await?;
         Ok(TSSTable::delta_reader(data))
     }
 
@@ -85,7 +87,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         limit: Option<u64>,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let slice = self.file_slice_for_range(key_range, limit);
-        let data = slice.read_bytes()?;
+        let data = slice.read_chunks()?;
         Ok(TSSTable::delta_reader(data))
     }
 
@@ -93,7 +95,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         block_addr: BlockAddr,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        let data = self
+            .sstable_slice
+            .read_chunks_slice(block_addr.byte_range)?;
         Ok(TSSTable::delta_reader(data))
     }
 
@@ -103,7 +107,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let data = self
             .sstable_slice
-            .read_bytes_slice_async(block_addr.byte_range)
+            .read_chunks_slice_async(block_addr.byte_range)
             .await?;
         Ok(TSSTable::delta_reader(data))
     }

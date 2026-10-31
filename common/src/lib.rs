@@ -6,6 +6,7 @@ pub use byteorder::LittleEndian as Endianness;
 
 mod bitset;
 mod byte_count;
+mod chunked_bytes;
 mod datetime;
 pub mod file_slice;
 mod group_by;
@@ -15,6 +16,7 @@ mod vint;
 mod writer;
 pub use bitset::*;
 pub use byte_count::ByteCount;
+pub use chunked_bytes::{ChunkedBytes, ChunkedBytesReader};
 pub use datetime::{DateTime, DateTimePrecision};
 pub use group_by::GroupByIteratorExtended;
 pub use json_path_writer::JsonPathWriter;
