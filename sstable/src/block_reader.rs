@@ -9,6 +9,7 @@ pub struct BlockReader {
     buffer: Vec<u8>,
     decompressor: Option<Decompressor<'static>>,
     reader: ChunkedBytes,
+    position: usize,
     offset: usize,
 }
 
@@ -18,6 +19,7 @@ impl BlockReader {
             buffer: Vec::new(),
             decompressor: None,
             reader: reader.into(),
+            position: 0,
             offset: 0,
         }
     }
@@ -25,21 +27,32 @@ impl BlockReader {
     pub(crate) fn reset(&mut self, reader: impl Into<ChunkedBytes>) {
         self.buffer.clear();
         self.reader = reader.into();
+        self.position = 0;
         self.offset = 0;
     }
 
-    fn take(&mut self, len: usize) -> ChunkedBytes {
-        let taken = self.reader.slice(0..len);
-        self.reader = self.reader.slice(len..self.reader.len());
-        taken
+    fn remaining(&self) -> usize {
+        self.reader.len() - self.position
+    }
+
+    fn take_range(&mut self, len: usize) -> Range<usize> {
+        let range = self.position..self.position + len;
+        self.position = range.end;
+        range
     }
 
     fn take_array<const N: usize>(&mut self) -> [u8; N] {
+        let range = self.take_range(N);
         let mut bytes = [0u8; N];
-        self.take(N)
-            .into_reader()
-            .read_exact(&mut bytes)
-            .expect("the taken range has exactly N bytes");
+        match self.reader.contiguous_slice(range.clone()) {
+            Some(slice) => bytes.copy_from_slice(slice),
+            None => self
+                .reader
+                .slice(range)
+                .into_reader()
+                .read_exact(&mut bytes)
+                .expect("the taken range has exactly N bytes"),
+        }
         bytes
     }
 
@@ -58,7 +71,7 @@ impl BlockReader {
         self.offset = 0;
         self.buffer.clear();
 
-        let block_len = match self.reader.len() {
+        let block_len = match self.remaining() {
             0 => return Ok(false),
             1..=3 => {
                 return Err(io::Error::new(
@@ -74,17 +87,17 @@ impl BlockReader {
         let [compress] = self.take_array();
         let block_len = block_len - 1;
 
-        if self.reader.len() < block_len {
+        if self.remaining() < block_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "failed to read block content",
             ));
         }
-        let block = self.take(block_len);
+        let block = self.take_range(block_len);
         if compress == 1 {
-            let compressed = match block.contiguous_slice(0..block_len) {
+            let compressed = match self.reader.contiguous_slice(block.clone()) {
                 Some(compressed) => Cow::Borrowed(compressed),
-                None => Cow::Owned(block.to_vec()),
+                None => Cow::Owned(self.reader.slice(block).to_vec()),
             };
             let required_capacity = Decompressor::upper_bound(&compressed).unwrap_or(1024 * 1024);
             self.buffer.reserve(required_capacity);
@@ -93,9 +106,14 @@ impl BlockReader {
                 slot @ None => slot.insert(Decompressor::new()?),
             };
             decompressor.decompress_to_buffer(&compressed[..], &mut self.buffer)?;
+        } else if let Some(block) = self.reader.contiguous_slice(block.clone()) {
+            self.buffer.extend_from_slice(block);
         } else {
             self.buffer.resize(block_len, 0u8);
-            block.into_reader().read_exact(&mut self.buffer[..])?;
+            self.reader
+                .slice(block)
+                .into_reader()
+                .read_exact(&mut self.buffer[..])?;
         }
 
         Ok(true)
