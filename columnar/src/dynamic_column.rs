@@ -237,8 +237,28 @@ pub struct DynamicColumnHandle {
 impl DynamicColumnHandle {
     // TODO rename load
     pub fn open(&self) -> io::Result<DynamicColumn> {
-        let column_bytes: OwnedBytes = self.file_slice.read_bytes()?;
-        self.open_internal(column_bytes)
+        let column_bytes = self.file_slice.read_chunks()?;
+        let dynamic_column: DynamicColumn = match self.column_type {
+            ColumnType::I64 => {
+                crate::column::open_column_u64_from_chunks::<i64>(column_bytes)?.into()
+            }
+            ColumnType::U64 => {
+                crate::column::open_column_u64_from_chunks::<u64>(column_bytes)?.into()
+            }
+            ColumnType::F64 => {
+                crate::column::open_column_u64_from_chunks::<f64>(column_bytes)?.into()
+            }
+            ColumnType::Bool => {
+                crate::column::open_column_u64_from_chunks::<bool>(column_bytes)?.into()
+            }
+            ColumnType::DateTime => {
+                crate::column::open_column_u64_from_chunks::<DateTime>(column_bytes)?.into()
+            }
+            ColumnType::Bytes | ColumnType::Str | ColumnType::IpAddr => {
+                return self.open_internal(column_bytes.into_contiguous());
+            }
+        };
+        Ok(dynamic_column)
     }
 
     #[doc(hidden)]
@@ -257,6 +277,19 @@ impl DynamicColumnHandle {
     /// If not, the fastfield reader will returns the u64-value associated with the original
     /// FastValue.
     pub fn open_u64_lenient(&self) -> io::Result<Option<Column<u64>>> {
+        if matches!(
+            self.column_type,
+            ColumnType::Bool
+                | ColumnType::I64
+                | ColumnType::U64
+                | ColumnType::F64
+                | ColumnType::DateTime
+        ) {
+            return crate::column::open_column_u64_from_chunks::<u64>(
+                self.file_slice.read_chunks()?,
+            )
+            .map(Some);
+        }
         let column_bytes = self.file_slice.read_bytes()?;
         match self.column_type {
             ColumnType::Str | ColumnType::Bytes => {
