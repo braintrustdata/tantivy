@@ -3,10 +3,11 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
-use common::OwnedBytes;
+use common::{ChunkedBytes, OwnedBytes};
 
 use crate::column_values::{
-    load_u64_based_column_values, serialize_u64_based_column_values, CodecType, ColumnValues,
+    load_u64_based_column_values_from_chunks, serialize_u64_based_column_values, CodecType,
+    ColumnValues,
 };
 use crate::iterable::Iterable;
 use crate::{DocId, RowId};
@@ -23,8 +24,9 @@ pub fn serialize_multivalued_index(
     Ok(())
 }
 
-pub fn open_multivalued_index(bytes: OwnedBytes) -> io::Result<MultiValueIndex> {
-    let start_index_column: Arc<dyn ColumnValues<RowId>> = load_u64_based_column_values(bytes)?;
+pub fn open_multivalued_index(bytes: ChunkedBytes) -> io::Result<MultiValueIndex> {
+    let start_index_column: Arc<dyn ColumnValues<RowId>> =
+        load_u64_based_column_values_from_chunks(bytes)?;
     Ok(MultiValueIndex { start_index_column })
 }
 
@@ -54,7 +56,7 @@ impl MultiValueIndex {
         let mut buffer = Vec::new();
         serialize_multivalued_index(&start_offsets, &mut buffer).unwrap();
         let bytes = OwnedBytes::new(buffer);
-        open_multivalued_index(bytes).unwrap()
+        open_multivalued_index(bytes.into()).unwrap()
     }
 
     /// Returns `[start, end)`, such that the values associated with
