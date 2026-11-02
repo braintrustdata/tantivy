@@ -943,3 +943,104 @@ fn test_delete_decrease_cardinality() {
     assert_eq!(cols[0].column_type(), ColumnType::I64);
     assert_eq!(cols[0].open().unwrap().get_cardinality(), Cardinality::Full);
 }
+
+// Serves reads as pages, like a page cache.
+#[derive(Debug)]
+struct PagedFile {
+    bytes: common::OwnedBytes,
+    page_size: usize,
+}
+
+impl common::HasLen for PagedFile {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl common::file_slice::FileHandle for PagedFile {
+    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<common::OwnedBytes> {
+        Ok(self.bytes.slice(range))
+    }
+
+    fn read_chunks(&self, range: std::ops::Range<usize>) -> std::io::Result<common::ChunkedBytes> {
+        let mut chunks = Vec::new();
+        let mut start = range.start;
+        while start < range.end {
+            let end = ((start / self.page_size + 1) * self.page_size).min(range.end);
+            chunks.push(self.bytes.slice(start..end));
+            start = end;
+        }
+        Ok(common::ChunkedBytes::new(chunks))
+    }
+}
+
+#[test]
+fn test_columns_read_from_pages_match_contiguous_columns() {
+    let num_rows = 300_000u32;
+    let mut writer = ColumnarWriter::default();
+    for row in 0..num_rows {
+        // Dense blocks, then sparse ones.
+        if (row < 150_000 && row % 3 != 0) || row % 1_000 == 0 {
+            writer.record_numerical(row, "optional", row as u64 * 7);
+            writer.record_str(row, "str", &format!("v{}", row % 1_000));
+        }
+        for value in 0..row % 4 {
+            writer.record_numerical(row, "multivalued", (row + value) as u64);
+        }
+    }
+    let mut buffer = Vec::new();
+    writer.serialize(num_rows, None, &mut buffer).unwrap();
+    let bytes = common::OwnedBytes::new(buffer);
+    let expected = ColumnarReader::open(common::file_slice::FileSlice::new(std::sync::Arc::new(
+        bytes.clone(),
+    )))
+    .unwrap();
+    for page_size in [7, 8, 4096, 128 << 10] {
+        let paged = ColumnarReader::open(common::file_slice::FileSlice::new(std::sync::Arc::new(
+            PagedFile {
+                bytes: bytes.clone(),
+                page_size,
+            },
+        )))
+        .unwrap();
+        for name in ["optional", "multivalued"] {
+            let open = |reader: &ColumnarReader| {
+                reader.read_columns(name).unwrap()[0]
+                    .open_u64_lenient()
+                    .unwrap()
+                    .unwrap()
+            };
+            let (want, got) = (open(&expected), open(&paged));
+            assert_eq!(got.get_cardinality(), want.get_cardinality());
+            for row in 0..num_rows {
+                assert!(
+                    got.values_for_doc(row).eq(want.values_for_doc(row)),
+                    "{name} page={page_size} row={row}"
+                );
+            }
+        }
+        let open = |reader: &ColumnarReader| match reader.read_columns("str").unwrap()[0]
+            .open()
+            .unwrap()
+        {
+            DynamicColumn::Str(column) => column,
+            _ => panic!("expected a str column"),
+        };
+        let (want, got) = (open(&expected), open(&paged));
+        let (mut want_str, mut got_str) = (String::new(), String::new());
+        for row in 0..num_rows {
+            assert!(
+                got.term_ords(row).eq(want.term_ords(row)),
+                "page={page_size} row={row}"
+            );
+            if row % 101 != 0 {
+                continue;
+            }
+            for ord in want.term_ords(row) {
+                want.ord_to_str(ord, &mut want_str).unwrap();
+                got.ord_to_str(ord, &mut got_str).unwrap();
+                assert_eq!(got_str, want_str, "page={page_size} row={row}");
+            }
+        }
+    }
+}
