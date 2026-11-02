@@ -1,3 +1,4 @@
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use common::{ChunkedBytes, OwnedBytes};
@@ -8,8 +9,14 @@ pub trait ColumnData: Clone + Send + Sync + 'static {
     /// Returns the value at `idx` of the bitpacked run that starts at `byte_offset`.
     fn get_bits(&self, bit_unpacker: &BitUnpacker, byte_offset: usize, idx: u32) -> u64;
 
-    /// Returns the data as one slice, when it is one.
-    fn as_slice(&self) -> Option<&[u8]>;
+    /// Same as [`BitUnpacker::get_ids_for_value_range`].
+    fn get_ids_for_value_range(
+        &self,
+        bit_unpacker: &BitUnpacker,
+        range: RangeInclusive<u64>,
+        id_range: Range<u32>,
+        positions: &mut Vec<u32>,
+    );
 }
 
 impl ColumnData for OwnedBytes {
@@ -21,8 +28,14 @@ impl ColumnData for OwnedBytes {
         bit_unpacker.get(idx, &self.as_slice()[byte_offset..])
     }
 
-    fn as_slice(&self) -> Option<&[u8]> {
-        Some(OwnedBytes::as_slice(self))
+    fn get_ids_for_value_range(
+        &self,
+        bit_unpacker: &BitUnpacker,
+        range: RangeInclusive<u64>,
+        id_range: Range<u32>,
+        positions: &mut Vec<u32>,
+    ) {
+        bit_unpacker.get_ids_for_value_range(range, id_range, self.as_slice(), positions);
     }
 }
 
@@ -103,8 +116,53 @@ impl ColumnData for PagedBytes {
         bit_unpacker.get_with(idx, |addr| self.read_u64_le(byte_offset + addr))
     }
 
-    fn as_slice(&self) -> Option<&[u8]> {
-        None
+    /// Decodes each page in batches. Values whose 8-value group crosses a page are read one by
+    /// one.
+    fn get_ids_for_value_range(
+        &self,
+        bit_unpacker: &BitUnpacker,
+        range: RangeInclusive<u64>,
+        id_range: Range<u32>,
+        positions: &mut Vec<u32>,
+    ) {
+        positions.clear();
+        let num_bits = bit_unpacker.bit_width() as usize;
+        let push_one_by_one = |ids: Range<u32>, positions: &mut Vec<u32>| {
+            for idx in ids {
+                if range.contains(&self.get_bits(bit_unpacker, 0, idx)) {
+                    positions.push(idx);
+                }
+            }
+        };
+        if num_bits == 0 {
+            return push_one_by_one(id_range, positions);
+        }
+        let end = id_range.end.min((self.len * 8 / num_bits) as u32);
+        let mut batch = Vec::new();
+        let mut idx = id_range.start;
+        while idx < end {
+            // Every 8th value starts on a byte, so groups of 8 can be decoded from one page.
+            let (page, _) = self.locate(idx as usize * num_bits / 8);
+            let page_end = (((page + 1) << self.page_shift) - self.skip).min(self.len);
+            let lo = idx.next_multiple_of(8);
+            let hi = ((page_end * 8 / num_bits) as u32 & !7).min(end);
+            if lo >= hi {
+                let next = (lo + 8).min(end);
+                push_one_by_one(idx..next, positions);
+                idx = next;
+                continue;
+            }
+            push_one_by_one(idx..lo, positions);
+            let (_, offset) = self.locate(lo as usize * num_bits / 8);
+            bit_unpacker.get_ids_for_value_range(
+                range.clone(),
+                0..hi - lo,
+                &self.pages[page].as_slice()[offset..],
+                &mut batch,
+            );
+            positions.extend(batch.iter().map(|id| id + lo));
+            idx = hi;
+        }
     }
 }
 
@@ -165,14 +223,17 @@ mod tests {
                             ..=expected
                                 .get_val(values.len() as u32 / 2)
                                 .max(expected.get_val(values.len() as u32 / 3));
-                        let (mut want, mut got) = (Vec::new(), Vec::new());
-                        expected.get_row_ids_for_value_range(
-                            range.clone(),
-                            0..values.len() as u32,
-                            &mut want,
-                        );
-                        actual.get_row_ids_for_value_range(range, 0..values.len() as u32, &mut got);
-                        assert_eq!(got, want, "{name} {codec:?} page={page_size}");
+                        let num_vals = values.len() as u32;
+                        for ids in [0..num_vals, num_vals / 5..num_vals - 1] {
+                            let (mut want, mut got) = (Vec::new(), Vec::new());
+                            expected.get_row_ids_for_value_range(
+                                range.clone(),
+                                ids.clone(),
+                                &mut want,
+                            );
+                            actual.get_row_ids_for_value_range(range.clone(), ids, &mut got);
+                            assert_eq!(got, want, "{name} {codec:?} page={page_size}");
+                        }
                     }
                 }
             }

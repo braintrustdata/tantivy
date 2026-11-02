@@ -99,17 +99,12 @@ impl<D: ColumnData> ColumnValues for BitpackedReader<D> {
             positions.clear();
             return;
         };
-        let Some(data) = self.data.as_slice() else {
-            positions.clear();
-            for idx in doc_id_range.start..doc_id_range.end.min(self.stats.num_rows) {
-                if transformed_range.contains(&self.data.get_bits(&self.bit_unpacker, 0, idx)) {
-                    positions.push(idx);
-                }
-            }
-            return;
-        };
-        self.bit_unpacker
-            .get_ids_for_value_range(transformed_range, doc_id_range, data, positions);
+        self.data.get_ids_for_value_range(
+            &self.bit_unpacker,
+            transformed_range,
+            doc_id_range,
+            positions,
+        );
     }
 }
 
