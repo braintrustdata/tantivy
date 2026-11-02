@@ -7,6 +7,7 @@ use fastdivide::DividerU64;
 use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use crate::column_values::u64_based::line::Line;
+use crate::column_values::u64_based::paged::ColumnData;
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::column_values::{ColumnValues, VecColumn};
 use crate::MonotonicallyMappableToU64;
@@ -176,7 +177,13 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
         let stats = ColumnStats::deserialize(&mut bytes)?;
         let footer_len: u32 = (&bytes[bytes.len() - 4..]).deserialize()?;
         let footer_offset = bytes.len() - 4 - footer_len as usize;
-        let (data, mut footer) = bytes.split(footer_offset);
+        let (data, footer) = bytes.split(footer_offset);
+        BlockwiseLinearReader::new(stats, footer.as_slice(), data)
+    }
+}
+
+impl<D> BlockwiseLinearReader<D> {
+    pub(crate) fn new(stats: ColumnStats, mut footer: &[u8], data: D) -> io::Result<Self> {
         let num_blocks = compute_num_blocks(stats.num_rows);
         let mut blocks: Vec<Block> = iter::repeat_with(|| Block::deserialize(&mut footer))
             .take(num_blocks as usize)
@@ -195,21 +202,24 @@ impl ColumnCodec<u64> for BlockwiseLinearCodec {
 }
 
 #[derive(Clone)]
-pub struct BlockwiseLinearReader {
+pub struct BlockwiseLinearReader<D = OwnedBytes> {
     blocks: Arc<[Block]>,
-    data: OwnedBytes,
+    data: D,
     stats: ColumnStats,
 }
 
-impl ColumnValues for BlockwiseLinearReader {
+impl<D: ColumnData> ColumnValues for BlockwiseLinearReader<D> {
     #[inline(always)]
     fn get_val(&self, idx: u32) -> u64 {
         let block_id = (idx / BLOCK_SIZE) as usize;
         let idx_within_block = idx % BLOCK_SIZE;
         let block = &self.blocks[block_id];
         let interpoled_val: u64 = block.line.eval(idx_within_block);
-        let block_bytes = &self.data[block.data_start_offset..];
-        let bitpacked_diff = block.bit_unpacker.get(idx_within_block, block_bytes);
+        let bitpacked_diff = self.data.get_bits(
+            &block.bit_unpacker,
+            block.data_start_offset,
+            idx_within_block,
+        );
         // TODO optimize me! the line parameters could be tweaked to include the multiplication and
         // remove the dependency.
         self.stats.min_value

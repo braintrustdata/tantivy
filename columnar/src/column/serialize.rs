@@ -2,14 +2,15 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 
-use common::OwnedBytes;
+use common::{BinarySerializable, ChunkedBytes, OwnedBytes};
 use sstable::Dictionary;
 
 use crate::column::{BytesColumn, Column};
 use crate::column_index::{serialize_column_index, SerializableColumnIndex};
 use crate::column_values::{
-    load_u64_based_column_values, serialize_column_values_u128, serialize_u64_based_column_values,
-    CodecType, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
+    load_u64_based_column_values, load_u64_based_column_values_from_chunks,
+    serialize_column_values_u128, serialize_u64_based_column_values, CodecType,
+    MonotonicallyMappableToU128, MonotonicallyMappableToU64,
 };
 use crate::iterable::Iterable;
 use crate::StrColumn;
@@ -51,6 +52,28 @@ pub fn open_column_u64<T: MonotonicallyMappableToU64>(bytes: OwnedBytes) -> io::
     let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
     let column_index = crate::column_index::open_column_index(column_index_data)?;
     let column_values = load_u64_based_column_values(column_values_data)?;
+    Ok(Column {
+        index: column_index,
+        values: column_values,
+    })
+}
+
+/// Same as [`open_column_u64`], but keeps the values in the chunks they were read as.
+pub fn open_column_u64_from_chunks<T: MonotonicallyMappableToU64>(
+    bytes: ChunkedBytes,
+) -> io::Result<Column<T>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "column is too short");
+    let body_len = bytes.len().checked_sub(4).ok_or_else(invalid)?;
+    let column_index_num_bytes =
+        u32::deserialize(&mut bytes.slice(body_len..bytes.len()).into_reader())? as usize;
+    if column_index_num_bytes > body_len {
+        return Err(invalid());
+    }
+    let column_index = crate::column_index::open_column_index(
+        bytes.slice(0..column_index_num_bytes).into_contiguous(),
+    )?;
+    let column_values =
+        load_u64_based_column_values_from_chunks(bytes.slice(column_index_num_bytes..body_len))?;
     Ok(Column {
         index: column_index,
         values: column_values,
