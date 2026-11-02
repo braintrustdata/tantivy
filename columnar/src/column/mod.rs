@@ -96,10 +96,25 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
             ColumnIndex::Empty { .. } => {}
             ColumnIndex::Full => self.values.get_vals_opt(docids, output),
             ColumnIndex::Optional(optional_index) => {
-                for (i, docid) in docids.iter().enumerate() {
-                    output[i] = optional_index
-                        .rank_if_exists(*docid)
-                        .map(|rowid| self.values.get_val(rowid));
+                // Fetch values in batches, as for full columns, to avoid a dynamic call per value.
+                const BATCH_LEN: usize = 64;
+                let mut row_ids = [0; BATCH_LEN];
+                let mut positions = [0; BATCH_LEN];
+                let mut vals = [None; BATCH_LEN];
+                for (docids, output) in docids.chunks(BATCH_LEN).zip(output.chunks_mut(BATCH_LEN)) {
+                    let mut len = 0;
+                    for (position, docid) in docids.iter().enumerate() {
+                        output[position] = None;
+                        if let Some(row_id) = optional_index.rank_if_exists(*docid) {
+                            row_ids[len] = row_id;
+                            positions[len] = position;
+                            len += 1;
+                        }
+                    }
+                    self.values.get_vals_opt(&row_ids[..len], &mut vals[..len]);
+                    for (position, val) in positions[..len].iter().zip(&vals[..len]) {
+                        output[*position] = *val;
+                    }
                 }
             }
             ColumnIndex::Multivalued(multivalued_index) => {
