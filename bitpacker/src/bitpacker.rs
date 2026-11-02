@@ -110,6 +110,14 @@ impl BitUnpacker {
         val_shifted & self.mask
     }
 
+    /// Same as [`BitUnpacker::get`], for data that is not one slice: `read_u64_le(addr)`
+    /// returns the 8 little-endian bytes at `addr`, zero-padded past the end.
+    #[inline]
+    pub fn get_with(&self, idx: u32, read_u64_le: impl FnOnce(usize) -> u64) -> u64 {
+        let addr_in_bits = idx * self.num_bits;
+        (read_u64_le((addr_in_bits >> 3) as usize) >> (addr_in_bits & 7)) & self.mask
+    }
+
     #[inline(never)]
     fn get_slow_path(&self, addr: usize, bit_shift: u32, data: &[u8]) -> u64 {
         let mut bytes: [u8; 8] = [0u8; 8];
