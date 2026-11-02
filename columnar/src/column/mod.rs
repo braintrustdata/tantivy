@@ -9,9 +9,9 @@ use std::sync::Arc;
 use common::BinarySerializable;
 pub use dictionary_encoded::{BytesColumn, StrColumn};
 pub use serialize::{
-    open_column_bytes, open_column_str, open_column_u128, open_column_u128_as_compact_u64,
-    open_column_u64, open_column_u64_from_chunks, serialize_column_mappable_to_u128,
-    serialize_column_mappable_to_u64,
+    open_column_bytes, open_column_bytes_from_slice, open_column_str, open_column_u128,
+    open_column_u128_as_compact_u64, open_column_u64, open_column_u64_from_chunks,
+    serialize_column_mappable_to_u128, serialize_column_mappable_to_u64,
 };
 
 use crate::column_index::{ColumnIndex, Set};

@@ -2,6 +2,7 @@ use std::io;
 use std::io::Write;
 use std::sync::Arc;
 
+use common::file_slice::FileSlice;
 use common::{BinarySerializable, ChunkedBytes, OwnedBytes};
 use sstable::Dictionary;
 
@@ -128,6 +129,18 @@ pub fn open_column_bytes(data: OwnedBytes) -> io::Result<BytesColumn> {
     Ok(BytesColumn {
         dictionary,
         term_ord_column,
+    })
+}
+
+/// Same as [`open_column_bytes`], but reads the dictionary lazily and keeps the term ordinals in
+/// the chunks they were read as.
+pub fn open_column_bytes_from_slice(file_slice: FileSlice) -> io::Result<BytesColumn> {
+    let (body, dictionary_len) = file_slice.split_from_end(4);
+    let dictionary_len = u32::deserialize(&mut dictionary_len.read_bytes()?)? as usize;
+    let (dictionary, term_ord_column) = body.split(dictionary_len);
+    Ok(BytesColumn {
+        dictionary: Arc::new(Dictionary::open(dictionary)?),
+        term_ord_column: open_column_u64_from_chunks(term_ord_column.read_chunks()?)?,
     })
 }
 

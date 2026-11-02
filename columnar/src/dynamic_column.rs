@@ -8,7 +8,7 @@ use common::{ByteCount, DateTime, HasLen, OwnedBytes};
 use crate::column::{BytesColumn, Column, StrColumn};
 use crate::column_values::{monotonic_map_column, StrictlyMonotonicFn};
 use crate::columnar::ColumnType;
-use crate::{Cardinality, ColumnIndex, ColumnValues, NumericalType};
+use crate::{Cardinality, ColumnIndex, ColumnValues, MonotonicallyMappableToU64, NumericalType};
 
 #[derive(Clone)]
 pub enum DynamicColumn {
@@ -237,28 +237,26 @@ pub struct DynamicColumnHandle {
 impl DynamicColumnHandle {
     // TODO rename load
     pub fn open(&self) -> io::Result<DynamicColumn> {
-        let column_bytes = self.file_slice.read_chunks()?;
         let dynamic_column: DynamicColumn = match self.column_type {
-            ColumnType::I64 => {
-                crate::column::open_column_u64_from_chunks::<i64>(column_bytes)?.into()
+            ColumnType::Bytes => {
+                crate::column::open_column_bytes_from_slice(self.file_slice.clone())?.into()
             }
-            ColumnType::U64 => {
-                crate::column::open_column_u64_from_chunks::<u64>(column_bytes)?.into()
-            }
-            ColumnType::F64 => {
-                crate::column::open_column_u64_from_chunks::<f64>(column_bytes)?.into()
-            }
-            ColumnType::Bool => {
-                crate::column::open_column_u64_from_chunks::<bool>(column_bytes)?.into()
-            }
-            ColumnType::DateTime => {
-                crate::column::open_column_u64_from_chunks::<DateTime>(column_bytes)?.into()
-            }
-            ColumnType::Bytes | ColumnType::Str | ColumnType::IpAddr => {
-                return self.open_internal(column_bytes.into_contiguous());
-            }
+            ColumnType::Str => StrColumn::wrap(crate::column::open_column_bytes_from_slice(
+                self.file_slice.clone(),
+            )?)
+            .into(),
+            ColumnType::IpAddr => return self.open_internal(self.file_slice.read_bytes()?),
+            ColumnType::I64 => self.open_u64_from_chunks::<i64>()?.into(),
+            ColumnType::U64 => self.open_u64_from_chunks::<u64>()?.into(),
+            ColumnType::F64 => self.open_u64_from_chunks::<f64>()?.into(),
+            ColumnType::Bool => self.open_u64_from_chunks::<bool>()?.into(),
+            ColumnType::DateTime => self.open_u64_from_chunks::<DateTime>()?.into(),
         };
         Ok(dynamic_column)
+    }
+
+    fn open_u64_from_chunks<T: MonotonicallyMappableToU64>(&self) -> io::Result<Column<T>> {
+        crate::column::open_column_u64_from_chunks(self.file_slice.read_chunks()?)
     }
 
     #[doc(hidden)]
@@ -277,38 +275,21 @@ impl DynamicColumnHandle {
     /// If not, the fastfield reader will returns the u64-value associated with the original
     /// FastValue.
     pub fn open_u64_lenient(&self) -> io::Result<Option<Column<u64>>> {
-        if matches!(
-            self.column_type,
-            ColumnType::Bool
-                | ColumnType::I64
-                | ColumnType::U64
-                | ColumnType::F64
-                | ColumnType::DateTime
-        ) {
-            return crate::column::open_column_u64_from_chunks::<u64>(
-                self.file_slice.read_chunks()?,
-            )
-            .map(Some);
-        }
-        let column_bytes = self.file_slice.read_bytes()?;
-        match self.column_type {
+        let column = match self.column_type {
             ColumnType::Str | ColumnType::Bytes => {
-                let column: BytesColumn = crate::column::open_column_bytes(column_bytes)?;
-                Ok(Some(column.term_ord_column))
+                crate::column::open_column_bytes_from_slice(self.file_slice.clone())?
+                    .term_ord_column
             }
             ColumnType::IpAddr => {
-                let column = crate::column::open_column_u128_as_compact_u64(column_bytes)?;
-                Ok(Some(column))
+                crate::column::open_column_u128_as_compact_u64(self.file_slice.read_bytes()?)?
             }
             ColumnType::Bool
             | ColumnType::I64
             | ColumnType::U64
             | ColumnType::F64
-            | ColumnType::DateTime => {
-                let column = crate::column::open_column_u64::<u64>(column_bytes)?;
-                Ok(Some(column))
-            }
-        }
+            | ColumnType::DateTime => self.open_u64_from_chunks()?,
+        };
+        Ok(Some(column))
     }
 
     fn open_internal(&self, column_bytes: OwnedBytes) -> io::Result<DynamicColumn> {
