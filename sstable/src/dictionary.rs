@@ -420,7 +420,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     #[doc(hidden)]
     pub async fn warm_up_dictionary(&self) -> io::Result<()> {
-        self.sstable_slice.read_bytes_async().await?;
+        self.sstable_slice.read_chunks_async().await?;
         Ok(())
     }
 }
