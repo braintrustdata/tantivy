@@ -2,6 +2,7 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use common::{ChunkedBytes, OwnedBytes};
+use fastdivide::DividerU64;
 use tantivy_bitpacker::BitUnpacker;
 
 /// Bytes that bitpacked column values are read from.
@@ -40,14 +41,14 @@ impl ColumnData for OwnedBytes {
 }
 
 /// Column data kept as the page-cache pages it was read from, so opening a column does not
-/// copy it. Every page but the first and the last holds `1 << page_shift` bytes.
+/// copy it. Every page but the first and the last holds `page_len` bytes.
 #[derive(Clone)]
 pub(crate) struct PagedBytes {
     pages: Arc<[OwnedBytes]>,
-    // Bytes missing from the front of the first page, so that offsets map to pages by shifting.
+    // Bytes missing from the front of the first page.
     skip: usize,
-    page_shift: u32,
-    page_mask: usize,
+    page_len: usize,
+    page_divider: DividerU64,
     len: usize,
 }
 
@@ -58,7 +59,6 @@ impl PagedBytes {
         let pages: Vec<OwnedBytes> = bytes.chunks().collect();
         let page_len = pages.iter().map(OwnedBytes::len).max().unwrap_or(0);
         let uniform = pages.len() > 1
-            && page_len.is_power_of_two()
             && pages[1..pages.len() - 1]
                 .iter()
                 .all(|page| page.len() == page_len);
@@ -67,8 +67,8 @@ impl PagedBytes {
         }
         Ok(Self {
             skip: page_len - pages[0].len(),
-            page_shift: page_len.trailing_zeros(),
-            page_mask: page_len - 1,
+            page_len,
+            page_divider: DividerU64::divide_by(page_len as u64),
             len: bytes.len(),
             pages: pages.into(),
         })
@@ -77,11 +77,11 @@ impl PagedBytes {
     #[inline(always)]
     fn locate(&self, addr: usize) -> (usize, usize) {
         let position = addr + self.skip;
-        let page = position >> self.page_shift;
+        let page = self.page_divider.divide(position as u64) as usize;
         let offset = if page == 0 {
             addr
         } else {
-            position & self.page_mask
+            position - page * self.page_len
         };
         (page, offset)
     }
@@ -144,7 +144,7 @@ impl ColumnData for PagedBytes {
         while idx < end {
             // Every 8th value starts on a byte, so groups of 8 can be decoded from one page.
             let (page, _) = self.locate(idx as usize * num_bits / 8);
-            let page_end = (((page + 1) << self.page_shift) - self.skip).min(self.len);
+            let page_end = ((page + 1) * self.page_len - self.skip).min(self.len);
             let lo = idx.next_multiple_of(8);
             let hi = ((page_end * 8 / num_bits) as u32 & !7).min(end);
             if lo >= hi {
@@ -207,19 +207,21 @@ mod tests {
 
     #[test]
     fn large_columns_retain_cache_pages() {
-        let pages: Vec<_> = (0..3)
-            .map(|_| OwnedBytes::new(vec![0u8; 128 << 10]))
-            .collect();
-        let pointers: Vec<_> = pages.iter().map(|page| page.as_ptr()).collect();
-        let paged = super::PagedBytes::new(ChunkedBytes::new(pages)).unwrap();
-        assert_eq!(
-            paged
-                .pages
-                .iter()
-                .map(|page| page.as_ptr())
-                .collect::<Vec<_>>(),
-            pointers
-        );
+        for page_len in [61, 128 << 10] {
+            let pages: Vec<_> = (0..3)
+                .map(|_| OwnedBytes::new(vec![0u8; page_len]))
+                .collect();
+            let pointers: Vec<_> = pages.iter().map(|page| page.as_ptr()).collect();
+            let paged = super::PagedBytes::new(ChunkedBytes::new(pages)).unwrap();
+            assert_eq!(
+                paged
+                    .pages
+                    .iter()
+                    .map(|page| page.as_ptr())
+                    .collect::<Vec<_>>(),
+                pointers
+            );
+        }
     }
 
     fn paged(bytes: &OwnedBytes, offset: usize, page_size: usize) -> ChunkedBytes {
@@ -251,7 +253,7 @@ mod tests {
                 }
                 let bytes = OwnedBytes::new(buffer);
                 let expected = load_u64_based_column_values::<u64>(bytes.clone()).unwrap();
-                for page_size in [1usize, 2, 8, 64, 4096, 1 << 20] {
+                for page_size in [1usize, 2, 3, 7, 8, 61, 64, 4096, 1 << 20] {
                     for offset in [0, 3, page_size.saturating_sub(1)] {
                         let actual = load_u64_based_column_values_from_chunks::<u64>(paged(
                             &bytes, offset, page_size,
