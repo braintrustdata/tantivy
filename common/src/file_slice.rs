@@ -252,26 +252,13 @@ impl FileSlice {
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
     pub fn read_bytes_slice(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        assert!(
-            range.end <= self.len(),
-            "end of requested range exceeds the fileslice length ({} > {})",
-            range.end,
-            self.len()
-        );
-        self.data
-            .read_bytes(self.range.start + range.start..self.range.start + range.end)
+        self.data.read_bytes(self.absolute_range(range))
     }
 
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        assert!(
-            self.range.start + byte_range.end <= self.range.end,
-            "`to` exceeds the fileslice length"
-        );
         self.data
-            .read_bytes_async(
-                self.range.start + byte_range.start..self.range.start + byte_range.end,
-            )
+            .read_bytes_async(self.absolute_range(byte_range))
             .await
     }
 
@@ -289,14 +276,7 @@ impl FileSlice {
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_chunks()`.
     pub fn read_chunks_slice(&self, range: Range<usize>) -> io::Result<ChunkedBytes> {
-        assert!(
-            range.end <= self.len(),
-            "end of requested range exceeds the fileslice length ({} > {})",
-            range.end,
-            self.len()
-        );
-        self.data
-            .read_chunks(self.range.start + range.start..self.range.start + range.end)
+        self.data.read_chunks(self.absolute_range(range))
     }
 
     #[doc(hidden)]
@@ -304,15 +284,23 @@ impl FileSlice {
         &self,
         byte_range: Range<usize>,
     ) -> io::Result<ChunkedBytes> {
-        assert!(
-            self.range.start + byte_range.end <= self.range.end,
-            "`to` exceeds the fileslice length"
-        );
         self.data
-            .read_chunks_async(
-                self.range.start + byte_range.start..self.range.start + byte_range.end,
-            )
+            .read_chunks_async(self.absolute_range(byte_range))
             .await
+    }
+
+    fn absolute_range(&self, range: Range<usize>) -> Range<usize> {
+        assert!(
+            range.start <= range.end,
+            "start of requested range exceeds its end"
+        );
+        assert!(
+            range.end <= self.len(),
+            "end of requested range exceeds the fileslice length ({} > {})",
+            range.end,
+            self.len()
+        );
+        self.range.start + range.start..self.range.start + range.end
     }
 
     /// Splits the FileSlice at the given offset and return two file slices.
@@ -478,6 +466,81 @@ mod tests {
             slice_deref.read_bytes_slice(0..10).unwrap().as_ref(),
             b"bcd"
         );
+    }
+
+    fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
+        struct Noop;
+        impl std::task::Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = std::task::Waker::from(Arc::new(Noop));
+        match Box::pin(future)
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+        {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("in-memory reads must complete immediately"),
+        }
+    }
+
+    #[test]
+    fn test_nested_slice_read_ranges() {
+        let slice = FileSlice::new(Arc::new(&b"abcdefgh"[..]))
+            .slice(1..7)
+            .slice(1..5);
+        for start in 0..=slice.len() {
+            for end in start..=slice.len() {
+                let range = start..end;
+                let expected = &b"cdef"[range.clone()];
+                assert_eq!(
+                    slice.read_bytes_slice(range.clone()).unwrap().as_slice(),
+                    expected
+                );
+                assert_eq!(
+                    slice.read_chunks_slice(range.clone()).unwrap().to_vec(),
+                    expected
+                );
+                assert_eq!(
+                    ready(slice.read_bytes_slice_async(range.clone()))
+                        .unwrap()
+                        .as_slice(),
+                    expected
+                );
+                assert_eq!(
+                    ready(slice.read_chunks_slice_async(range))
+                        .unwrap()
+                        .to_vec(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_slice_read_ranges_reject_invalid_bounds() {
+        for range in [std::ops::Range { start: 2, end: 1 }, 0..5, 0..usize::MAX] {
+            for method in 0..4 {
+                let range = range.clone();
+                assert!(std::panic::catch_unwind(|| {
+                    let slice = FileSlice::new(Arc::new(&b"abcdefgh"[..])).slice(2..6);
+                    match method {
+                        0 => {
+                            slice.read_bytes_slice(range).unwrap();
+                        }
+                        1 => {
+                            slice.read_chunks_slice(range).unwrap();
+                        }
+                        2 => {
+                            ready(slice.read_bytes_slice_async(range)).unwrap();
+                        }
+                        _ => {
+                            ready(slice.read_chunks_slice_async(range)).unwrap();
+                        }
+                    }
+                })
+                .is_err());
+            }
+        }
     }
 
     #[test]
