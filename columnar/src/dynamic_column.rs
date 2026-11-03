@@ -277,8 +277,8 @@ impl DynamicColumnHandle {
     pub fn open_u64_lenient(&self) -> io::Result<Option<Column<u64>>> {
         let column = match self.column_type {
             ColumnType::Str | ColumnType::Bytes => {
-                crate::column::open_column_bytes_from_slice(self.file_slice.clone())?
-                    .term_ord_column
+                let (_, ordinals) = crate::column::split_dictionary(self.file_slice.clone())?;
+                crate::column::open_column_u64_from_chunks(ordinals.read_chunks()?)?
             }
             ColumnType::IpAddr => {
                 crate::column::open_column_u128_as_compact_u64(self.file_slice.read_bytes()?)?
