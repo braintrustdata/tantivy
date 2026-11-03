@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 use std::ops::Range;
 
 use common::ChunkedBytes;
@@ -45,15 +45,7 @@ impl BlockReader {
     fn take_array<const N: usize>(&mut self) -> [u8; N] {
         let range = self.take_range(N);
         let mut bytes = [0u8; N];
-        match self.reader.contiguous_slice(range.clone()) {
-            Some(slice) => bytes.copy_from_slice(slice),
-            None => self
-                .reader
-                .slice(range)
-                .into_reader()
-                .read_exact(&mut bytes)
-                .expect("the taken range has exactly N bytes"),
-        }
+        self.reader.copy_to(range, &mut bytes);
         bytes
     }
 
@@ -108,10 +100,7 @@ impl BlockReader {
                 Some(compressed) => compressed,
                 None => {
                     self.compressed_block.resize(block_len, 0);
-                    self.reader
-                        .slice(block)
-                        .into_reader()
-                        .read_exact(&mut self.compressed_block)?;
+                    self.reader.copy_to(block, &mut self.compressed_block);
                     &self.compressed_block
                 }
             };
@@ -126,10 +115,7 @@ impl BlockReader {
             self.buffer.extend_from_slice(block);
         } else {
             self.buffer.resize(block_len, 0u8);
-            self.reader
-                .slice(block)
-                .into_reader()
-                .read_exact(&mut self.buffer[..])?;
+            self.reader.copy_to(block, &mut self.buffer);
         }
 
         Ok(true)
