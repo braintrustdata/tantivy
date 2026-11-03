@@ -40,6 +40,18 @@ pub use vec_column::VecColumn;
 pub use self::monotonic_column::monotonic_map_column;
 use crate::RowId;
 
+pub(crate) fn compact_column_bytes(bytes: common::ChunkedBytes) -> common::ChunkedBytes {
+    let retained_len = bytes
+        .chunks()
+        .map(|chunk| chunk.backing_len())
+        .max()
+        .unwrap_or(0);
+    if bytes.len() < retained_len / 4 {
+        return common::OwnedBytes::new(bytes.to_vec()).into();
+    }
+    bytes
+}
+
 /// `ColumnValues` provides access to a dense field column.
 ///
 /// `Column` are just a wrapper over `ColumnValues` and a `ColumnIndex`.
