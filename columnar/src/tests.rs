@@ -954,6 +954,7 @@ struct PagedFile {
 #[derive(Debug)]
 struct FailableFile {
     bytes: common::OwnedBytes,
+    forbidden: std::ops::Range<usize>,
     fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -968,7 +969,9 @@ impl common::file_slice::FileHandle for FailableFile {
     fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<common::OwnedBytes> {
         use std::sync::atomic::Ordering;
         self.reads.fetch_add(1, Ordering::Relaxed);
-        if self.fail.load(Ordering::Relaxed) {
+        if self.fail.load(Ordering::Relaxed)
+            || (range.start < self.forbidden.end && self.forbidden.start < range.end)
+        {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "read failed"));
         }
         Ok(self.bytes.slice(range))
@@ -995,6 +998,7 @@ fn test_dictionary_lookups_do_not_read_files_after_open() {
         let reads = Arc::new(AtomicUsize::new(0));
         handle.file_slice = common::file_slice::FileSlice::new(Arc::new(FailableFile {
             bytes: handle.file_slice.read_bytes().unwrap(),
+            forbidden: 0..0,
             fail: fail.clone(),
             reads: reads.clone(),
         }));
@@ -1020,6 +1024,39 @@ fn test_dictionary_lookups_do_not_read_files_after_open() {
             }
         }
         assert_eq!(reads.load(Ordering::Relaxed), reads_at_open);
+    }
+}
+
+#[test]
+fn test_lenient_ordinals_skip_dictionary_reads() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut writer = ColumnarWriter::default();
+    for (row, term) in [(0, "z"), (2, "a")] {
+        writer.record_str(row, "str", term);
+        writer.record_bytes(row, "bytes", term.as_bytes());
+    }
+    let mut buffer = Vec::new();
+    writer.serialize(3, None, &mut buffer).unwrap();
+    let reader = ColumnarReader::open(buffer).unwrap();
+    for name in ["str", "bytes"] {
+        let mut handle = reader.read_columns(name).unwrap().remove(0);
+        let bytes = handle.file_slice.read_bytes().unwrap();
+        let dictionary_len = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        let reads = Arc::new(AtomicUsize::new(0));
+        handle.file_slice = common::file_slice::FileSlice::new(Arc::new(FailableFile {
+            bytes,
+            forbidden: 0..dictionary_len as usize,
+            fail: Arc::new(AtomicBool::new(false)),
+            reads: reads.clone(),
+        }));
+        let ordinals = handle.open_u64_lenient().unwrap().unwrap();
+        assert_eq!(ordinals.first(0), Some(1));
+        assert_eq!(ordinals.first(1), None);
+        assert_eq!(ordinals.first(2), Some(0));
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert!(handle.open().is_err());
     }
 }
 

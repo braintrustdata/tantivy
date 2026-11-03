@@ -133,13 +133,17 @@ pub fn open_column_bytes(data: OwnedBytes) -> io::Result<BytesColumn> {
 
 /// Same as [`open_column_bytes`], but keeps the term ordinals in the chunks they were read as.
 pub fn open_column_bytes_from_slice(file_slice: FileSlice) -> io::Result<BytesColumn> {
-    let (body, dictionary_len) = file_slice.split_from_end(4);
-    let dictionary_len = u32::deserialize(&mut dictionary_len.read_bytes()?)? as usize;
-    let (dictionary, term_ord_column) = body.split(dictionary_len);
+    let (dictionary, term_ord_column) = split_dictionary(file_slice)?;
     Ok(BytesColumn {
         dictionary: Arc::new(Dictionary::from_bytes(dictionary.read_bytes()?)?),
         term_ord_column: open_column_u64_from_chunks(term_ord_column.read_chunks()?)?,
     })
+}
+
+pub(crate) fn split_dictionary(file_slice: FileSlice) -> io::Result<(FileSlice, FileSlice)> {
+    let (body, dictionary_len) = file_slice.split_from_end(4);
+    let dictionary_len = u32::deserialize(&mut dictionary_len.read_bytes()?)? as usize;
+    Ok(body.split(dictionary_len))
 }
 
 pub fn open_column_str(data: OwnedBytes) -> io::Result<StrColumn> {
