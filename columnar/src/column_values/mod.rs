@@ -31,13 +31,26 @@ pub use u128_based::{
     CompactSpaceU64Accessor,
 };
 pub use u64_based::{
-    load_u64_based_column_values, serialize_and_load_u64_based_column_values,
-    serialize_u64_based_column_values, CodecType, ALL_U64_CODEC_TYPES,
+    load_u64_based_column_values, load_u64_based_column_values_from_chunks,
+    serialize_and_load_u64_based_column_values, serialize_u64_based_column_values, CodecType,
+    ALL_U64_CODEC_TYPES,
 };
 pub use vec_column::VecColumn;
 
 pub use self::monotonic_column::monotonic_map_column;
 use crate::RowId;
+
+pub(crate) fn compact_column_bytes(bytes: common::ChunkedBytes) -> common::ChunkedBytes {
+    let retained_len = bytes
+        .chunks()
+        .map(|chunk| chunk.backing_len())
+        .max()
+        .unwrap_or(0);
+    if bytes.len() < retained_len / 4 {
+        return common::OwnedBytes::new(bytes.to_vec()).into();
+    }
+    bytes
+}
 
 /// `ColumnValues` provides access to a dense field column.
 ///

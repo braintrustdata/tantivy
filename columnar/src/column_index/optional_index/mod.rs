@@ -1,14 +1,12 @@
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::sync::Arc;
 
 mod set;
 mod set_block;
 
-use common::{BinarySerializable, OwnedBytes, VInt};
+use common::{BinarySerializable, ChunkedBytes, OwnedBytes, VInt};
 pub use set::{SelectCursor, Set, SetCodec};
-use set_block::{
-    DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec, DENSE_BLOCK_NUM_BYTES,
-};
+use set_block::{DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec};
 
 use crate::iterable::Iterable;
 use crate::{DocId, InvalidData, RowId};
@@ -82,8 +80,14 @@ impl BlockVariant {
 pub struct OptionalIndex {
     num_rows: RowId,
     num_non_null_rows: RowId,
-    block_data: OwnedBytes,
+    blocks: BlockData,
     block_metas: Arc<[BlockMeta]>,
+}
+
+#[derive(Clone)]
+enum BlockData {
+    Contiguous(OwnedBytes),
+    Paged(Arc<[OwnedBytes]>),
 }
 
 impl std::fmt::Debug for OptionalIndex {
@@ -151,7 +155,7 @@ impl<'a> OptionalIndexSelectCursor<'a> {
         self.block_doc_idx_start = (self.current_block_id as u32) * ELEMENTS_PER_BLOCK;
         let block_meta = self.optional_index.block_metas[self.current_block_id as usize];
         self.num_null_rows_before_block = block_meta.non_null_rows_before_block;
-        let block: Block<'_> = self.optional_index.block(block_meta);
+        let block: Block<'_> = self.optional_index.block(self.current_block_id as usize);
         self.current_block_cursor = match block {
             Block::Dense(dense_block) => BlockSelectCursor::Dense(dense_block.select_cursor()),
             Block::Sparse(sparse_block) => BlockSelectCursor::Sparse(sparse_block.select_cursor()),
@@ -168,7 +172,9 @@ impl<'a> SelectCursor<RowId> for OptionalIndexSelectCursor<'a> {
 }
 
 impl Set<RowId> for OptionalIndex {
-    type SelectCursor<'b> = OptionalIndexSelectCursor<'b> where Self: 'b;
+    type SelectCursor<'b>
+        = OptionalIndexSelectCursor<'b>
+    where Self: 'b;
     // Check if value at position is not null.
     #[inline]
     fn contains(&self, row_id: RowId) -> bool {
@@ -176,8 +182,7 @@ impl Set<RowId> for OptionalIndex {
             block_id,
             in_block_row_id,
         } = row_addr_from_row_id(row_id);
-        let block_meta = self.block_metas[block_id as usize];
-        match self.block(block_meta) {
+        match self.block(block_id as usize) {
             Block::Dense(dense_block) => dense_block.contains(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.contains(in_block_row_id),
         }
@@ -195,7 +200,7 @@ impl Set<RowId> for OptionalIndex {
             in_block_row_id,
         } = row_addr_from_row_id(doc_id);
         let block_meta = self.block_metas[block_id as usize];
-        let block = self.block(block_meta);
+        let block = self.block(block_id as usize);
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank(in_block_row_id),
@@ -212,7 +217,7 @@ impl Set<RowId> for OptionalIndex {
             in_block_row_id,
         } = row_addr_from_row_id(doc_id);
         let block_meta = *self.block_metas.get(block_id as usize)?;
-        let block = self.block(block_meta);
+        let block = self.block(block_id as usize);
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank_if_exists(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank_if_exists(in_block_row_id),
@@ -225,7 +230,7 @@ impl Set<RowId> for OptionalIndex {
         let block_pos = self.find_block(rank, 0);
         let block_doc_idx_start = (block_pos as u32) * ELEMENTS_PER_BLOCK;
         let block_meta = self.block_metas[block_pos as usize];
-        let block: Block<'_> = self.block(block_meta);
+        let block: Block<'_> = self.block(block_pos as usize);
         let index_in_block = (rank - block_meta.non_null_rows_before_block) as u16;
         let in_block_rank = match block {
             Block::Dense(dense_block) => dense_block.select(index_in_block),
@@ -282,23 +287,18 @@ impl OptionalIndex {
     }
 
     #[inline]
-    fn block(&self, block_meta: BlockMeta) -> Block<'_> {
-        let BlockMeta {
-            start_byte_offset,
-            block_variant,
-            ..
-        } = block_meta;
-        let start_byte_offset = start_byte_offset as usize;
-        let bytes = self.block_data.as_slice();
-        match block_variant {
-            BlockVariant::Dense => Block::Dense(DenseBlockCodec::open(
-                &bytes[start_byte_offset..start_byte_offset + DENSE_BLOCK_NUM_BYTES as usize],
-            )),
-            BlockVariant::Sparse { num_vals } => {
-                let end_byte_offset = start_byte_offset + num_vals as usize * 2;
-                let sparse_bytes = &bytes[start_byte_offset..end_byte_offset];
-                Block::Sparse(SparseBlockCodec::open(sparse_bytes))
+    fn block(&self, block_id: usize) -> Block<'_> {
+        let meta = self.block_metas[block_id];
+        let bytes = match &self.blocks {
+            BlockData::Contiguous(bytes) => {
+                let start = meta.start_byte_offset as usize;
+                &bytes[start..start + meta.block_variant.num_bytes_in_block() as usize]
             }
+            BlockData::Paged(blocks) => blocks[block_id].as_slice(),
+        };
+        match meta.block_variant {
+            BlockVariant::Dense => Block::Dense(DenseBlockCodec::open(bytes)),
+            BlockVariant::Sparse { .. } => Block::Sparse(SparseBlockCodec::open(bytes)),
         }
     }
 
@@ -506,23 +506,47 @@ fn deserialize_optional_index_block_metadatas(
     (block_metas.into_boxed_slice(), non_null_rows_before_block)
 }
 
-pub fn open_optional_index(bytes: OwnedBytes) -> io::Result<OptionalIndex> {
-    let (mut bytes, num_non_empty_blocks_bytes) = bytes.rsplit(2);
-    let num_non_empty_block_bytes =
-        u16::from_le_bytes(num_non_empty_blocks_bytes.as_slice().try_into().unwrap());
-    let num_rows = VInt::deserialize_u64(&mut bytes)? as u32;
-    let block_metas_num_bytes =
-        num_non_empty_block_bytes as usize * SERIALIZED_BLOCK_META_NUM_BYTES;
-    let (block_data, block_metas) = bytes.rsplit(block_metas_num_bytes);
-    let (block_metas, num_non_null_rows) =
-        deserialize_optional_index_block_metadatas(block_metas.as_slice(), num_rows);
-    let optional_index = OptionalIndex {
+pub fn open_optional_index(bytes: impl Into<ChunkedBytes>) -> io::Result<OptionalIndex> {
+    let bytes = bytes.into();
+    let body_len = bytes.len() - 2;
+    let num_non_empty_blocks =
+        u16::deserialize(&mut bytes.slice(body_len..bytes.len()).into_reader())?;
+    let mut body = bytes.slice(0..body_len).into_reader();
+    let num_rows = VInt::deserialize_u64(&mut body)? as u32;
+    let block_data_start = body.stream_position()? as usize;
+    let block_metas_start =
+        body_len - num_non_empty_blocks as usize * SERIALIZED_BLOCK_META_NUM_BYTES;
+    let (block_metas, num_non_null_rows) = deserialize_optional_index_block_metadatas(
+        bytes
+            .slice(block_metas_start..body_len)
+            .into_contiguous()
+            .as_slice(),
+        num_rows,
+    );
+    let data = crate::column_values::compact_column_bytes(
+        bytes.slice(block_data_start..block_metas_start),
+    );
+    let blocks = if data.contiguous_slice(0..data.len()).is_some() {
+        BlockData::Contiguous(data.into_contiguous())
+    } else {
+        BlockData::Paged(
+            block_metas
+                .iter()
+                .map(|block_meta| {
+                    let start = block_meta.start_byte_offset as usize;
+                    let end = start + block_meta.block_variant.num_bytes_in_block() as usize;
+                    crate::column_values::compact_column_bytes(data.slice(start..end))
+                        .into_contiguous()
+                })
+                .collect(),
+        )
+    };
+    Ok(OptionalIndex {
         num_rows,
         num_non_null_rows,
-        block_data,
+        blocks,
         block_metas: block_metas.into(),
-    };
-    Ok(optional_index)
+    })
 }
 
 #[cfg(test)]
