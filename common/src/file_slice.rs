@@ -34,11 +34,17 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
 
     /// Reads a slice of bytes as a list of buffers, without copying them together.
     ///
+    /// The default wraps [`FileHandle::read_bytes`] in a single chunk and may copy.
+    /// Wrapper handles must forward both this method and [`FileHandle::read_chunks_async`]
+    /// to preserve the underlying handle's chunked reads.
+    ///
     /// This method may panic if the range requested is invalid.
     fn read_chunks(&self, range: Range<usize>) -> io::Result<ChunkedBytes> {
         self.read_bytes(range).map(ChunkedBytes::from)
     }
 
+    /// Asynchronously reads chunks. The default wraps [`FileHandle::read_bytes_async`]
+    /// and may copy. Wrappers must forward this separately from [`FileHandle::read_chunks`].
     #[doc(hidden)]
     async fn read_chunks_async(&self, byte_range: Range<usize>) -> io::Result<ChunkedBytes> {
         self.read_bytes_async(byte_range)
