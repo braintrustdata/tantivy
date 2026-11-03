@@ -93,6 +93,7 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
     /// Load the first value for each docid in the provided slice.
     #[inline]
     pub fn first_vals(&self, docids: &[DocId], output: &mut [Option<T>]) {
+        debug_assert_eq!(docids.len(), output.len());
         match &self.index {
             ColumnIndex::Empty { .. } => {}
             ColumnIndex::Full => self.values.get_vals_opt(docids, output),
