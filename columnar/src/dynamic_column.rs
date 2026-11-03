@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 use common::file_slice::FileSlice;
-use common::{ByteCount, DateTime, HasLen, OwnedBytes};
+use common::{ByteCount, DateTime, HasLen};
 
 use crate::column::{BytesColumn, Column, StrColumn};
 use crate::column_values::{monotonic_map_column, StrictlyMonotonicFn};
@@ -245,7 +245,9 @@ impl DynamicColumnHandle {
                 self.file_slice.clone(),
             )?)
             .into(),
-            ColumnType::IpAddr => return self.open_internal(self.file_slice.read_bytes()?),
+            ColumnType::IpAddr => {
+                crate::column::open_column_u128::<Ipv6Addr>(self.file_slice.read_bytes()?)?.into()
+            }
             ColumnType::I64 => self.open_u64_from_chunks::<i64>()?.into(),
             ColumnType::U64 => self.open_u64_from_chunks::<u64>()?.into(),
             ColumnType::F64 => self.open_u64_from_chunks::<f64>()?.into(),
@@ -290,22 +292,6 @@ impl DynamicColumnHandle {
             | ColumnType::DateTime => self.open_u64_from_chunks()?,
         };
         Ok(Some(column))
-    }
-
-    fn open_internal(&self, column_bytes: OwnedBytes) -> io::Result<DynamicColumn> {
-        let dynamic_column: DynamicColumn = match self.column_type {
-            ColumnType::Bytes => crate::column::open_column_bytes(column_bytes)?.into(),
-            ColumnType::Str => crate::column::open_column_str(column_bytes)?.into(),
-            ColumnType::I64 => crate::column::open_column_u64::<i64>(column_bytes)?.into(),
-            ColumnType::U64 => crate::column::open_column_u64::<u64>(column_bytes)?.into(),
-            ColumnType::F64 => crate::column::open_column_u64::<f64>(column_bytes)?.into(),
-            ColumnType::Bool => crate::column::open_column_u64::<bool>(column_bytes)?.into(),
-            ColumnType::IpAddr => crate::column::open_column_u128::<Ipv6Addr>(column_bytes)?.into(),
-            ColumnType::DateTime => {
-                crate::column::open_column_u64::<DateTime>(column_bytes)?.into()
-            }
-        };
-        Ok(dynamic_column)
     }
 
     pub fn num_bytes(&self) -> ByteCount {
