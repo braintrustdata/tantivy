@@ -1,6 +1,6 @@
-use rand::Rng;
 use proptest::prelude::*;
 use proptest::{prop_oneof, proptest};
+use rand::Rng;
 
 #[test]
 fn test_serialize_and_load_simple() {
