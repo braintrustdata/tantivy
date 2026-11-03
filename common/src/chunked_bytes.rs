@@ -176,6 +176,18 @@ impl ChunkedBytes {
         }
     }
 
+    /// Appends a range to `output` without cloning the underlying buffers.
+    ///
+    /// Panics if `range` exceeds the view.
+    pub fn extend_into(&self, range: Range<usize>, output: &mut Vec<u8>) {
+        let len = range.len();
+        let slices = self.borrowed_slices(range);
+        output.reserve(len);
+        for slice in slices {
+            output.extend_from_slice(slice);
+        }
+    }
+
     /// Returns the bytes as one buffer, copying only when they span several chunks.
     pub fn to_contiguous(&self) -> OwnedBytes {
         match &self.0 {
@@ -206,9 +218,7 @@ impl ChunkedBytes {
     /// Copies the bytes into a new vector.
     pub fn to_vec(&self) -> Vec<u8> {
         let mut contents = Vec::with_capacity(self.len());
-        for slice in self.borrowed_slices(0..self.len()) {
-            contents.extend_from_slice(slice);
-        }
+        self.extend_into(0..self.len(), &mut contents);
         contents
     }
 
@@ -430,6 +440,10 @@ mod tests {
                     assert_eq!(copied, expected);
                     sliced.copy_to(0..sliced.len(), &mut copied);
                     assert_eq!(copied, expected);
+                    let mut extended = vec![255];
+                    sliced.extend_into(0..sliced.len(), &mut extended);
+                    assert_eq!(&extended[1..], expected);
+                    assert_eq!(extended[0], 255);
                     assert_eq!(sliced.to_contiguous().as_slice(), expected);
                     assert_eq!(sliced.clone().into_contiguous().as_slice(), expected);
                     assert_eq!(
