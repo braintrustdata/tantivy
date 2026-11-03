@@ -19,6 +19,29 @@ fn test_small_index_releases_cache_pages() {
 }
 
 #[test]
+fn test_optional_index_contiguous_and_paged_storage() {
+    let rows: Vec<u32> = (0..200_000).filter(|row| row % 3 == 0).collect();
+    let mut buffer = Vec::new();
+    serialize_optional_index(&&rows[..], 200_000, &mut buffer).unwrap();
+    let contiguous = open_optional_index(OwnedBytes::new(buffer.clone()).into()).unwrap();
+    assert!(matches!(contiguous.blocks, BlockData::Contiguous(_)));
+    let paged = open_optional_index(ChunkedBytes::new(
+        buffer
+            .chunks(4096)
+            .map(|page| OwnedBytes::new(page.to_vec()))
+            .collect(),
+    ))
+    .unwrap();
+    assert!(matches!(paged.blocks, BlockData::Paged(_)));
+    for index in [&contiguous, &paged] {
+        assert_eq!(index.iter_rows().collect::<Vec<_>>(), rows);
+        for row in 0..200_000 {
+            assert_eq!(index.contains(row), row % 3 == 0);
+        }
+    }
+}
+
+#[test]
 fn test_optional_index_bug_2293() {
     // tests for panic in docid_range_to_rowids for docid == num_docs
     test_optional_index_with_num_docs(ELEMENTS_PER_BLOCK - 1);
