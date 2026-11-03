@@ -54,6 +54,7 @@ pub(crate) struct PagedBytes {
 impl PagedBytes {
     /// Returns the bytes unchanged when they are one chunk or not split into equal pages.
     pub(crate) fn new(bytes: ChunkedBytes) -> Result<Self, ChunkedBytes> {
+        let bytes = crate::column_values::compact_column_bytes(bytes);
         let pages: Vec<OwnedBytes> = bytes.chunks().collect();
         let page_len = pages.iter().map(OwnedBytes::len).max().unwrap_or(0);
         let uniform = pages.len() > 1
@@ -175,6 +176,51 @@ mod tests {
         load_u64_based_column_values, load_u64_based_column_values_from_chunks,
         serialize_u64_based_column_values, ALL_U64_CODEC_TYPES,
     };
+
+    #[test]
+    fn small_columns_release_cache_pages() {
+        let values: Vec<u64> = (0..200).map(|i| i % 17).collect();
+        let mut buffer = Vec::new();
+        serialize_u64_based_column_values(
+            &&values[..],
+            &[super::super::CodecType::Bitpacked],
+            &mut buffer,
+        )
+        .unwrap();
+        let mid = buffer.len() / 2;
+        let mut pages = Vec::new();
+        let mut weak_pages = Vec::new();
+        for (part, start) in [(&buffer[..mid], (128 << 10) - mid), (&buffer[mid..], 0)] {
+            let mut page = vec![0u8; 128 << 10];
+            page[start..start + part.len()].copy_from_slice(part);
+            let page: std::sync::Arc<[u8]> = page.into();
+            weak_pages.push(std::sync::Arc::downgrade(&page));
+            pages.push(OwnedBytes::new(page).slice(start..start + part.len()));
+        }
+        let column =
+            load_u64_based_column_values_from_chunks::<u64>(ChunkedBytes::new(pages)).unwrap();
+        assert!(weak_pages.iter().all(|page| page.upgrade().is_none()));
+        for (idx, value) in values.into_iter().enumerate() {
+            assert_eq!(column.get_val(idx as u32), value);
+        }
+    }
+
+    #[test]
+    fn large_columns_retain_cache_pages() {
+        let pages: Vec<_> = (0..3)
+            .map(|_| OwnedBytes::new(vec![0u8; 128 << 10]))
+            .collect();
+        let pointers: Vec<_> = pages.iter().map(|page| page.as_ptr()).collect();
+        let paged = super::PagedBytes::new(ChunkedBytes::new(pages)).unwrap();
+        assert_eq!(
+            paged
+                .pages
+                .iter()
+                .map(|page| page.as_ptr())
+                .collect::<Vec<_>>(),
+            pointers
+        );
+    }
 
     fn paged(bytes: &OwnedBytes, offset: usize, page_size: usize) -> ChunkedBytes {
         let mut chunks = Vec::new();

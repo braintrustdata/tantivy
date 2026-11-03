@@ -515,7 +515,7 @@ pub fn open_optional_index(bytes: ChunkedBytes) -> io::Result<OptionalIndex> {
         .map(|block_meta| {
             let start = block_data_start + block_meta.start_byte_offset as usize;
             let end = start + block_meta.block_variant.num_bytes_in_block() as usize;
-            bytes.slice(start..end).into_contiguous()
+            crate::column_values::compact_column_bytes(bytes.slice(start..end)).into_contiguous()
         })
         .collect();
     Ok(OptionalIndex {
