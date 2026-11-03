@@ -51,7 +51,7 @@ pub fn open_column_u64<T: MonotonicallyMappableToU64>(bytes: OwnedBytes) -> io::
             .unwrap(),
     );
     let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
-    let column_index = crate::column_index::open_column_index(column_index_data.into())?;
+    let column_index = crate::column_index::open_column_index(column_index_data)?;
     let column_values = load_u64_based_column_values(column_values_data)?;
     Ok(Column {
         index: column_index,
@@ -91,7 +91,7 @@ pub fn open_column_u128<T: MonotonicallyMappableToU128>(
             .unwrap(),
     );
     let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
-    let column_index = crate::column_index::open_column_index(column_index_data.into())?;
+    let column_index = crate::column_index::open_column_index(column_index_data)?;
     let column_values = crate::column_values::open_u128_mapped(column_values_data)?;
     Ok(Column {
         index: column_index,
@@ -111,7 +111,7 @@ pub fn open_column_u128_as_compact_u64(bytes: OwnedBytes) -> io::Result<Column<u
             .unwrap(),
     );
     let (column_index_data, column_values_data) = body.split(column_index_num_bytes as usize);
-    let column_index = crate::column_index::open_column_index(column_index_data.into())?;
+    let column_index = crate::column_index::open_column_index(column_index_data)?;
     let column_values = crate::column_values::open_u128_as_compact_u64(column_values_data)?;
     Ok(Column {
         index: column_index,

@@ -263,7 +263,7 @@ impl OptionalIndex {
         let mut buffer = Vec::new();
         serialize_optional_index(&row_ids, num_rows, &mut buffer).unwrap();
         let bytes = OwnedBytes::new(buffer);
-        open_optional_index(bytes.into()).unwrap()
+        open_optional_index(bytes).unwrap()
     }
 
     pub fn num_docs(&self) -> RowId {
@@ -506,7 +506,8 @@ fn deserialize_optional_index_block_metadatas(
     (block_metas.into_boxed_slice(), non_null_rows_before_block)
 }
 
-pub fn open_optional_index(bytes: ChunkedBytes) -> io::Result<OptionalIndex> {
+pub fn open_optional_index(bytes: impl Into<ChunkedBytes>) -> io::Result<OptionalIndex> {
+    let bytes = bytes.into();
     let body_len = bytes.len() - 2;
     let num_non_empty_blocks =
         u16::deserialize(&mut bytes.slice(body_len..bytes.len()).into_reader())?;

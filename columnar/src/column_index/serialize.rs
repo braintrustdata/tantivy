@@ -53,7 +53,8 @@ pub fn serialize_column_index(
 }
 
 /// Open a serialized column index.
-pub fn open_column_index(bytes: ChunkedBytes) -> io::Result<ColumnIndex> {
+pub fn open_column_index(bytes: impl Into<ChunkedBytes>) -> io::Result<ColumnIndex> {
+    let bytes = bytes.into();
     let Some(&[cardinality_code]) = bytes.contiguous_slice(0..1.min(bytes.len())) else {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
