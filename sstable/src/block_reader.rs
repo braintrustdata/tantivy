@@ -99,8 +99,8 @@ impl BlockReader {
             let compressed = match self.reader.contiguous_slice(block.clone()) {
                 Some(compressed) => compressed,
                 None => {
-                    self.compressed_block.resize(block_len, 0);
-                    self.reader.copy_to(block, &mut self.compressed_block);
+                    self.compressed_block.clear();
+                    self.reader.extend_into(block, &mut self.compressed_block);
                     &self.compressed_block
                 }
             };
@@ -111,11 +111,8 @@ impl BlockReader {
                 slot @ None => slot.insert(Decompressor::new()?),
             };
             decompressor.decompress_to_buffer(compressed, &mut self.buffer)?;
-        } else if let Some(block) = self.reader.contiguous_slice(block.clone()) {
-            self.buffer.extend_from_slice(block);
         } else {
-            self.buffer.resize(block_len, 0u8);
-            self.reader.copy_to(block, &mut self.buffer);
+            self.reader.extend_into(block, &mut self.buffer);
         }
 
         Ok(true)
