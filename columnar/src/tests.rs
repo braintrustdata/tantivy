@@ -972,7 +972,7 @@ impl common::file_slice::FileHandle for FailableFile {
         if self.fail.load(Ordering::Relaxed)
             || (range.start < self.forbidden.end && self.forbidden.start < range.end)
         {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "read failed"));
+            return Err(std::io::Error::other("read failed"));
         }
         Ok(self.bytes.slice(range))
     }
@@ -1058,6 +1058,22 @@ fn test_lenient_ordinals_skip_dictionary_reads() {
         assert_eq!(reads.load(Ordering::Relaxed), 2);
         assert!(handle.open().is_err());
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn test_first_vals_rejects_short_output() {
+    let mut writer = ColumnarWriter::default();
+    writer.record_numerical(1, "optional", 7u64);
+    let mut buffer = Vec::new();
+    writer.serialize(3, None, &mut buffer).unwrap();
+    let reader = ColumnarReader::open(buffer).unwrap();
+    let column = reader.read_columns("optional").unwrap()[0]
+        .open_u64_lenient()
+        .unwrap()
+        .unwrap();
+    column.first_vals(&[1; 129], &mut []);
 }
 
 impl common::HasLen for PagedFile {
