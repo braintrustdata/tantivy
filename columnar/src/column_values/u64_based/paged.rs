@@ -136,35 +136,44 @@ impl ColumnData for PagedBytes {
             }
         };
         if num_bits == 0 {
-            return push_one_by_one(id_range, positions);
+            if range.contains(&0) {
+                positions.extend(id_range);
+            }
+            return;
         }
-        let end = id_range.end.min((self.len * 8 / num_bits) as u32);
-        let mut batch = Vec::new();
+        let end = id_range.end.min(value_count(self.len, num_bits));
         let mut idx = id_range.start;
         while idx < end {
             // Every 8th value starts on a byte, so groups of 8 can be decoded from one page.
             let (page, _) = self.locate(idx as usize * num_bits / 8);
             let page_end = ((page + 1) * self.page_len - self.skip).min(self.len);
-            let lo = idx.next_multiple_of(8);
-            let hi = ((page_end * 8 / num_bits) as u32 & !7).min(end);
+            let lo = idx.checked_next_multiple_of(8).unwrap_or(end);
+            let hi = (value_count(page_end, num_bits) & !7).min(end);
             if lo >= hi {
-                let next = (lo + 8).min(end);
+                let next = lo.saturating_add(8).min(end);
                 push_one_by_one(idx..next, positions);
                 idx = next;
                 continue;
             }
             push_one_by_one(idx..lo, positions);
             let (_, offset) = self.locate(lo as usize * num_bits / 8);
-            bit_unpacker.get_ids_for_value_range(
+            let start = positions.len();
+            bit_unpacker.append_ids_for_value_range(
                 range.clone(),
                 0..hi - lo,
                 &self.pages[page].as_slice()[offset..],
-                &mut batch,
+                positions,
             );
-            positions.extend(batch.iter().map(|id| id + lo));
+            for id in &mut positions[start..] {
+                *id += lo;
+            }
             idx = hi;
         }
     }
+}
+
+fn value_count(num_bytes: usize, num_bits: usize) -> u32 {
+    ((num_bytes as u64).saturating_mul(8) / num_bits as u64).min(u32::MAX as u64) as u32
 }
 
 #[cfg(test)]
@@ -176,6 +185,29 @@ mod tests {
         load_u64_based_column_values, load_u64_based_column_values_from_chunks,
         serialize_u64_based_column_values, ALL_U64_CODEC_TYPES,
     };
+
+    #[test]
+    fn constant_ranges_and_large_value_counts() {
+        use super::ColumnData;
+        let paged = super::PagedBytes::new(ChunkedBytes::new(vec![
+            OwnedBytes::new(vec![0u8; 8]),
+            OwnedBytes::new(vec![0u8; 8]),
+        ]))
+        .unwrap();
+        let unpacker = tantivy_bitpacker::BitUnpacker::new(0);
+        let mut positions = vec![99];
+        paged.get_ids_for_value_range(&unpacker, 0..=0, 7..19, &mut positions);
+        assert_eq!(positions, (7..19).collect::<Vec<_>>());
+        paged.get_ids_for_value_range(&unpacker, 1..=9, 0..u32::MAX, &mut positions);
+        assert!(positions.is_empty());
+        assert_eq!(super::value_count(100, 3), 266);
+        #[cfg(target_pointer_width = "64")]
+        for bits in [1, 8, 32, 64] {
+            let num_bytes = (u32::MAX as usize * bits).div_ceil(8) + 1;
+            assert_eq!(super::value_count(num_bytes, bits), u32::MAX);
+            assert_eq!(super::value_count(usize::MAX, bits), u32::MAX);
+        }
+    }
 
     #[test]
     fn small_columns_release_cache_pages() {
