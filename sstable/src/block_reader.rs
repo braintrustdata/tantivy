@@ -1,30 +1,52 @@
-use std::io::{self, Read};
+use std::io;
 use std::ops::Range;
 
-use common::OwnedBytes;
+use common::ChunkedBytes;
 use zstd::bulk::Decompressor;
 
 pub struct BlockReader {
     buffer: Vec<u8>,
+    compressed_block: Vec<u8>,
     decompressor: Option<Decompressor<'static>>,
-    reader: OwnedBytes,
+    reader: ChunkedBytes,
+    position: usize,
     offset: usize,
 }
 
 impl BlockReader {
-    pub fn new(reader: OwnedBytes) -> BlockReader {
+    pub fn new(reader: impl Into<ChunkedBytes>) -> BlockReader {
         BlockReader {
             buffer: Vec::new(),
+            compressed_block: Vec::new(),
             decompressor: None,
-            reader,
+            reader: reader.into(),
+            position: 0,
             offset: 0,
         }
     }
 
-    pub(crate) fn reset(&mut self, reader: OwnedBytes) {
+    pub(crate) fn reset(&mut self, reader: impl Into<ChunkedBytes>) {
         self.buffer.clear();
-        self.reader = reader;
+        self.reader = reader.into();
+        self.position = 0;
         self.offset = 0;
+    }
+
+    fn remaining(&self) -> usize {
+        self.reader.len() - self.position
+    }
+
+    fn take_range(&mut self, len: usize) -> Range<usize> {
+        let range = self.position..self.position + len;
+        self.position = range.end;
+        range
+    }
+
+    fn take_array<const N: usize>(&mut self) -> [u8; N] {
+        let range = self.take_range(N);
+        let mut bytes = [0u8; N];
+        self.reader.copy_to(range, &mut bytes);
+        bytes
     }
 
     pub fn deserialize_u64(&mut self) -> u64 {
@@ -41,8 +63,17 @@ impl BlockReader {
     pub fn read_block(&mut self) -> io::Result<bool> {
         self.offset = 0;
         self.buffer.clear();
+        let position = self.position;
+        let result = self.read_block_inner();
+        if result.is_err() {
+            self.position = position;
+            self.buffer.clear();
+        }
+        result
+    }
 
-        let block_len = match self.reader.len() {
+    fn read_block_inner(&mut self) -> io::Result<bool> {
+        let block_len = match self.remaining() {
             0 => return Ok(false),
             1..=3 => {
                 return Err(io::Error::new(
@@ -50,34 +81,38 @@ impl BlockReader {
                     "failed to read block_len",
                 ))
             }
-            _ => self.reader.read_u32() as usize,
+            _ => u32::from_le_bytes(self.take_array()) as usize,
         };
         if block_len <= 1 {
             return Ok(false);
         }
-        let compress = self.reader.read_u8();
-        let block_len = block_len - 1;
-
-        if self.reader.len() < block_len {
+        if self.remaining() < block_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "failed to read block content",
             ));
         }
+        let [compress] = self.take_array();
+        let block_len = block_len - 1;
+        let block = self.take_range(block_len);
         if compress == 1 {
-            let required_capacity =
-                Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
+            let compressed = match self.reader.contiguous_slice(block.clone()) {
+                Some(compressed) => compressed,
+                None => {
+                    self.compressed_block.clear();
+                    self.reader.extend_into(block, &mut self.compressed_block);
+                    &self.compressed_block
+                }
+            };
+            let required_capacity = Decompressor::upper_bound(compressed).unwrap_or(1024 * 1024);
             self.buffer.reserve(required_capacity);
             let decompressor = match &mut self.decompressor {
                 Some(decompressor) => decompressor,
                 slot @ None => slot.insert(Decompressor::new()?),
             };
-            decompressor.decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
-
-            self.reader.advance(block_len);
+            decompressor.decompress_to_buffer(compressed, &mut self.buffer)?;
         } else {
-            self.buffer.resize(block_len, 0u8);
-            self.reader.read_exact(&mut self.buffer[..])?;
+            self.reader.extend_into(block, &mut self.buffer);
         }
 
         Ok(true)
@@ -107,7 +142,7 @@ impl io::Read for BlockReader {
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        let len = self.buffer.len();
+        let len = self.buffer().len();
         buf.extend_from_slice(self.buffer());
         self.advance(len);
         Ok(len)
@@ -122,6 +157,10 @@ impl io::Read for BlockReader {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
+    use common::OwnedBytes;
+
     use super::*;
 
     fn block(data: &[u8], compressed: bool) -> OwnedBytes {
@@ -167,6 +206,119 @@ mod tests {
         reader.reset(block(&large, true));
         assert!(reader.read_block().unwrap());
         assert_eq!(reader.buffer(), large);
+    }
+
+    #[test]
+    fn test_blocks_split_across_chunks_read_like_contiguous_blocks() {
+        let blocks = [
+            (b"plain block".to_vec(), false),
+            ((0..4096).map(|i| (i % 7) as u8).collect::<Vec<_>>(), true),
+            (b"tail".to_vec(), false),
+        ];
+        let encoded: Vec<u8> = blocks
+            .iter()
+            .flat_map(|(data, compressed)| block(data, *compressed).to_vec())
+            .collect();
+        for chunk_len in [1, 2, 3, 5, 7, 64, 1000, encoded.len()] {
+            let mut reader = BlockReader::new(ChunkedBytes::new(
+                encoded
+                    .chunks(chunk_len)
+                    .map(|chunk| OwnedBytes::new(chunk.to_vec()))
+                    .collect(),
+            ));
+            for (data, _) in &blocks {
+                assert!(reader.read_block().unwrap(), "chunk_len={chunk_len}");
+                assert_eq!(reader.buffer(), data.as_slice(), "chunk_len={chunk_len}");
+            }
+            assert!(!reader.read_block().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_decompression_error_is_repeated_without_skipping_block() {
+        let mut invalid = block(b"not a zstd frame", false).to_vec();
+        invalid[4] = 1;
+        invalid.extend_from_slice(&block(b"valid next block", true));
+        for chunk_len in [1, 3, invalid.len()] {
+            let mut reader = BlockReader::new(ChunkedBytes::new(
+                invalid
+                    .chunks(chunk_len)
+                    .map(|chunk| OwnedBytes::new(chunk.to_vec()))
+                    .collect(),
+            ));
+            for _ in 0..3 {
+                assert!(reader.read_block().is_err());
+                assert!(reader.buffer().is_empty());
+                assert_eq!(reader.position, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_truncated_block_returns_unexpected_eof() {
+        let encoded = block(b"payload", false);
+        for end in 1..encoded.len() {
+            for chunk_len in [1, 3, encoded.len()] {
+                let mut reader = BlockReader::new(ChunkedBytes::new(
+                    encoded[..end]
+                        .chunks(chunk_len)
+                        .map(|chunk| OwnedBytes::new(chunk.to_vec()))
+                        .collect(),
+                ));
+                for _ in 0..2 {
+                    assert_eq!(
+                        reader.read_block().unwrap_err().kind(),
+                        io::ErrorKind::UnexpectedEof
+                    );
+                    assert!(reader.buffer().is_empty());
+                    assert_eq!(reader.position, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_straddling_compressed_blocks_reuse_scratch_storage() {
+        let data = vec![b'a'; 4096];
+        let encoded = block(&data, true);
+        let input = ChunkedBytes::new(
+            encoded
+                .iter()
+                .map(|&byte| OwnedBytes::new(vec![byte]))
+                .collect(),
+        );
+        let mut reader = BlockReader::new(input.clone());
+        assert!(reader.read_block().unwrap());
+        assert_eq!(reader.buffer(), data);
+        assert_eq!(reader.compressed_block.len(), encoded.len() - 5);
+        let ptr = reader.compressed_block.as_ptr();
+        let capacity = reader.compressed_block.capacity();
+        for _ in 0..3 {
+            reader.reset(input.clone());
+            assert!(reader.read_block().unwrap());
+            assert_eq!(reader.buffer(), data);
+            assert_eq!(reader.compressed_block.as_ptr(), ptr);
+            assert_eq!(reader.compressed_block.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn test_read_to_end_after_partial_read() {
+        for compressed in [false, true] {
+            for consumed in 0..=7 {
+                let mut reader = BlockReader::new(block(b"payload", compressed));
+                assert!(reader.read_block().unwrap());
+                reader.read_exact(&mut vec![0; consumed]).unwrap();
+                let mut output = vec![255];
+                assert_eq!(reader.read_to_end(&mut output).unwrap(), 7 - consumed);
+                assert_eq!(&output[1..], &b"payload"[consumed..]);
+                assert_eq!(reader.offset(), 7);
+                assert!(reader.buffer().is_empty());
+                assert_eq!(reader.read_to_end(&mut output).unwrap(), 0);
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                assert!(!reader.read_block().unwrap());
+            }
+        }
     }
 
     #[test]
