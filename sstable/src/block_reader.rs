@@ -142,7 +142,7 @@ impl io::Read for BlockReader {
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        let len = self.buffer.len();
+        let len = self.buffer().len();
         buf.extend_from_slice(self.buffer());
         self.advance(len);
         Ok(len)
@@ -157,6 +157,8 @@ impl io::Read for BlockReader {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use common::OwnedBytes;
 
     use super::*;
@@ -297,6 +299,25 @@ mod tests {
             assert_eq!(reader.buffer(), data);
             assert_eq!(reader.compressed_block.as_ptr(), ptr);
             assert_eq!(reader.compressed_block.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn test_read_to_end_after_partial_read() {
+        for compressed in [false, true] {
+            for consumed in 0..=7 {
+                let mut reader = BlockReader::new(block(b"payload", compressed));
+                assert!(reader.read_block().unwrap());
+                reader.read_exact(&mut vec![0; consumed]).unwrap();
+                let mut output = vec![255];
+                assert_eq!(reader.read_to_end(&mut output).unwrap(), 7 - consumed);
+                assert_eq!(&output[1..], &b"payload"[consumed..]);
+                assert_eq!(reader.offset(), 7);
+                assert!(reader.buffer().is_empty());
+                assert_eq!(reader.read_to_end(&mut output).unwrap(), 0);
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                assert!(!reader.read_block().unwrap());
+            }
         }
     }
 
