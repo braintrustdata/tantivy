@@ -70,7 +70,16 @@ impl BlockReader {
     pub fn read_block(&mut self) -> io::Result<bool> {
         self.offset = 0;
         self.buffer.clear();
+        let position = self.position;
+        let result = self.read_block_inner();
+        if result.is_err() {
+            self.position = position;
+            self.buffer.clear();
+        }
+        result
+    }
 
+    fn read_block_inner(&mut self) -> io::Result<bool> {
         let block_len = match self.remaining() {
             0 => return Ok(false),
             1..=3 => {
@@ -230,6 +239,26 @@ mod tests {
                 assert_eq!(reader.buffer(), data.as_slice(), "chunk_len={chunk_len}");
             }
             assert!(!reader.read_block().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_decompression_error_is_repeated_without_skipping_block() {
+        let mut invalid = block(b"not a zstd frame", false).to_vec();
+        invalid[4] = 1;
+        invalid.extend_from_slice(&block(b"valid next block", true));
+        for chunk_len in [1, 3, invalid.len()] {
+            let mut reader = BlockReader::new(ChunkedBytes::new(
+                invalid
+                    .chunks(chunk_len)
+                    .map(|chunk| OwnedBytes::new(chunk.to_vec()))
+                    .collect(),
+            ));
+            for _ in 0..3 {
+                assert!(reader.read_block().is_err());
+                assert!(reader.buffer().is_empty());
+                assert_eq!(reader.position, 0);
+            }
         }
     }
 
