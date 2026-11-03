@@ -13,7 +13,7 @@ fn test_small_index_releases_cache_pages() {
     let page: std::sync::Arc<[u8]> = page.into();
     let weak = std::sync::Arc::downgrade(&page);
     let bytes = OwnedBytes::new(page).slice(100..100 + buffer.len());
-    let index = open_optional_index(bytes.into()).unwrap();
+    let index = open_optional_index(bytes).unwrap();
     assert!(weak.upgrade().is_none());
     assert_eq!(index.iter_rows().collect::<Vec<_>>(), [1, 3, 5]);
 }
@@ -23,7 +23,7 @@ fn test_optional_index_contiguous_and_paged_storage() {
     let rows: Vec<u32> = (0..200_000).filter(|row| row % 3 == 0).collect();
     let mut buffer = Vec::new();
     serialize_optional_index(&&rows[..], 200_000, &mut buffer).unwrap();
-    let contiguous = open_optional_index(OwnedBytes::new(buffer.clone()).into()).unwrap();
+    let contiguous = open_optional_index(OwnedBytes::new(buffer.clone())).unwrap();
     assert!(matches!(contiguous.blocks, BlockData::Contiguous(_)));
     let paged = open_optional_index(ChunkedBytes::new(
         buffer
@@ -98,7 +98,7 @@ fn test_with_random_sets_simple() {
     let vals = 10..ELEMENTS_PER_BLOCK * 2;
     let mut out: Vec<u8> = Vec::new();
     serialize_optional_index(&vals, 100, &mut out).unwrap();
-    let null_index = open_optional_index(OwnedBytes::new(out).into()).unwrap();
+    let null_index = open_optional_index(OwnedBytes::new(out)).unwrap();
     let ranks: Vec<u32> = (65_472u32..65_473u32).collect();
     let els: Vec<u32> = ranks.iter().copied().map(|rank| rank + 10).collect();
     let mut select_cursor = null_index.select_cursor();
@@ -141,7 +141,7 @@ impl<'a> Iterable<RowId> for &'a [bool] {
 fn test_null_index(data: &[bool]) {
     let mut out: Vec<u8> = Vec::new();
     serialize_optional_index(&data, data.len() as RowId, &mut out).unwrap();
-    let null_index = open_optional_index(OwnedBytes::new(out).into()).unwrap();
+    let null_index = open_optional_index(OwnedBytes::new(out)).unwrap();
     let orig_idx_with_value: Vec<u32> = data
         .iter()
         .enumerate()
@@ -280,7 +280,7 @@ mod bench {
             .collect();
         serialize_optional_index(&&vals[..], TOTAL_NUM_VALUES, &mut out).unwrap();
 
-        open_optional_index(OwnedBytes::new(out).into()).unwrap()
+        open_optional_index(OwnedBytes::new(out)).unwrap()
     }
 
     fn random_range_iterator(
