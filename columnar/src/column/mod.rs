@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use common::BinarySerializable;
 pub use dictionary_encoded::{BytesColumn, StrColumn};
+pub(crate) use serialize::split_dictionary;
 pub use serialize::{
     open_column_bytes, open_column_bytes_from_slice, open_column_str, open_column_u128,
     open_column_u128_as_compact_u64, open_column_u64, open_column_u64_from_chunks,
