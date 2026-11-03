@@ -5,6 +5,20 @@ use super::*;
 use crate::{ColumnarReader, ColumnarWriter, DynamicColumnHandle};
 
 #[test]
+fn test_small_index_releases_cache_pages() {
+    let mut buffer = Vec::new();
+    serialize_optional_index(&&[1u32, 3, 5][..], 10, &mut buffer).unwrap();
+    let mut page = vec![0u8; 128 << 10];
+    page[100..100 + buffer.len()].copy_from_slice(&buffer);
+    let page: std::sync::Arc<[u8]> = page.into();
+    let weak = std::sync::Arc::downgrade(&page);
+    let bytes = OwnedBytes::new(page).slice(100..100 + buffer.len());
+    let index = open_optional_index(bytes.into()).unwrap();
+    assert!(weak.upgrade().is_none());
+    assert_eq!(index.iter_rows().collect::<Vec<_>>(), [1, 3, 5]);
+}
+
+#[test]
 fn test_optional_index_bug_2293() {
     // tests for panic in docid_range_to_rowids for docid == num_docs
     test_optional_index_with_num_docs(ELEMENTS_PER_BLOCK - 1);

@@ -56,6 +56,12 @@ impl OwnedBytes {
         self.data.len()
     }
 
+    /// Returns the length of the backing slice retained by this view.
+    /// This can exceed [`Self::len`] after slicing or splitting.
+    pub fn backing_len(&self) -> usize {
+        self.box_stable_deref.len()
+    }
+
     /// Returns true iff this `OwnedBytes` is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -329,6 +335,8 @@ mod tests {
         let (left, right) = bytes.split(3);
         assert_eq!(left.as_slice(), b"abc");
         assert_eq!(right.as_slice(), b"defghi");
+        assert_eq!(left.backing_len(), 9);
+        assert_eq!(right.backing_len(), 9);
     }
 
     #[test]

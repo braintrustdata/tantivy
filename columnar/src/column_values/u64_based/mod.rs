@@ -217,6 +217,8 @@ macro_rules! paged_or_contiguous {
 ///
 /// The values are read from the pages in place when they are split into equal pages, and are
 /// copied into one buffer otherwise.
+/// Small columns are also copied when their bytes occupy less than a quarter of a backing
+/// buffer, so opening them does not retain oversized cache pages.
 pub fn load_u64_based_column_values_from_chunks<T: MonotonicallyMappableToU64>(
     bytes: ChunkedBytes,
 ) -> io::Result<Arc<dyn ColumnValues<T>>> {
