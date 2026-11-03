@@ -80,9 +80,14 @@ impl BlockVariant {
 pub struct OptionalIndex {
     num_rows: RowId,
     num_non_null_rows: RowId,
-    // One slice per block, so a block read from pages is copied only when it spans two pages.
-    blocks: Arc<[OwnedBytes]>,
+    blocks: BlockData,
     block_metas: Arc<[BlockMeta]>,
+}
+
+#[derive(Clone)]
+enum BlockData {
+    Contiguous(OwnedBytes),
+    Paged(Arc<[OwnedBytes]>),
 }
 
 impl std::fmt::Debug for OptionalIndex {
@@ -283,8 +288,15 @@ impl OptionalIndex {
 
     #[inline]
     fn block(&self, block_id: usize) -> Block<'_> {
-        let bytes = self.blocks[block_id].as_slice();
-        match self.block_metas[block_id].block_variant {
+        let meta = self.block_metas[block_id];
+        let bytes = match &self.blocks {
+            BlockData::Contiguous(bytes) => {
+                let start = meta.start_byte_offset as usize;
+                &bytes[start..start + meta.block_variant.num_bytes_in_block() as usize]
+            }
+            BlockData::Paged(blocks) => blocks[block_id].as_slice(),
+        };
+        match meta.block_variant {
             BlockVariant::Dense => Block::Dense(DenseBlockCodec::open(bytes)),
             BlockVariant::Sparse { .. } => Block::Sparse(SparseBlockCodec::open(bytes)),
         }
@@ -510,14 +522,24 @@ pub fn open_optional_index(bytes: ChunkedBytes) -> io::Result<OptionalIndex> {
             .as_slice(),
         num_rows,
     );
-    let blocks = block_metas
-        .iter()
-        .map(|block_meta| {
-            let start = block_data_start + block_meta.start_byte_offset as usize;
-            let end = start + block_meta.block_variant.num_bytes_in_block() as usize;
-            crate::column_values::compact_column_bytes(bytes.slice(start..end)).into_contiguous()
-        })
-        .collect();
+    let data = crate::column_values::compact_column_bytes(
+        bytes.slice(block_data_start..block_metas_start),
+    );
+    let blocks = if data.contiguous_slice(0..data.len()).is_some() {
+        BlockData::Contiguous(data.into_contiguous())
+    } else {
+        BlockData::Paged(
+            block_metas
+                .iter()
+                .map(|block_meta| {
+                    let start = block_meta.start_byte_offset as usize;
+                    let end = start + block_meta.block_variant.num_bytes_in_block() as usize;
+                    crate::column_values::compact_column_bytes(data.slice(start..end))
+                        .into_contiguous()
+                })
+                .collect(),
+        )
+    };
     Ok(OptionalIndex {
         num_rows,
         num_non_null_rows,
