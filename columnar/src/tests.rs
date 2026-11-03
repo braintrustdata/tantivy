@@ -951,6 +951,78 @@ struct PagedFile {
     page_size: usize,
 }
 
+#[derive(Debug)]
+struct FailableFile {
+    bytes: common::OwnedBytes,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl common::HasLen for FailableFile {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl common::file_slice::FileHandle for FailableFile {
+    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<common::OwnedBytes> {
+        use std::sync::atomic::Ordering;
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if self.fail.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "read failed"));
+        }
+        Ok(self.bytes.slice(range))
+    }
+}
+
+#[test]
+fn test_dictionary_lookups_do_not_read_files_after_open() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut writer = ColumnarWriter::default();
+    for row in 0..10_000 {
+        let term = format!("term-{row:05}");
+        writer.record_str(row, "str", &term);
+        writer.record_bytes(row, "bytes", term.as_bytes());
+    }
+    let mut buffer = Vec::new();
+    writer.serialize(10_000, None, &mut buffer).unwrap();
+    let reader = ColumnarReader::open(buffer).unwrap();
+    for name in ["str", "bytes"] {
+        let mut handle = reader.read_columns(name).unwrap().remove(0);
+        let fail = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        handle.file_slice = common::file_slice::FileSlice::new(Arc::new(FailableFile {
+            bytes: handle.file_slice.read_bytes().unwrap(),
+            fail: fail.clone(),
+            reads: reads.clone(),
+        }));
+        assert_eq!(handle.open().unwrap_err().kind(), std::io::ErrorKind::Other);
+        fail.store(false, Ordering::Relaxed);
+        let column = handle.open().unwrap();
+        let reads_at_open = reads.load(Ordering::Relaxed);
+        fail.store(true, Ordering::Relaxed);
+        let mut output = Vec::new();
+        let mut str_output = String::new();
+        for ord in 0..10_000 {
+            let expected = format!("term-{ord:05}");
+            match &column {
+                DynamicColumn::Bytes(column) => {
+                    assert!(column.ord_to_bytes(ord, &mut output).unwrap());
+                    assert_eq!(output, expected.as_bytes());
+                }
+                DynamicColumn::Str(column) => {
+                    assert!(column.ord_to_str(ord, &mut str_output).unwrap());
+                    assert_eq!(str_output, expected);
+                }
+                _ => panic!("expected a dictionary column"),
+            }
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), reads_at_open);
+    }
+}
+
 impl common::HasLen for PagedFile {
     fn len(&self) -> usize {
         self.bytes.len()
