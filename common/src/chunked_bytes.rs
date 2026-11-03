@@ -135,6 +135,47 @@ impl ChunkedBytes {
         )
     }
 
+    fn borrowed_slices(&self, range: Range<usize>) -> impl Iterator<Item = &[u8]> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        let (contiguous, chunked) = match &self.0 {
+            Repr::Contiguous(bytes) => (Some(&bytes[range]), None),
+            Repr::Chunked {
+                chunks,
+                range: current,
+            } => (
+                None,
+                Some((
+                    chunks,
+                    current.start + range.start..current.start + range.end,
+                )),
+            ),
+        };
+        contiguous
+            .into_iter()
+            .chain(chunked.into_iter().flat_map(|(chunks, range)| {
+                chunks[chunk_index(chunks, range.start)..]
+                    .iter()
+                    .take_while(move |chunk| range.start < range.end && chunk.start < range.end)
+                    .map(move |chunk| {
+                        let start = range.start.saturating_sub(chunk.start);
+                        let end = (range.end - chunk.start).min(chunk.bytes.len());
+                        &chunk.bytes[start..end]
+                    })
+            }))
+    }
+
+    /// Copies a range into `output` without cloning the underlying buffers.
+    ///
+    /// Panics if `range` exceeds the view or its length differs from `output.len()`.
+    pub fn copy_to(&self, range: Range<usize>, mut output: &mut [u8]) {
+        assert_eq!(range.len(), output.len());
+        for slice in self.borrowed_slices(range) {
+            let (head, tail) = output.split_at_mut(slice.len());
+            head.copy_from_slice(slice);
+            output = tail;
+        }
+    }
+
     /// Returns the bytes as one buffer, copying only when they span several chunks.
     pub fn to_contiguous(&self) -> OwnedBytes {
         match &self.0 {
@@ -165,8 +206,8 @@ impl ChunkedBytes {
     /// Copies the bytes into a new vector.
     pub fn to_vec(&self) -> Vec<u8> {
         let mut contents = Vec::with_capacity(self.len());
-        for chunk in self.chunks() {
-            contents.extend_from_slice(chunk.as_slice());
+        for slice in self.borrowed_slices(0..self.len()) {
+            contents.extend_from_slice(slice);
         }
         contents
     }
@@ -384,6 +425,11 @@ mod tests {
                     let sliced = bytes.slice(start..end);
                     assert_eq!(sliced.len(), expected.len());
                     assert_eq!(sliced.to_vec(), expected);
+                    let mut copied = vec![0; expected.len()];
+                    bytes.copy_to(start..end, &mut copied);
+                    assert_eq!(copied, expected);
+                    sliced.copy_to(0..sliced.len(), &mut copied);
+                    assert_eq!(copied, expected);
                     assert_eq!(sliced.to_contiguous().as_slice(), expected);
                     assert_eq!(sliced.clone().into_contiguous().as_slice(), expected);
                     assert_eq!(
@@ -413,6 +459,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn copies_reject_invalid_ranges_and_output_lengths() {
+        for range in [Range { start: 2, end: 1 }, 0..4, usize::MAX..usize::MAX] {
+            assert!(std::panic::catch_unwind(|| {
+                let bytes =
+                    ChunkedBytes::new(vec![OwnedBytes::new(vec![1, 2]), OwnedBytes::new(vec![3])]);
+                bytes.copy_to(range, &mut []);
+            })
+            .is_err());
+        }
+        assert!(std::panic::catch_unwind(|| {
+            let bytes = ChunkedBytes::from(OwnedBytes::new(vec![1, 2, 3]));
+            bytes.copy_to(0..2, &mut [0]);
+        })
+        .is_err());
     }
 
     #[test]
