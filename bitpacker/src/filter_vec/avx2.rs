@@ -22,7 +22,13 @@ unsafe fn u32_to_i32_avx2(vals_u32x8s: DataType) -> DataType {
     op_xor(vals_u32x8s, HIGHEST_BIT_MASK)
 }
 
+#[cfg(test)]
 pub fn filter_vec_in_place(range: RangeInclusive<u32>, offset: u32, output: &mut Vec<u32>) {
+    let len = filter_slice_in_place(range, offset, output);
+    output.truncate(len);
+}
+
+pub fn filter_slice_in_place(range: RangeInclusive<u32>, offset: u32, output: &mut [u32]) -> usize {
     // We use a monotonic mapping from u32 to i32 to make the comparison possible in AVX2.
     let range_i32: RangeInclusive<i32> = u32_to_i32(*range.start())..=u32_to_i32(*range.end());
     let num_words = output.len() / NUM_LANES;
@@ -41,7 +47,7 @@ pub fn filter_vec_in_place(range: RangeInclusive<u32>, offset: u32, output: &mut
         output[output_len] = offset + i as u32;
         output_len += if range.contains(&val) { 1 } else { 0 };
     }
-    output.truncate(output_len);
+    output_len
 }
 
 #[target_feature(enable = "avx2")]

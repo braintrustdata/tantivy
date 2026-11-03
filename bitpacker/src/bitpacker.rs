@@ -207,52 +207,64 @@ impl BitUnpacker {
         data: &[u8],
         positions: &mut Vec<u32>,
     ) {
-        if self.bit_width() > 32 {
-            self.get_ids_for_value_range_slow(range, id_range, data, positions)
-        } else {
-            if *range.start() > u32::MAX as u64 {
-                positions.clear();
-                return;
-            }
-            let range_u32 = (*range.start() as u32)..=(*range.end()).min(u32::MAX as u64) as u32;
-            self.get_ids_for_value_range_fast(range_u32, id_range, data, positions)
-        }
+        positions.clear();
+        self.append_ids_for_value_range(range, id_range, data, positions);
     }
 
-    fn get_ids_for_value_range_slow(
+    /// Appends matching row IDs, reusing the output buffer for decoding and filtering.
+    pub fn append_ids_for_value_range(
         &self,
         range: RangeInclusive<u64>,
         id_range: Range<u32>,
         data: &[u8],
         positions: &mut Vec<u32>,
     ) {
-        positions.clear();
-        for i in id_range {
-            // If we cared we could make this branchless, but the slow implementation should rarely
-            // kick in.
-            let val = self.get(i, data);
-            if range.contains(&val) {
-                positions.push(i);
+        if self.bit_width() > 32 {
+            for i in id_range {
+                if range.contains(&self.get(i, data)) {
+                    positions.push(i);
+                }
             }
+            return;
         }
-    }
-
-    fn get_ids_for_value_range_fast(
-        &self,
-        value_range: RangeInclusive<u32>,
-        id_range: Range<u32>,
-        data: &[u8],
-        positions: &mut Vec<u32>,
-    ) {
-        positions.resize(id_range.len(), 0u32);
-        self.get_batch_u32s(id_range.start, data, positions);
-        crate::filter_vec::filter_vec_in_place(value_range, id_range.start, positions)
+        if *range.start() > u32::MAX as u64 {
+            return;
+        }
+        let range_u32 = (*range.start() as u32)..=(*range.end()).min(u32::MAX as u64) as u32;
+        let start = positions.len();
+        positions.resize(start + id_range.len(), 0u32);
+        self.get_batch_u32s(id_range.start, data, &mut positions[start..]);
+        let len = crate::filter_vec::filter_slice_in_place(
+            range_u32,
+            id_range.start,
+            &mut positions[start..],
+        );
+        positions.truncate(start + len);
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::{BitPacker, BitUnpacker};
+
+    #[test]
+    fn append_range_matches_reuses_output_capacity() {
+        for bits in [0, 1, 7, 32, 48, 56] {
+            let (unpacker, vals, data) = create_bitpacker(400, bits);
+            let mut positions = Vec::with_capacity(800);
+            let pointer = positions.as_ptr();
+            for ids in [0..151, 151..400] {
+                let expected: Vec<_> = ids
+                    .clone()
+                    .filter(|&id| (2..=100).contains(&vals[id as usize]))
+                    .collect();
+                let start = positions.len();
+                unpacker.append_ids_for_value_range(2..=100, ids, &data, &mut positions);
+                assert_eq!(&positions[start..], expected);
+                assert_eq!(positions.as_ptr(), pointer);
+            }
+        }
+    }
 
     fn create_bitpacker(len: usize, num_bits: u8) -> (BitUnpacker, Vec<u64>, Vec<u8>) {
         let mut data = Vec::new();
