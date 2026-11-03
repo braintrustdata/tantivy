@@ -93,15 +93,14 @@ impl BlockReader {
         if block_len <= 1 {
             return Ok(false);
         }
-        let [compress] = self.take_array();
-        let block_len = block_len - 1;
-
         if self.remaining() < block_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "failed to read block content",
             ));
         }
+        let [compress] = self.take_array();
+        let block_len = block_len - 1;
         let block = self.take_range(block_len);
         if compress == 1 {
             let compressed = match self.reader.contiguous_slice(block.clone()) {
@@ -258,6 +257,29 @@ mod tests {
                 assert!(reader.read_block().is_err());
                 assert!(reader.buffer().is_empty());
                 assert_eq!(reader.position, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_truncated_block_returns_unexpected_eof() {
+        let encoded = block(b"payload", false);
+        for end in 1..encoded.len() {
+            for chunk_len in [1, 3, encoded.len()] {
+                let mut reader = BlockReader::new(ChunkedBytes::new(
+                    encoded[..end]
+                        .chunks(chunk_len)
+                        .map(|chunk| OwnedBytes::new(chunk.to_vec()))
+                        .collect(),
+                ));
+                for _ in 0..2 {
+                    assert_eq!(
+                        reader.read_block().unwrap_err().kind(),
+                        io::ErrorKind::UnexpectedEof
+                    );
+                    assert!(reader.buffer().is_empty());
+                    assert_eq!(reader.position, 0);
+                }
             }
         }
     }
