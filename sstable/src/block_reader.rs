@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::io::{self, Read};
 use std::ops::Range;
 
@@ -7,6 +6,7 @@ use zstd::bulk::Decompressor;
 
 pub struct BlockReader {
     buffer: Vec<u8>,
+    compressed_block: Vec<u8>,
     decompressor: Option<Decompressor<'static>>,
     reader: ChunkedBytes,
     position: usize,
@@ -17,6 +17,7 @@ impl BlockReader {
     pub fn new(reader: impl Into<ChunkedBytes>) -> BlockReader {
         BlockReader {
             buffer: Vec::new(),
+            compressed_block: Vec::new(),
             decompressor: None,
             reader: reader.into(),
             position: 0,
@@ -104,16 +105,23 @@ impl BlockReader {
         let block = self.take_range(block_len);
         if compress == 1 {
             let compressed = match self.reader.contiguous_slice(block.clone()) {
-                Some(compressed) => Cow::Borrowed(compressed),
-                None => Cow::Owned(self.reader.slice(block).to_vec()),
+                Some(compressed) => compressed,
+                None => {
+                    self.compressed_block.resize(block_len, 0);
+                    self.reader
+                        .slice(block)
+                        .into_reader()
+                        .read_exact(&mut self.compressed_block)?;
+                    &self.compressed_block
+                }
             };
-            let required_capacity = Decompressor::upper_bound(&compressed).unwrap_or(1024 * 1024);
+            let required_capacity = Decompressor::upper_bound(compressed).unwrap_or(1024 * 1024);
             self.buffer.reserve(required_capacity);
             let decompressor = match &mut self.decompressor {
                 Some(decompressor) => decompressor,
                 slot @ None => slot.insert(Decompressor::new()?),
             };
-            decompressor.decompress_to_buffer(&compressed[..], &mut self.buffer)?;
+            decompressor.decompress_to_buffer(compressed, &mut self.buffer)?;
         } else if let Some(block) = self.reader.contiguous_slice(block.clone()) {
             self.buffer.extend_from_slice(block);
         } else {
@@ -281,6 +289,31 @@ mod tests {
                     assert_eq!(reader.position, 0);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_straddling_compressed_blocks_reuse_scratch_storage() {
+        let data = vec![b'a'; 4096];
+        let encoded = block(&data, true);
+        let input = ChunkedBytes::new(
+            encoded
+                .iter()
+                .map(|&byte| OwnedBytes::new(vec![byte]))
+                .collect(),
+        );
+        let mut reader = BlockReader::new(input.clone());
+        assert!(reader.read_block().unwrap());
+        assert_eq!(reader.buffer(), data);
+        assert_eq!(reader.compressed_block.len(), encoded.len() - 5);
+        let ptr = reader.compressed_block.as_ptr();
+        let capacity = reader.compressed_block.capacity();
+        for _ in 0..3 {
+            reader.reset(input.clone());
+            assert!(reader.read_block().unwrap());
+            assert_eq!(reader.buffer(), data);
+            assert_eq!(reader.compressed_block.as_ptr(), ptr);
+            assert_eq!(reader.compressed_block.capacity(), capacity);
         }
     }
 
