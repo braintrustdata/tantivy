@@ -5,6 +5,7 @@ use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
 use super::line::Line;
 use super::ColumnValues;
+use crate::column_values::u64_based::paged::ColumnData;
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::column_values::VecColumn;
 use crate::RowId;
@@ -15,17 +16,17 @@ const LINE_ESTIMATION_BLOCK_LEN: usize = 512;
 /// Depending on the field type, a different
 /// fast field is required.
 #[derive(Clone)]
-pub struct LinearReader {
-    data: OwnedBytes,
+pub struct LinearReader<D = OwnedBytes> {
+    data: D,
     linear_params: LinearParams,
     stats: ColumnStats,
 }
 
-impl ColumnValues for LinearReader {
+impl<D: ColumnData> ColumnValues for LinearReader<D> {
     #[inline]
     fn get_val(&self, doc: u32) -> u64 {
         let interpoled_val: u64 = self.linear_params.line.eval(doc);
-        let bitpacked_diff = self.linear_params.bit_unpacker.get(doc, &self.data);
+        let bitpacked_diff = self.data.get_bits(&self.linear_params.bit_unpacker, 0, doc);
         interpoled_val.wrapping_add(bitpacked_diff)
     }
 
@@ -45,12 +46,22 @@ impl ColumnValues for LinearReader {
     }
 }
 
+impl<D> LinearReader<D> {
+    pub(crate) fn new(stats: ColumnStats, linear_params: LinearParams, data: D) -> Self {
+        LinearReader {
+            data,
+            linear_params,
+            stats,
+        }
+    }
+}
+
 /// Fastfield serializer, which tries to guess values by linear interpolation
 /// and stores the difference bitpacked.
 pub struct LinearCodec;
 
 #[derive(Debug, Clone)]
-struct LinearParams {
+pub(crate) struct LinearParams {
     line: Line,
     bit_unpacker: BitUnpacker,
 }
@@ -193,11 +204,7 @@ impl ColumnCodec for LinearCodec {
     fn load(mut data: OwnedBytes) -> io::Result<Self::ColumnValues> {
         let stats = ColumnStats::deserialize(&mut data)?;
         let linear_params = LinearParams::deserialize(&mut data)?;
-        Ok(LinearReader {
-            stats,
-            linear_params,
-            data,
-        })
+        Ok(LinearReader::new(stats, linear_params, data))
     }
 }
 

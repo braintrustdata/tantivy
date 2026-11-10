@@ -943,3 +943,229 @@ fn test_delete_decrease_cardinality() {
     assert_eq!(cols[0].column_type(), ColumnType::I64);
     assert_eq!(cols[0].open().unwrap().get_cardinality(), Cardinality::Full);
 }
+
+// Serves reads as pages, like a page cache.
+#[derive(Debug)]
+struct PagedFile {
+    bytes: common::OwnedBytes,
+    page_size: usize,
+}
+
+#[derive(Debug)]
+struct FailableFile {
+    bytes: common::OwnedBytes,
+    forbidden: std::ops::Range<usize>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl common::HasLen for FailableFile {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl common::file_slice::FileHandle for FailableFile {
+    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<common::OwnedBytes> {
+        use std::sync::atomic::Ordering;
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if self.fail.load(Ordering::Relaxed)
+            || (range.start < self.forbidden.end && self.forbidden.start < range.end)
+        {
+            return Err(std::io::Error::other("read failed"));
+        }
+        Ok(self.bytes.slice(range))
+    }
+}
+
+#[test]
+fn test_dictionary_lookups_do_not_read_files_after_open() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut writer = ColumnarWriter::default();
+    for row in 0..10_000 {
+        let term = format!("term-{row:05}");
+        writer.record_str(row, "str", &term);
+        writer.record_bytes(row, "bytes", term.as_bytes());
+    }
+    let mut buffer = Vec::new();
+    writer.serialize(10_000, None, &mut buffer).unwrap();
+    let reader = ColumnarReader::open(buffer).unwrap();
+    for name in ["str", "bytes"] {
+        let mut handle = reader.read_columns(name).unwrap().remove(0);
+        let fail = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        handle.file_slice = common::file_slice::FileSlice::new(Arc::new(FailableFile {
+            bytes: handle.file_slice.read_bytes().unwrap(),
+            forbidden: 0..0,
+            fail: fail.clone(),
+            reads: reads.clone(),
+        }));
+        assert_eq!(handle.open().unwrap_err().kind(), std::io::ErrorKind::Other);
+        fail.store(false, Ordering::Relaxed);
+        let column = handle.open().unwrap();
+        let reads_at_open = reads.load(Ordering::Relaxed);
+        fail.store(true, Ordering::Relaxed);
+        let mut output = Vec::new();
+        let mut str_output = String::new();
+        for ord in 0..10_000 {
+            let expected = format!("term-{ord:05}");
+            match &column {
+                DynamicColumn::Bytes(column) => {
+                    assert!(column.ord_to_bytes(ord, &mut output).unwrap());
+                    assert_eq!(output, expected.as_bytes());
+                }
+                DynamicColumn::Str(column) => {
+                    assert!(column.ord_to_str(ord, &mut str_output).unwrap());
+                    assert_eq!(str_output, expected);
+                }
+                _ => panic!("expected a dictionary column"),
+            }
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), reads_at_open);
+    }
+}
+
+#[test]
+fn test_lenient_ordinals_skip_dictionary_reads() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut writer = ColumnarWriter::default();
+    for (row, term) in [(0, "z"), (2, "a")] {
+        writer.record_str(row, "str", term);
+        writer.record_bytes(row, "bytes", term.as_bytes());
+    }
+    let mut buffer = Vec::new();
+    writer.serialize(3, None, &mut buffer).unwrap();
+    let reader = ColumnarReader::open(buffer).unwrap();
+    for name in ["str", "bytes"] {
+        let mut handle = reader.read_columns(name).unwrap().remove(0);
+        let bytes = handle.file_slice.read_bytes().unwrap();
+        let dictionary_len = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        let reads = Arc::new(AtomicUsize::new(0));
+        handle.file_slice = common::file_slice::FileSlice::new(Arc::new(FailableFile {
+            bytes,
+            forbidden: 0..dictionary_len as usize,
+            fail: Arc::new(AtomicBool::new(false)),
+            reads: reads.clone(),
+        }));
+        let ordinals = handle.open_u64_lenient().unwrap().unwrap();
+        assert_eq!(ordinals.first(0), Some(1));
+        assert_eq!(ordinals.first(1), None);
+        assert_eq!(ordinals.first(2), Some(0));
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert!(handle.open().is_err());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn test_first_vals_rejects_short_output() {
+    let mut writer = ColumnarWriter::default();
+    writer.record_numerical(1, "optional", 7u64);
+    let mut buffer = Vec::new();
+    writer.serialize(3, None, &mut buffer).unwrap();
+    let reader = ColumnarReader::open(buffer).unwrap();
+    let column = reader.read_columns("optional").unwrap()[0]
+        .open_u64_lenient()
+        .unwrap()
+        .unwrap();
+    column.first_vals(&[1; 129], &mut []);
+}
+
+impl common::HasLen for PagedFile {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl common::file_slice::FileHandle for PagedFile {
+    fn read_bytes(&self, range: std::ops::Range<usize>) -> std::io::Result<common::OwnedBytes> {
+        Ok(self.bytes.slice(range))
+    }
+
+    fn read_chunks(&self, range: std::ops::Range<usize>) -> std::io::Result<common::ChunkedBytes> {
+        let mut chunks = Vec::new();
+        let mut start = range.start;
+        while start < range.end {
+            let end = ((start / self.page_size + 1) * self.page_size).min(range.end);
+            chunks.push(self.bytes.slice(start..end));
+            start = end;
+        }
+        Ok(common::ChunkedBytes::new(chunks))
+    }
+}
+
+#[test]
+fn test_columns_read_from_pages_match_contiguous_columns() {
+    let num_rows = 300_000u32;
+    let mut writer = ColumnarWriter::default();
+    for row in 0..num_rows {
+        // Dense blocks, then sparse ones.
+        if (row < 150_000 && row % 3 != 0) || row % 1_000 == 0 {
+            writer.record_numerical(row, "optional", row as u64 * 7);
+            writer.record_str(row, "str", &format!("v{}", row % 1_000));
+        }
+        for value in 0..row % 4 {
+            writer.record_numerical(row, "multivalued", (row + value) as u64);
+        }
+    }
+    let mut buffer = Vec::new();
+    writer.serialize(num_rows, None, &mut buffer).unwrap();
+    let bytes = common::OwnedBytes::new(buffer);
+    let expected = ColumnarReader::open(common::file_slice::FileSlice::new(std::sync::Arc::new(
+        bytes.clone(),
+    )))
+    .unwrap();
+    for page_size in [7, 8, 4096, 128 << 10] {
+        let paged = ColumnarReader::open(common::file_slice::FileSlice::new(std::sync::Arc::new(
+            PagedFile {
+                bytes: bytes.clone(),
+                page_size,
+            },
+        )))
+        .unwrap();
+        for name in ["optional", "multivalued"] {
+            let open = |reader: &ColumnarReader| {
+                reader.read_columns(name).unwrap()[0]
+                    .open_u64_lenient()
+                    .unwrap()
+                    .unwrap()
+            };
+            let (want, got) = (open(&expected), open(&paged));
+            assert_eq!(got.get_cardinality(), want.get_cardinality());
+            for row in 0..num_rows {
+                assert!(
+                    got.values_for_doc(row).eq(want.values_for_doc(row)),
+                    "{name} page={page_size} row={row}"
+                );
+            }
+        }
+        let open = |reader: &ColumnarReader| match reader.read_columns("str").unwrap()[0]
+            .open()
+            .unwrap()
+        {
+            DynamicColumn::Str(column) => column,
+            _ => panic!("expected a str column"),
+        };
+        let (want, got) = (open(&expected), open(&paged));
+        let (mut want_str, mut got_str) = (String::new(), String::new());
+        for row in 0..num_rows {
+            assert!(
+                got.term_ords(row).eq(want.term_ords(row)),
+                "page={page_size} row={row}"
+            );
+            if row % 101 != 0 {
+                continue;
+            }
+            for ord in want.term_ords(row) {
+                want.ord_to_str(ord, &mut want_str).unwrap();
+                got.ord_to_str(ord, &mut got_str).unwrap();
+                assert_eq!(got_str, want_str, "page={page_size} row={row}");
+            }
+        }
+    }
+}

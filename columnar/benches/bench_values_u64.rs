@@ -4,8 +4,12 @@ extern crate test;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
+use common::{ChunkedBytes, OwnedBytes};
 use rand::prelude::*;
-use tantivy_columnar::column_values::{serialize_and_load_u64_based_column_values, CodecType};
+use tantivy_columnar::column_values::{
+    load_u64_based_column_values_from_chunks, serialize_and_load_u64_based_column_values,
+    serialize_u64_based_column_values, CodecType,
+};
 use tantivy_columnar::*;
 use test::Bencher;
 
@@ -52,6 +56,18 @@ fn bench_intfastfield_jumpy_fflookup_bitpacked(b: &mut Bencher) {
         }
         a
     });
+}
+
+// Loads the column from 128 KiB pages, as read through a page cache.
+fn serialize_and_load_paged(column: &[u64], codec_type: CodecType) -> Arc<dyn ColumnValues<u64>> {
+    let mut buffer = Vec::new();
+    serialize_u64_based_column_values(&column, &[codec_type], &mut buffer).unwrap();
+    let bytes = OwnedBytes::new(buffer);
+    let pages = (0..bytes.len())
+        .step_by(128 << 10)
+        .map(|start| bytes.slice(start..(start + (128 << 10)).min(bytes.len())))
+        .collect();
+    load_u64_based_column_values_from_chunks(ChunkedBytes::new(pages)).unwrap()
 }
 
 const FIFTY_PERCENT_RANGE: RangeInclusive<u64> = 1..=50;
@@ -132,6 +148,38 @@ fn bench_intfastfield_getrange_u64_hit_all(b: &mut Bencher) {
         positions
     });
 }
+
+#[bench]
+fn bench_intfastfield_getrange_u64_50percent_hit_paged(b: &mut Bencher) {
+    let data = get_data_50percent_item();
+    let data = data.iter().map(|el| *el as u64).collect::<Vec<_>>();
+    let column = serialize_and_load_paged(&data, CodecType::Bitpacked);
+    b.iter(|| {
+        let mut positions = Vec::new();
+        column.get_row_ids_for_value_range(
+            FIFTY_PERCENT_RANGE,
+            0..data.len() as u32,
+            &mut positions,
+        );
+        positions
+    });
+}
+
+#[bench]
+fn bench_intfastfield_getrange_u64_1percent_hit_paged(b: &mut Bencher) {
+    let data = get_data_50percent_item();
+    let data = data.iter().map(|el| *el as u64).collect::<Vec<_>>();
+    let column = serialize_and_load_paged(&data, CodecType::Bitpacked);
+    b.iter(|| {
+        let mut positions = Vec::new();
+        column.get_row_ids_for_value_range(
+            ONE_PERCENT_ITEM_RANGE,
+            0..data.len() as u32,
+            &mut positions,
+        );
+        positions
+    });
+}
 // U64 RANGE END
 
 #[bench]
@@ -166,6 +214,21 @@ fn bench_intfastfield_scan_all_fflookup(b: &mut Bencher) {
     let permutation = generate_permutation();
     let n = permutation.len();
     let column: Arc<dyn ColumnValues<u64>> = serialize_and_load(&permutation, CodecType::Bitpacked);
+    let column_ref = column.as_ref();
+    b.iter(|| {
+        let mut a = 0u64;
+        for i in 0u32..n as u32 {
+            a += column_ref.get_val(i);
+        }
+        a
+    });
+}
+
+#[bench]
+fn bench_intfastfield_scan_all_fflookup_paged(b: &mut Bencher) {
+    let permutation = generate_permutation();
+    let n = permutation.len();
+    let column = serialize_and_load_paged(&permutation, CodecType::Bitpacked);
     let column_ref = column.as_ref();
     b.iter(|| {
         let mut a = 0u64;
