@@ -706,11 +706,13 @@ impl IndexMerger {
                          indexed. Have you modified the schema?",
         );
 
-        let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
+        let mut postings_pool: Vec<SegmentPostings> = (0..self.readers.len())
+            .map(|_| SegmentPostings::empty())
+            .collect();
+        let mut segment_postings_containing_the_term = Vec::with_capacity(self.readers.len());
         let mut doc_id_and_positions = vec![];
 
         while merged_terms.advance() {
-            segment_postings_containing_the_term.clear();
             let term_bytes: &[u8] = merged_terms.key();
 
             let mut total_doc_freq = 0;
@@ -718,17 +720,33 @@ impl IndexMerger {
             for (segment_ord, term_info) in merged_terms.current_segment_ords_and_term_infos() {
                 let segment_reader = &self.readers[segment_ord];
                 let inverted_index: &InvertedIndexReader = &field_readers[segment_ord];
-                let segment_postings = inverted_index
-                    .read_postings_from_terminfo(&term_info, segment_postings_option)?;
+                let segment_postings = &mut postings_pool[segment_ord];
+                inverted_index.read_postings_from_terminfo_into(
+                    &term_info,
+                    segment_postings_option,
+                    segment_postings,
+                )?;
                 let alive_bitset_opt = segment_reader.alive_bitset();
                 let doc_freq = if let Some(alive_bitset) = alive_bitset_opt {
-                    segment_postings.doc_freq_given_deletes(alive_bitset)
+                    let mut doc_freq = 0;
+                    while segment_postings.doc() != TERMINATED {
+                        doc_freq += u32::from(alive_bitset.is_alive(segment_postings.doc()));
+                        segment_postings.advance();
+                    }
+                    if doc_freq > 0 {
+                        inverted_index.read_postings_from_terminfo_into(
+                            &term_info,
+                            segment_postings_option,
+                            segment_postings,
+                        )?;
+                    }
+                    doc_freq
                 } else {
                     segment_postings.doc_freq()
                 };
                 if doc_freq > 0u32 {
                     total_doc_freq += doc_freq;
-                    segment_postings_containing_the_term.push((segment_ord, segment_postings));
+                    segment_postings_containing_the_term.push(segment_ord);
                 }
             }
 
@@ -746,12 +764,12 @@ impl IndexMerger {
             assert!(!segment_postings_containing_the_term.is_empty());
 
             let has_term_freq = {
-                let has_term_freq = !segment_postings_containing_the_term[0]
-                    .1
+                let has_term_freq = !postings_pool[segment_postings_containing_the_term[0]]
                     .block_cursor
                     .freqs()
                     .is_empty();
-                for (_, postings) in &segment_postings_containing_the_term[1..] {
+                for &segment_ord in &segment_postings_containing_the_term[1..] {
+                    let postings = &postings_pool[segment_ord];
                     // This may look at a strange way to test whether we have term freq or not.
                     // With JSON object, the schema is not sufficient to know whether a term
                     // has its term frequency encoded or not:
@@ -780,9 +798,8 @@ impl IndexMerger {
 
             // We can now serialize this postings, by pushing each document to the
             // postings serializer.
-            for (segment_ord, mut segment_postings) in
-                segment_postings_containing_the_term.drain(..)
-            {
+            for &segment_ord in &segment_postings_containing_the_term {
+                let segment_postings = &mut postings_pool[segment_ord];
                 let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
 
                 let mut doc = segment_postings.doc();
@@ -824,6 +841,7 @@ impl IndexMerger {
                     doc = segment_postings.advance();
                 }
             }
+            segment_postings_containing_the_term.clear();
             if !doc_id_mapping.is_trivial() {
                 doc_id_and_positions.sort_unstable_by_key(|&(doc_id, _, _)| doc_id);
 
@@ -1154,6 +1172,70 @@ mod tests {
         assert_nearly_equals, schema, DateTime, DocAddress, DocId, DocSet, IndexSettings,
         IndexSortByField, IndexWriter, Order, Searcher, SegmentId,
     };
+
+    #[test]
+    fn test_merge_reused_postings_with_deleted_terms() -> crate::Result<()> {
+        use crate::postings::Postings;
+
+        let mut schema = schema::Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let id = schema.add_u64_field("id", INDEXED);
+        let schema = schema.build();
+        let mut indices = Vec::new();
+        for segment in 0..3 {
+            let index = Index::create_in_ram(schema.clone());
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+            for doc in 0..260 {
+                let body = match doc {
+                    1 => "hot hot hot rare rare",
+                    2 => "aaa_deleted hot hot hot",
+                    _ => "hot hot hot",
+                };
+                writer.add_document(doc!(text => body, id => segment * 260 + doc))?;
+            }
+            for doc in 0..260 {
+                if doc % 5 == 0 || doc == 2 || (segment == 0 && doc == 1) {
+                    writer.delete_term(Term::from_field_u64(id, segment * 260 + doc));
+                }
+            }
+            writer.commit()?;
+            writer.wait_merging_threads()?;
+            indices.push(index);
+        }
+        let merged =
+            crate::indexer::merge_indices(&indices, crate::directory::RamDirectory::default())?;
+        let reader = merged.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 620);
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let inverted = searcher.segment_readers()[0].inverted_index(text)?;
+        let mut positions = Vec::new();
+        for (word, doc_freq, term_freq, expected_positions) in
+            [("hot", 620, 3, vec![0, 1, 2]), ("rare", 2, 2, vec![3, 4])]
+        {
+            let mut postings = inverted
+                .read_postings(
+                    &Term::from_field_text(text, word),
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?
+                .unwrap();
+            assert_eq!(postings.doc_freq(), doc_freq);
+            let mut docs = 0;
+            while postings.doc() != crate::TERMINATED {
+                assert_eq!(postings.term_freq(), term_freq);
+                postings.positions(&mut positions);
+                assert_eq!(positions, expected_positions);
+                postings.advance();
+                docs += 1;
+            }
+            assert_eq!(docs, doc_freq);
+        }
+        assert!(inverted
+            .get_term_info(&Term::from_field_text(text, "aaa_deleted"))?
+            .is_none());
+        Ok(())
+    }
 
     #[test]
     fn test_index_merger_no_deletes() -> crate::Result<()> {
