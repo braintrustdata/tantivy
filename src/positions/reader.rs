@@ -54,6 +54,33 @@ impl PositionReader {
         })
     }
 
+    pub(crate) fn empty() -> Self {
+        Self {
+            bit_widths: OwnedBytes::empty(),
+            positions: OwnedBytes::empty(),
+            block_decoder: BlockDecoder::default(),
+            block_offset: i64::MAX as u64,
+            anchor_offset: 0,
+            original_bit_widths: OwnedBytes::empty(),
+            original_positions: OwnedBytes::empty(),
+        }
+    }
+
+    pub(crate) fn reset_data(&mut self, mut positions_data: OwnedBytes) -> io::Result<()> {
+        let num_blocks = VInt::deserialize(&mut positions_data)?.0;
+        let num_blocks = usize::try_from(num_blocks)
+            .ok()
+            .filter(|&count| count <= positions_data.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Invalid position block count")
+            })?;
+        let (bit_widths, positions) = positions_data.split(num_blocks);
+        self.original_bit_widths = bit_widths;
+        self.original_positions = positions;
+        self.reset();
+        Ok(())
+    }
+
     fn reset(&mut self) {
         self.positions = self.original_positions.clone();
         self.bit_widths = self.original_bit_widths.clone();
@@ -145,5 +172,38 @@ impl PositionReader {
             offset += remaining_in_block as u64;
             self.load_block(i);
         }
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+    use crate::positions::PositionSerializer;
+
+    #[test]
+    fn reset_position_data_after_block_reads_and_rewind() -> io::Result<()> {
+        let mut reader = PositionReader::empty();
+        for deltas in [
+            vec![1; 260],
+            vec![7],
+            vec![0; 128],
+            vec![3; 129],
+            vec![2; 127],
+        ] {
+            let mut encoded = Vec::new();
+            let mut serializer = PositionSerializer::new(&mut encoded);
+            serializer.write_positions_delta(&deltas);
+            serializer.close_term()?;
+            serializer.close()?;
+            reader.reset_data(OwnedBytes::new(encoded))?;
+            for offset in [deltas.len() - 1, 0, deltas.len() / 2, 0] {
+                let mut actual = [u32::MAX];
+                reader.read(offset as u64, &mut actual);
+                assert_eq!(actual[0], deltas[offset]);
+            }
+        }
+        assert!(reader.reset_data(OwnedBytes::empty()).is_err());
+        assert!(reader.reset_data(OwnedBytes::new(vec![0xff])).is_err());
+        Ok(())
     }
 }

@@ -1,5 +1,8 @@
+use std::io;
+
 use common::HasLen;
 
+use crate::directory::OwnedBytes;
 use crate::docset::DocSet;
 use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
@@ -15,8 +18,9 @@ use crate::{DocId, TERMINATED};
 #[derive(Clone)]
 pub struct SegmentPostings {
     pub(crate) block_cursor: BlockSegmentPostings,
-    cur: usize,
+    cur: u32,
     position_reader: Option<PositionReader>,
+    positions_enabled: bool,
 }
 
 impl SegmentPostings {
@@ -26,7 +30,20 @@ impl SegmentPostings {
             block_cursor: BlockSegmentPostings::empty(),
             cur: 0,
             position_reader: None,
+            positions_enabled: false,
         }
+    }
+
+    pub(crate) fn reset(&mut self, positions_data: Option<OwnedBytes>) -> io::Result<()> {
+        self.cur = 0;
+        self.positions_enabled = false;
+        if let Some(positions_data) = positions_data {
+            self.position_reader
+                .get_or_insert_with(PositionReader::empty)
+                .reset_data(positions_data)?;
+            self.positions_enabled = true;
+        }
+        Ok(())
     }
 
     /// Compute the number of non-deleted documents.
@@ -149,6 +166,7 @@ impl SegmentPostings {
         SegmentPostings {
             block_cursor: segment_block_postings,
             cur: 0, // cursor within the block
+            positions_enabled: position_reader.is_some(),
             position_reader,
         }
     }
@@ -160,7 +178,7 @@ impl DocSet for SegmentPostings {
     #[inline]
     fn advance(&mut self) -> DocId {
         debug_assert!(self.block_cursor.block_is_loaded());
-        if self.cur == COMPRESSION_BLOCK_SIZE - 1 {
+        if self.cur as usize == COMPRESSION_BLOCK_SIZE - 1 {
             self.cur = 0;
             self.block_cursor.advance();
         } else {
@@ -179,12 +197,13 @@ impl DocSet for SegmentPostings {
 
         // At this point we are on the block, that might contain our document.
         let output = self.block_cursor.full_block();
-        self.cur = branchless_binary_search(output, target);
+        let cur = branchless_binary_search(output, target);
 
         // The last block is not full and padded with the value TERMINATED,
         // so that we are guaranteed to have at least doc in the block (a real one or the padding)
         // that is greater or equal to the target.
-        debug_assert!(self.cur < COMPRESSION_BLOCK_SIZE);
+        debug_assert!(cur < COMPRESSION_BLOCK_SIZE);
+        self.cur = cur as u32;
 
         // `doc` is now the first element >= `target`
 
@@ -192,7 +211,7 @@ impl DocSet for SegmentPostings {
         // with the value `TERMINATED`.
         //
         // After the search, the cursor should point to the first value of TERMINATED.
-        let doc = output[self.cur];
+        let doc = output[cur];
         debug_assert!(doc >= target);
         debug_assert_eq!(doc, self.doc());
         doc
@@ -201,7 +220,7 @@ impl DocSet for SegmentPostings {
     /// Return the current document's `DocId`.
     #[inline]
     fn doc(&self) -> DocId {
-        self.block_cursor.doc(self.cur)
+        self.block_cursor.doc(self.cur as usize)
     }
 
     fn size_hint(&self) -> u32 {
@@ -231,21 +250,25 @@ impl Postings for SegmentPostings {
             //
             // In that case we hit the block just as if the frequency had been
             // decoded. The block is simply prefilled by the value 1.
-            self.cur < COMPRESSION_BLOCK_SIZE,
+            (self.cur as usize) < COMPRESSION_BLOCK_SIZE,
             "Have you forgotten to call `.advance()` at least once before calling `.term_freq()`."
         );
-        self.block_cursor.freq(self.cur)
+        self.block_cursor.freq(self.cur as usize)
     }
 
     fn positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         let term_freq = self.term_freq();
-        if let Some(position_reader) = self.position_reader.as_mut() {
+        if let Some(position_reader) = self
+            .position_reader
+            .as_mut()
+            .filter(|_| self.positions_enabled)
+        {
             debug_assert!(
                 !self.block_cursor.freqs().is_empty(),
                 "No positions available"
             );
             let read_offset = self.block_cursor.position_offset()
-                + (self.block_cursor.freqs()[..self.cur]
+                + (self.block_cursor.freqs()[..self.cur as usize]
                     .iter()
                     .cloned()
                     .sum::<u32>() as u64);
