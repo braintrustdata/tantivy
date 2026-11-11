@@ -508,12 +508,13 @@ fn remap_and_write(
         let dictionary = settings
             .docstore_compression
             .resolve_dictionary(serializer.segment().index().directory())?;
-        let store_writer = StoreWriter::new(
+        let store_writer = StoreWriter::new_with_zstd_parameters(
             store_write,
             settings.docstore_compression.clone(),
             settings.docstore_blocksize,
             settings.docstore_compress_dedicated_thread,
             dictionary,
+            serializer.segment().index().docstore_zstd_parameters(),
         )?;
         let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
         old_store_writer.close()?;

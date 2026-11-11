@@ -286,6 +286,7 @@ pub struct Index {
     directory: ManagedDirectory,
     schema: Schema,
     settings: IndexSettings,
+    docstore_zstd_parameters: crate::store::ZstdEncoderParameters,
     executor: Arc<Executor>,
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
@@ -408,6 +409,7 @@ impl Index {
         let schema = metas.schema.clone();
         Index {
             settings: metas.index_settings.clone(),
+            docstore_zstd_parameters: Default::default(),
             directory,
             schema,
             tokenizers: TokenizerManager::default(),
@@ -416,6 +418,20 @@ impl Index {
             inventory,
             segment_artifact_providers: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Sets encoder overrides for future writers created from this handle.
+    /// These are not persisted; reopening an index restores the default overrides.
+    pub fn set_docstore_zstd_parameters(
+        &mut self,
+        parameters: crate::store::ZstdEncoderParameters,
+    ) {
+        self.docstore_zstd_parameters = parameters;
+    }
+
+    /// Returns this handle's runtime docstore encoder overrides.
+    pub fn docstore_zstd_parameters(&self) -> &crate::store::ZstdEncoderParameters {
+        &self.docstore_zstd_parameters
     }
 
     /// Setter for the tokenizer manager.

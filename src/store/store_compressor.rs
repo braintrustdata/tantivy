@@ -28,8 +28,10 @@ impl BlockCompressor {
         wrt: WritePtr,
         dedicated_thread: bool,
         dictionary: Option<Arc<[u8]>>,
+        parameters: &super::ZstdEncoderParameters,
     ) -> io::Result<Self> {
-        let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt, dictionary)?;
+        let block_compressor_impl =
+            BlockCompressorImpl::new(compressor, wrt, dictionary, parameters)?;
         if dedicated_thread {
             let dedicated_thread_compressor =
                 DedicatedThreadBlockCompressorImpl::new(block_compressor_impl)?;
@@ -98,8 +100,9 @@ impl BlockCompressorImpl {
         compressor: Compressor,
         writer: WritePtr,
         dictionary: Option<Arc<[u8]>>,
+        parameters: &super::ZstdEncoderParameters,
     ) -> io::Result<Self> {
-        let context = CompressorContext::new(&compressor, dictionary.as_deref())?;
+        let context = CompressorContext::new(&compressor, dictionary.as_deref(), parameters)?;
         Ok(Self {
             compressor,
             dictionary,
@@ -279,8 +282,10 @@ mod tests {
         let path2 = Path::new("path2");
         let wrt1 = ram_directory.open_write(path1).unwrap();
         let wrt2 = ram_directory.open_write(path2).unwrap();
-        let block_compressor1 = BlockCompressor::new(Compressor::None, wrt1, true, None).unwrap();
-        let block_compressor2 = BlockCompressor::new(Compressor::None, wrt2, false, None).unwrap();
+        let block_compressor1 =
+            BlockCompressor::new(Compressor::None, wrt1, true, None, &Default::default()).unwrap();
+        let block_compressor2 =
+            BlockCompressor::new(Compressor::None, wrt2, false, None, &Default::default()).unwrap();
         populate_block_compressor(block_compressor1).unwrap();
         populate_block_compressor(block_compressor2).unwrap();
         let data1 = ram_directory.open_read(path1).unwrap();
