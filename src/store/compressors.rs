@@ -468,7 +468,11 @@ pub(crate) enum CompressorContext {
 }
 
 impl CompressorContext {
-    pub(crate) fn new(compressor: &Compressor, dictionary: Option<&[u8]>) -> io::Result<Self> {
+    pub(crate) fn new(
+        compressor: &Compressor,
+        dictionary: Option<&[u8]>,
+        _parameters: &super::ZstdEncoderParameters,
+    ) -> io::Result<Self> {
         Ok(match compressor {
             Compressor::None => Self::None,
             #[cfg(feature = "lz4-compression")]
@@ -478,6 +482,7 @@ impl CompressorContext {
                 Self::Zstd(super::compression_zstd_block::new_compressor(
                     settings.compression_level,
                     dictionary,
+                    _parameters,
                 )?)
             }
         })

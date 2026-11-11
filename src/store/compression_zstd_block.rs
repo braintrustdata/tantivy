@@ -6,9 +6,35 @@ use zstd::DEFAULT_COMPRESSION_LEVEL;
 pub(crate) fn new_compressor(
     compression_level: Option<i32>,
     dictionary: Option<&[u8]>,
+    parameters: &super::ZstdEncoderParameters,
 ) -> io::Result<Compressor<'static>> {
-    let level = compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    let level = parameters
+        .compression_level
+        .or(compression_level)
+        .unwrap_or(DEFAULT_COMPRESSION_LEVEL);
     let mut compressor = Compressor::with_dictionary(level, dictionary.unwrap_or_default())?;
+    use zstd::zstd_safe::{CParameter, Strategy};
+    if let Some(strategy) = parameters.strategy {
+        let strategy = match strategy {
+            super::ZstdStrategy::Fast => Strategy::ZSTD_fast,
+            super::ZstdStrategy::DoubleFast => Strategy::ZSTD_dfast,
+            super::ZstdStrategy::Greedy => Strategy::ZSTD_greedy,
+            super::ZstdStrategy::Lazy => Strategy::ZSTD_lazy,
+        };
+        compressor.set_parameter(CParameter::Strategy(strategy))?;
+    }
+    if let Some(value) = parameters.hash_log {
+        compressor.set_parameter(CParameter::HashLog(value))?;
+    }
+    if let Some(value) = parameters.chain_log {
+        compressor.set_parameter(CParameter::ChainLog(value))?;
+    }
+    if let Some(value) = parameters.min_match {
+        compressor.set_parameter(CParameter::MinMatch(value))?;
+    }
+    if let Some(value) = parameters.target_length {
+        compressor.set_parameter(CParameter::TargetLength(value))?;
+    }
     if dictionary.is_some() {
         // Blocks compressed against a dictionary carry a zstd frame checksum. It's verified
         // automatically by the decompressor (a few bytes + a fast XXH64 pass per block) and is
@@ -95,7 +121,7 @@ mod tests {
     fn reused_compressor_writes_independent_blocks() -> std::io::Result<()> {
         let dictionary = b"shared dictionary with repeated words and values";
         for dictionary in [None, Some(dictionary.as_slice())] {
-            let mut compressor = new_compressor(Some(3), dictionary)?;
+            let mut compressor = new_compressor(Some(3), dictionary, &Default::default())?;
             let mut compressed = Vec::new();
             for data in [
                 b"shared dictionary with repeated words and values".repeat(1000),
@@ -112,7 +138,7 @@ mod tests {
                 compress(
                     &data,
                     &mut fresh_compressed,
-                    &mut new_compressor(Some(3), dictionary)?,
+                    &mut new_compressor(Some(3), dictionary, &Default::default())?,
                 )?;
                 assert_eq!(compressed, fresh_compressed);
                 if dictionary.is_some() {
