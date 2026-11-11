@@ -149,6 +149,44 @@ impl InvertedIndexReader {
         )
     }
 
+    /// Reopens a block cursor in place, preserving its decoding buffers.
+    pub fn read_block_postings_from_terminfo_into(
+        &self,
+        term_info: &TermInfo,
+        requested_option: IndexRecordOption,
+        out: &mut BlockSegmentPostings,
+    ) -> io::Result<()> {
+        let bytes = self
+            .postings_file_slice
+            .read_bytes_slice(term_info.postings_range.clone())?;
+        out.reset_with_options(
+            term_info.doc_freq,
+            bytes,
+            self.record_option,
+            requested_option,
+        )
+    }
+
+    /// Reopens a postings cursor in place, preserving its decoding buffers.
+    pub fn read_postings_from_terminfo_into(
+        &self,
+        term_info: &TermInfo,
+        option: IndexRecordOption,
+        out: &mut SegmentPostings,
+    ) -> io::Result<()> {
+        let option = option.downgrade(self.record_option);
+        self.read_block_postings_from_terminfo_into(term_info, option, &mut out.block_cursor)?;
+        let positions_data = if option.has_positions() {
+            Some(
+                self.positions_file_slice
+                    .read_bytes_slice(term_info.positions_range.clone())?,
+            )
+        } else {
+            None
+        };
+        out.reset(positions_data)
+    }
+
     /// Returns a posting object given a `term_info`.
     /// This method is for an advanced usage only.
     ///
@@ -345,5 +383,121 @@ impl InvertedIndexReader {
             .await?
             .map(|term_info| term_info.doc_freq)
             .unwrap_or(0u32))
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::postings::Postings;
+    use crate::schema::{OwnedValue, Schema, TantivyDocument, INDEXED, TEXT};
+    use crate::{DocSet, Index, TERMINATED};
+
+    #[test]
+    fn reuse_postings_across_terms_fields_and_record_options() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let number = schema.add_u64_field("number", INDEXED);
+        let json = schema.add_json_field("json", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for doc in 0..260 {
+            let body = if doc == 0 {
+                "hot hot hot rare rare"
+            } else {
+                "hot hot hot"
+            };
+            let mut document = TantivyDocument::default();
+            document.add_text(text, body);
+            document.add_u64(number, if doc == 0 { 43 } else { 42 });
+            document.add_object(
+                json,
+                BTreeMap::from([
+                    ("text".to_string(), OwnedValue::Str(body.to_string())),
+                    (
+                        "number".to_string(),
+                        OwnedValue::U64(if doc == 0 { 43 } else { 42 }),
+                    ),
+                ]),
+            );
+            writer.add_document(document)?;
+        }
+        writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let mut terms = Vec::new();
+        for field in [text, number, json] {
+            let inverted = searcher.segment_readers()[0].inverted_index(field)?;
+            let mut stream = inverted.terms().stream()?;
+            while stream.advance() {
+                terms.push((inverted.clone(), stream.value().clone()));
+            }
+        }
+        let mut postings = SegmentPostings::empty();
+        let mut blocks = BlockSegmentPostings::empty();
+        let mut actual_positions = Vec::new();
+        let mut expected_positions = Vec::new();
+        for _ in 0..3 {
+            for option in [
+                IndexRecordOption::WithFreqsAndPositions,
+                IndexRecordOption::Basic,
+                IndexRecordOption::WithFreqs,
+                IndexRecordOption::WithFreqsAndPositions,
+            ] {
+                for (inverted, info) in &terms {
+                    let mut expected = inverted.read_postings_from_terminfo(info, option)?;
+                    inverted.read_postings_from_terminfo_into(info, option, &mut postings)?;
+                    assert_eq!(postings.doc_freq(), expected.doc_freq());
+                    while expected.doc() != TERMINATED {
+                        assert_eq!(postings.doc(), expected.doc());
+                        assert_eq!(postings.term_freq(), expected.term_freq());
+                        if !option.has_positions() || !expected.block_cursor.freqs().is_empty() {
+                            actual_positions.push(u32::MAX);
+                            expected_positions.push(u32::MAX);
+                            postings.positions(&mut actual_positions);
+                            expected.positions(&mut expected_positions);
+                            assert_eq!(actual_positions, expected_positions);
+                        }
+                        postings.advance();
+                        expected.advance();
+                    }
+                    assert_eq!(postings.doc(), TERMINATED);
+                    let mut expected = inverted.read_block_postings_from_terminfo(info, option)?;
+                    inverted.read_block_postings_from_terminfo_into(info, option, &mut blocks)?;
+                    while expected.doc(0) != TERMINATED {
+                        assert_eq!(blocks.docs(), expected.docs());
+                        assert_eq!(blocks.freqs(), expected.freqs());
+                        assert_eq!(blocks.freq(0), expected.freq(0));
+                        blocks.advance();
+                        expected.advance();
+                    }
+                    assert_eq!(blocks.doc(0), TERMINATED);
+                }
+                terms.reverse();
+            }
+        }
+        let inverted = searcher.segment_readers()[0].inverted_index(text)?;
+        let info = inverted
+            .get_term_info(&Term::from_field_text(text, "hot"))?
+            .unwrap();
+        inverted.read_postings_from_terminfo_into(
+            &info,
+            IndexRecordOption::WithFreqsAndPositions,
+            &mut postings,
+        )?;
+        assert_eq!(postings.seek(200), 200);
+        postings.positions(&mut actual_positions);
+        assert_eq!(actual_positions, [0, 1, 2]);
+        inverted.read_postings_from_terminfo_into(
+            &info,
+            IndexRecordOption::WithFreqsAndPositions,
+            &mut postings,
+        )?;
+        assert_eq!(postings.doc(), 0);
+        postings.positions(&mut actual_positions);
+        assert_eq!(actual_positions, [0, 1, 2]);
+        Ok(())
     }
 }
