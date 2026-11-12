@@ -1,4 +1,7 @@
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    sync::{atomic::Ordering as AtomicOrdering, Arc},
+};
 
 use crate::docset::{DocSet, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
@@ -6,6 +9,8 @@ use crate::postings::Postings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Intersection, Scorer};
 use crate::{DocId, Score};
+
+use super::PhraseQueryStats;
 
 struct PostingsWithOffset<TPostings> {
     offset: u32,
@@ -55,6 +60,7 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
     slops_buffer: Vec<u8>,
+    stats: Option<Arc<PhraseQueryStats>>,
 }
 
 /// Returns true if and only if the two sorted arrays contain a common element
@@ -352,12 +358,13 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         fieldnorm_reader: FieldNormReader,
         slop: u32,
     ) -> PhraseScorer<TPostings> {
-        Self::new_with_offset(
+        Self::new_with_offset_and_stats(
             term_postings,
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
             0,
+            None,
         )
     }
 
@@ -367,6 +374,41 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         fieldnorm_reader: FieldNormReader,
         slop: u32,
         offset: usize,
+    ) -> PhraseScorer<TPostings> {
+        Self::new_with_offset_and_stats(
+            term_postings_with_offset,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+            offset,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_stats(
+        term_postings: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+        stats: Arc<PhraseQueryStats>,
+    ) -> PhraseScorer<TPostings> {
+        Self::new_with_offset_and_stats(
+            term_postings,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+            0,
+            Some(stats),
+        )
+    }
+
+    fn new_with_offset_and_stats(
+        term_postings_with_offset: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+        offset: usize,
+        stats: Option<Arc<PhraseQueryStats>>,
     ) -> PhraseScorer<TPostings> {
         let max_offset = term_postings_with_offset
             .iter()
@@ -393,6 +435,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             left_slops: Vec::with_capacity(100),
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
+            stats,
         };
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
             scorer.advance();
@@ -410,13 +453,16 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_match(&mut self) -> bool {
-        if self.similarity_weight_opt.is_some() {
+        self.record_candidate_doc();
+        let matched = if self.similarity_weight_opt.is_some() {
             let count = self.compute_phrase_count();
             self.phrase_count = count;
             count > 0u32
         } else {
             self.phrase_exists()
-        }
+        };
+        self.record_phrase_result(matched);
+        matched
     }
 
     fn phrase_exists(&mut self) -> bool {
@@ -467,12 +513,14 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
                 self.left_slops.clear();
             }
         }
+        self.record_position_read(self.left_positions.len());
         for i in 1..self.num_terms - 1 {
             {
                 self.intersection_docset
                     .docset_mut_specialized(i)
                     .positions(&mut self.right_positions);
             }
+            self.record_position_read(self.right_positions.len());
             if self.has_slop() {
                 if self.num_terms > 2 {
                     intersection_count_with_carrying_slop(
@@ -502,10 +550,43 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         self.intersection_docset
             .docset_mut_specialized(self.num_terms - 1)
             .positions(&mut self.right_positions);
+        self.record_position_read(self.right_positions.len());
     }
 
     fn has_slop(&self) -> bool {
         self.slop > 0
+    }
+
+    fn record_candidate_doc(&self) {
+        if let Some(stats) = &self.stats {
+            stats
+                .phrase_candidate_docs
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn record_position_read(&self, num_values: usize) {
+        if let Some(stats) = &self.stats {
+            stats
+                .phrase_position_reads
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            stats.phrase_position_values.fetch_add(
+                num_values.min(u64::MAX as usize) as u64,
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+
+    fn record_phrase_result(&self, matched: bool) {
+        if let Some(stats) = &self.stats {
+            if matched {
+                stats.phrase_matches.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                stats
+                    .phrase_non_matches
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
     }
 }
 
