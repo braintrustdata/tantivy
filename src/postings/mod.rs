@@ -236,6 +236,7 @@ pub mod tests {
                        text_field => "d d d d a"
                     ),
                     artifacts: Vec::new(),
+                    stored_document: None,
                 };
                 segment_writer.add_document(op)?;
             }
@@ -244,6 +245,7 @@ pub mod tests {
                     opstamp: 1u64,
                     document: doc!(text_field => "b a"),
                     artifacts: Vec::new(),
+                    stored_document: None,
                 };
                 segment_writer.add_document(op).unwrap();
             }
@@ -254,6 +256,7 @@ pub mod tests {
                     opstamp: 2u64,
                     document: doc!(text_field => text),
                     artifacts: Vec::new(),
+                    stored_document: None,
                 };
                 segment_writer.add_document(op).unwrap();
             }
