@@ -1,5 +1,6 @@
 mod merge_dict_column;
 mod merge_mapping;
+mod sparse;
 mod term_merger;
 
 use std::collections::{BTreeMap, HashSet};
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 pub use merge_mapping::{MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};
 
+use self::sparse::{PackedRowIds, SparseMergeContext};
 use super::writer::ColumnarSerializer;
 use crate::column::{serialize_column_mappable_to_u128, serialize_column_mappable_to_u64};
 use crate::column_values::MergedColumnValues;
@@ -81,6 +83,22 @@ pub fn merge_columnar(
     merge_row_order: MergeRowOrder,
     output: &mut impl io::Write,
 ) -> io::Result<()> {
+    merge_columnar_with_context(
+        columnar_readers,
+        required_columns,
+        merge_row_order,
+        &mut SparseMergeContext::default(),
+        output,
+    )
+}
+
+fn merge_columnar_with_context(
+    columnar_readers: &[&ColumnarReader],
+    required_columns: &[(String, ColumnType)],
+    merge_row_order: MergeRowOrder,
+    sparse_context: &mut SparseMergeContext,
+    output: &mut impl io::Write,
+) -> io::Result<()> {
     let mut serializer = ColumnarSerializer::new(output);
     let num_rows_per_columnar = columnar_readers
         .iter()
@@ -107,6 +125,7 @@ pub fn merge_columnar(
             &num_rows_per_columnar,
             columns,
             &merge_row_order,
+            sparse_context,
             &mut column_serializer,
         )?;
         column_serializer.finalize()?;
@@ -132,6 +151,7 @@ fn merge_column(
     num_docs_per_column: &[u32],
     columns: Vec<Option<DynamicColumn>>,
     merge_row_order: &MergeRowOrder,
+    sparse_context: &mut SparseMergeContext,
     wrt: &mut impl io::Write,
 ) -> io::Result<()> {
     match column_type {
@@ -163,7 +183,25 @@ fn merge_column(
                 column_values: &column_values[..],
                 merge_row_order,
             };
-            serialize_column_mappable_to_u64(merged_column_index, &merge_column_values, wrt)?;
+            if let Some(packed) = sparse_context.prepare(
+                &merged_column_index,
+                column_indexes.iter().map(Some),
+                merge_row_order,
+                num_docs_per_column,
+                |_, rank| rank,
+            ) {
+                let sparse_index = crate::column_index::SerializableColumnIndex::Optional {
+                    non_null_row_ids: Box::new(PackedRowIds(packed)),
+                    num_rows: merge_row_order.num_rows(),
+                };
+                serialize_column_mappable_to_u64(
+                    sparse_index,
+                    &merge_column_values.with_sparse_rows(packed),
+                    wrt,
+                )?;
+            } else {
+                serialize_column_mappable_to_u64(merged_column_index, &merge_column_values, wrt)?;
+            }
         }
         ColumnType::IpAddr => {
             let mut column_indexes: Vec<ColumnIndex> = Vec::with_capacity(columns.len());
@@ -216,7 +254,14 @@ fn merge_column(
             }
             let merged_column_index =
                 crate::column_index::merge_column_index(&column_indexes[..], merge_row_order);
-            merge_bytes_or_str_column(merged_column_index, &bytes_columns, merge_row_order, wrt)?;
+            merge_bytes_or_str_column(
+                merged_column_index,
+                &bytes_columns,
+                merge_row_order,
+                num_docs_per_column,
+                sparse_context,
+                wrt,
+            )?;
         }
     }
     Ok(())
@@ -483,3 +528,125 @@ fn min_max_if_numerical(column: &DynamicColumn) -> Option<(NumericalValue, Numer
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod coverage_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_and_conflicting_required_types() {
+        let mut writer = crate::ColumnarWriter::default();
+        writer.record_numerical(7, "value", u64::MAX);
+        let mut bytes = Vec::new();
+        writer.serialize(128, None, &mut bytes).unwrap();
+        let reader = ColumnarReader::open(bytes).unwrap();
+        for shuffled in [false, true] {
+            let order = || -> MergeRowOrder {
+                if shuffled {
+                    ShuffleMergeOrder::for_test(
+                        &[128],
+                        (0..128)
+                            .rev()
+                            .map(|row_id| crate::RowAddr {
+                                segment_ord: 0,
+                                row_id,
+                            })
+                            .collect(),
+                    )
+                    .into()
+                } else {
+                    StackMergeOrder::stack_for_test(&[128]).into()
+                }
+            };
+            let required = ("value".to_owned(), ColumnType::U64);
+            let mut expected = Vec::new();
+            merge_columnar(
+                &[&reader],
+                std::slice::from_ref(&required),
+                order(),
+                &mut expected,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            merge_columnar(
+                &[&reader],
+                &[required.clone(), required.clone()],
+                order(),
+                &mut actual,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            for other in [ColumnType::I64, ColumnType::F64] {
+                let err = merge_columnar(
+                    &[&reader],
+                    &[required.clone(), ("value".to_owned(), other)],
+                    order(),
+                    &mut Vec::new(),
+                )
+                .unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            }
+            let err = merge_columnar(
+                &[&reader],
+                &[("value".to_owned(), ColumnType::I64)],
+                order(),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn required_empty_columns_can_be_merged_again() {
+        for rows in [0, 17] {
+            let required = [
+                ("empty".to_owned(), ColumnType::U64),
+                ("empty".to_owned(), ColumnType::Str),
+            ];
+            let mut writer = crate::ColumnarWriter::default();
+            let mut bytes = Vec::new();
+            writer.serialize(rows, None, &mut bytes).unwrap();
+            let reader = ColumnarReader::open(bytes).unwrap();
+            let mut first = Vec::new();
+            merge_columnar(
+                &[&reader],
+                &required,
+                StackMergeOrder::stack_for_test(&[rows]).into(),
+                &mut first,
+            )
+            .unwrap();
+            let reader = ColumnarReader::open(first.clone()).unwrap();
+            assert_eq!(reader.read_columns("empty").unwrap().len(), 2);
+            let mut second = Vec::new();
+            merge_columnar(
+                &[&reader],
+                &required,
+                StackMergeOrder::stack_for_test(&[rows]).into(),
+                &mut second,
+            )
+            .unwrap();
+            assert_eq!(first, second);
+        }
+    }
+
+    #[test]
+    fn incompatible_nonnumerical_coercion_returns_error() {
+        let mut writer = crate::ColumnarWriter::default();
+        writer.record_bool(0, "value", true);
+        let mut bytes = Vec::new();
+        writer.serialize(1, None, &mut bytes).unwrap();
+        let reader = ColumnarReader::open(bytes).unwrap();
+        let column = reader
+            .read_columns("value")
+            .unwrap()
+            .remove(0)
+            .open()
+            .unwrap();
+        let error = coerce_column(ColumnType::Str, column).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(fuzzing)]
+pub use sparse::merge_columnar_for_fuzzing;

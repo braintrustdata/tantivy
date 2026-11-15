@@ -24,6 +24,21 @@ fn detect_cardinality_single_column_index(
         // If we are already "Full", we are guaranteed to stay "Full" after deletes.
         return Cardinality::Full;
     }
+    if let ColumnIndex::Optional(index) = column_index {
+        let alive = alive_bitset.len();
+        if alive == 0 {
+            return Cardinality::Full;
+        }
+        if (index.num_non_nulls() as usize) < alive {
+            return Cardinality::Optional;
+        }
+        let mut cursor = index.cursor();
+        return if alive_bitset.iter().all(|row| cursor.contains(row)) {
+            Cardinality::Full
+        } else {
+            Cardinality::Optional
+        };
+    }
     let mut cardinality_so_far = Cardinality::Full;
     for doc_id in alive_bitset.iter() {
         let num_values = column_index.value_row_ids(doc_id).len();
@@ -206,5 +221,39 @@ mod tests {
         };
         let start_indexes: Vec<RowId> = start_index_iterable.boxed_iter().collect();
         assert_eq!(&start_indexes, &[0, 3, 5, 6]);
+    }
+}
+
+#[cfg(test)]
+mod coverage_boundary_tests {
+    use super::*;
+    use crate::column_index::OptionalIndex;
+    use crate::{RowAddr, ShuffleMergeOrder};
+
+    #[test]
+    fn optional_cardinality_survivor_boundaries() {
+        let index = ColumnIndex::Optional(OptionalIndex::for_test(8, &[0, 7]));
+        for (live, expected) in [
+            (vec![], Cardinality::Full),
+            (vec![0], Cardinality::Full),
+            (vec![1], Cardinality::Optional),
+            (vec![0, 7], Cardinality::Full),
+            (vec![0, 1], Cardinality::Optional),
+            (vec![0, 1, 7], Cardinality::Optional),
+        ] {
+            let order = ShuffleMergeOrder::for_test(
+                &[8],
+                live.into_iter()
+                    .map(|row_id| RowAddr {
+                        segment_ord: 0,
+                        row_id,
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                detect_cardinality_single_column_index(&index, &order.alive_bitsets[0]),
+                expected
+            );
+        }
     }
 }

@@ -10,3 +10,6 @@ pub(crate) use merge::ColumnTypeCategory;
 pub use merge::{merge_columnar, MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};
 pub use reader::ColumnarReader;
 pub use writer::ColumnarWriter;
+
+#[cfg(fuzzing)]
+pub use merge::merge_columnar_for_fuzzing;

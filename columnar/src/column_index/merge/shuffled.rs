@@ -49,14 +49,26 @@ struct ShuffledIndex<'a> {
 
 impl<'a> Iterable<u32> for ShuffledIndex<'a> {
     fn boxed_iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        let mut cursors: Vec<_> = self
+            .column_indexes
+            .iter()
+            .map(|index| match index {
+                ColumnIndex::Optional(index) => index.cursor_for_sparse_blocks(),
+                _ => None,
+            })
+            .collect();
         Box::new(
             self.merge_order
                 .iter_new_to_old_row_addrs()
                 .enumerate()
-                .filter_map(|(new_row_id, old_row_addr)| {
+                .filter_map(move |(new_row_id, old_row_addr)| {
                     let column_index = &self.column_indexes[old_row_addr.segment_ord as usize];
                     let row_id = new_row_id as u32;
-                    if column_index.has_value(old_row_addr.row_id) {
+                    let present = match &mut cursors[old_row_addr.segment_ord as usize] {
+                        Some(cursor) => cursor.contains(old_row_addr.row_id),
+                        None => column_index.has_value(old_row_addr.row_id),
+                    };
+                    if present {
                         Some(row_id)
                     } else {
                         None
@@ -85,19 +97,31 @@ fn iter_num_values<'a>(
     column_indexes: &'a [ColumnIndex],
     merge_order: &'a ShuffleMergeOrder,
 ) -> impl Iterator<Item = u32> + 'a {
-    merge_order.iter_new_to_old_row_addrs().map(|row_addr| {
-        let column_index = &column_indexes[row_addr.segment_ord as usize];
-        match column_index {
-            ColumnIndex::Empty { .. } => 0u32,
-            ColumnIndex::Full => 1,
-            ColumnIndex::Optional(optional_index) => {
-                u32::from(optional_index.contains(row_addr.row_id))
+    let mut cursors: Vec<_> = column_indexes
+        .iter()
+        .map(|index| match index {
+            ColumnIndex::Optional(index) => index.cursor_for_sparse_blocks(),
+            _ => None,
+        })
+        .collect();
+    merge_order
+        .iter_new_to_old_row_addrs()
+        .map(move |row_addr| {
+            let column_index = &column_indexes[row_addr.segment_ord as usize];
+            match column_index {
+                ColumnIndex::Empty { .. } => 0u32,
+                ColumnIndex::Full => 1,
+                ColumnIndex::Optional(index) => {
+                    u32::from(match &mut cursors[row_addr.segment_ord as usize] {
+                        Some(cursor) => cursor.contains(row_addr.row_id),
+                        None => index.contains(row_addr.row_id),
+                    })
+                }
+                ColumnIndex::Multivalued(multivalued_index) => {
+                    multivalued_index.range(row_addr.row_id).len() as u32
+                }
             }
-            ColumnIndex::Multivalued(multivalued_index) => {
-                multivalued_index.range(row_addr.row_id).len() as u32
-            }
-        }
-    })
+        })
 }
 
 /// Transforms an iterator containing the number of vals per row (with `num_rows` elements)
@@ -167,5 +191,73 @@ mod tests {
         assert_eq!(num_rows, 2);
         let non_null_rows: Vec<RowId> = non_null_row_ids.boxed_iter().collect();
         assert_eq!(&non_null_rows, &[1]);
+    }
+}
+
+#[cfg(test)]
+mod coverage_boundary_tests {
+    use super::*;
+    use crate::column_index::{multivalued_index::MultiValueIndex, OptionalIndex};
+    use crate::RowAddr;
+
+    #[test]
+    fn multivalued_shuffle_with_dense_sparse_full_and_empty_sources() {
+        let indexes = [
+            ColumnIndex::Optional(OptionalIndex::for_test(
+                65537,
+                &(0..5120).collect::<Vec<_>>(),
+            )),
+            ColumnIndex::Optional(OptionalIndex::for_test(65537, &[0, 65536])),
+            ColumnIndex::Full,
+            ColumnIndex::Empty { num_docs: 1 },
+            ColumnIndex::Multivalued(MultiValueIndex::for_test(&[0, 2])),
+        ];
+        let order = ShuffleMergeOrder::for_test(
+            &[65537, 65537, 1, 1, 1],
+            vec![
+                RowAddr {
+                    segment_ord: 0,
+                    row_id: 5119,
+                },
+                RowAddr {
+                    segment_ord: 1,
+                    row_id: 65536,
+                },
+                RowAddr {
+                    segment_ord: 0,
+                    row_id: 5120,
+                },
+                RowAddr {
+                    segment_ord: 2,
+                    row_id: 0,
+                },
+                RowAddr {
+                    segment_ord: 3,
+                    row_id: 0,
+                },
+                RowAddr {
+                    segment_ord: 4,
+                    row_id: 0,
+                },
+                RowAddr {
+                    segment_ord: 1,
+                    row_id: 0,
+                },
+                RowAddr {
+                    segment_ord: 0,
+                    row_id: 0,
+                },
+            ],
+        );
+        let merged = merge_column_index_shuffled(&indexes, Cardinality::Multivalued, &order);
+        let SerializableColumnIndex::Multivalued(offsets) = merged else {
+            panic!()
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                offsets.boxed_iter().collect::<Vec<_>>(),
+                [0, 1, 2, 2, 3, 3, 5, 6, 7]
+            );
+        }
     }
 }
