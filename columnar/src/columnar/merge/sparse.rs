@@ -164,11 +164,14 @@ impl Iterable<u32> for PackedRowIds<'_> {
 
 #[cfg(test)]
 mod sparse_tests {
+    use proptest::prelude::*;
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
     use super::*;
     use crate::columnar::merge::merge_columnar_with_context;
     use crate::{ColumnType, ColumnarReader, ColumnarWriter, RowAddr};
-    use proptest::prelude::*;
-    use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
     pub(super) fn reader(rows: u32, stride: u32, multi: bool) -> ColumnarReader {
         let mut writer = ColumnarWriter::default();

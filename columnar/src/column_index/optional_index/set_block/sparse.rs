@@ -34,8 +34,7 @@ impl<'a> SelectCursor<u16> for SparseBlock<'a> {
 impl<'a> Set<u16> for SparseBlock<'a> {
     type SelectCursor<'b>
         = Self
-    where
-        Self: 'b;
+    where Self: 'b;
 
     #[inline(always)]
     fn contains(&self, el: u16) -> bool {
@@ -177,8 +176,9 @@ impl<'a> SparseBlock<'a> {
 
 #[cfg(test)]
 mod cursor_tests {
-    use super::*;
     use proptest::prelude::*;
+
+    use super::*;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]

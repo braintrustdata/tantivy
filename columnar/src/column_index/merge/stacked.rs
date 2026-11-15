@@ -158,9 +158,10 @@ mod tests {
 
 #[cfg(test)]
 mod sparse_offset_tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::column_index::{OptionalIndex, Set};
-    use proptest::prelude::*;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
@@ -206,7 +207,14 @@ mod coverage_boundary_tests {
         for inputs in [
             vec![],
             vec![vec![]],
-            vec![vec![0u32, 2], vec![], vec![], vec![0], vec![0, 0, 3], vec![]],
+            vec![
+                vec![0u32, 2],
+                vec![],
+                vec![],
+                vec![0],
+                vec![0, 0, 3],
+                vec![],
+            ],
         ] {
             let expected = if inputs.len() > 1 {
                 vec![0, 2, 2, 5]

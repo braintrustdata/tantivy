@@ -197,7 +197,8 @@ mod tests {
 #[cfg(test)]
 mod coverage_boundary_tests {
     use super::*;
-    use crate::column_index::{multivalued_index::MultiValueIndex, OptionalIndex};
+    use crate::column_index::multivalued_index::MultiValueIndex;
+    use crate::column_index::OptionalIndex;
     use crate::RowAddr;
 
     #[test]
