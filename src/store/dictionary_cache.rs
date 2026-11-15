@@ -1,8 +1,8 @@
-//! Process-wide cache of decompressed dictionary bytes, keyed by path.
+//! Process-wide weak caches of dictionary bytes and prepared contexts, keyed by path.
 //!
-//! Weak-referenced, not LRU: an entry serves cached bytes for as long as *something else* (a
-//! `SegmentReader`, `StoreReader`, etc.) still holds a strong `Arc` to them; once every such
-//! holder drops, the entry naturally goes dead and the next lookup re-decompresses. This trades
+//! Weak-referenced, not LRU: an entry serves cached bytes or prepared state for as long as a
+//! caller (`SegmentReader`, `StoreReader`, etc.) holds a strong `Arc`; once every such holder
+//! drops, the entry naturally goes dead and the next lookup reloads the dictionary. This trades
 //! away an explicit memory ceiling for simplicity -- no eviction policy to tune, memory tracks
 //! actual live usage. Mirrors `MmapDirectory`'s own `MmapCache` (`directory/mmap_directory.rs`),
 //! the only other path-keyed weak-ref cache in this fork.
@@ -22,7 +22,33 @@ use std::sync::{Arc, RwLock, Weak};
 
 use once_cell::sync::Lazy;
 
+use super::decompressors::DecompressionContext;
+
 static CACHE: Lazy<RwLock<HashMap<String, Weak<[u8]>>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+static CONTEXT_CACHE: Lazy<RwLock<HashMap<String, Weak<DecompressionContext>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+pub(crate) fn get_context(path: &str) -> Option<Arc<DecompressionContext>> {
+    CONTEXT_CACHE
+        .read()
+        .unwrap()
+        .get(path)
+        .and_then(Weak::upgrade)
+}
+
+pub(crate) fn insert_context(
+    path: &str,
+    context: Arc<DecompressionContext>,
+) -> Arc<DecompressionContext> {
+    let mut cache = CONTEXT_CACHE.write().unwrap();
+    if let Some(existing) = cache.get(path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    cache.retain(|_, weak| weak.strong_count() > 0);
+    cache.insert(path.to_string(), Arc::downgrade(&context));
+    context
+}
 
 /// Returns cached bytes for `path`, if a strong reference is still alive somewhere.
 pub(crate) fn get(path: &str) -> Option<Arc<[u8]>> {
@@ -53,4 +79,5 @@ pub(crate) fn insert(path: &str, bytes: &Arc<[u8]>) {
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     CACHE.write().unwrap().clear();
+    CONTEXT_CACHE.write().unwrap().clear();
 }

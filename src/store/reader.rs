@@ -28,7 +28,7 @@ type Block = OwnedBytes;
 pub struct StoreReader {
     decompressor: Decompressor,
     dictionary_used: bool,
-    decompression_context: DecompressionContext,
+    decompression_context: Arc<DecompressionContext>,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
     space_usage: StoreSpaceUsage,
@@ -125,6 +125,18 @@ impl StoreReader {
         cache_num_blocks: usize,
         dictionary: Option<Arc<[u8]>>,
     ) -> io::Result<StoreReader> {
+        Self::open_with_context(
+            store_file,
+            cache_num_blocks,
+            Arc::new(DecompressionContext::new(dictionary)),
+        )
+    }
+
+    pub(crate) fn open_with_context(
+        store_file: FileSlice,
+        cache_num_blocks: usize,
+        decompression_context: Arc<DecompressionContext>,
+    ) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
 
         // No upfront dictionary check here: blocks compressed against a dictionary carry a zstd
@@ -140,7 +152,7 @@ impl StoreReader {
         Ok(StoreReader {
             decompressor: footer.decompressor,
             dictionary_used: footer.dictionary_used(),
-            decompression_context: DecompressionContext::new(dictionary),
+            decompression_context,
             data: data_file,
             cache: BlockCache {
                 cache: NonZeroUsize::new(cache_num_blocks)
