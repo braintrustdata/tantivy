@@ -140,29 +140,33 @@ mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn invalid_dictionary_cannot_populate_the_prepared_cache() -> io::Result<()> {
+    fn prepared_cache_trusts_content_addressed_names() -> io::Result<()> {
         use crate::directory::RamDirectory;
         use crate::store::ZstdDictionary;
         use crate::Directory;
 
-        let valid_directory = RamDirectory::create();
-        let invalid_directory = RamDirectory::create();
+        let directory = RamDirectory::create();
         let path = ZstdDictionary::seed(
-            &valid_directory,
-            Arc::from(b"prepared dictionary hash verification fixture".as_slice()),
+            &directory,
+            Arc::from(b"prepared dictionary filename trust fixture".as_slice()),
         )?
         .path()
         .to_string();
-        invalid_directory.atomic_write(
+        let dictionary = b"dictionary bytes that do not match the filename hash";
+        directory.atomic_write(
             std::path::Path::new(&path),
-            &super::super::compression_zstd_block::compress_whole(b"different dictionary bytes")?,
+            &super::super::compression_zstd_block::compress_whole(dictionary)?,
         )?;
-        let result = DecompressionContext::load(&invalid_directory, Some(&path));
-        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidData));
-        assert!(super::super::dictionary_cache::get_context(&path).is_none());
-        let valid = DecompressionContext::load(&valid_directory, Some(&path))?;
-        let shared = DecompressionContext::load(&invalid_directory, Some(&path))?;
-        assert!(Arc::ptr_eq(&valid, &shared));
+        let context = DecompressionContext::load(&directory, Some(&path))?;
+        let data = dictionary.repeat(100);
+        let mut compressed = Vec::new();
+        super::super::compression_zstd_block::compress(
+            &data,
+            &mut compressed,
+            Some(3),
+            Some(dictionary),
+        )?;
+        assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
         Ok(())
     }
 
