@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use common::{BinarySerializable, OwnedBytes};
 use lru::LruCache;
 
+use super::decompressors::DecompressionContext;
 use super::footer::DocStoreFooter;
 use super::index::SkipIndex;
 use super::Decompressor;
@@ -27,7 +28,7 @@ type Block = OwnedBytes;
 pub struct StoreReader {
     decompressor: Decompressor,
     dictionary_used: bool,
-    dictionary: Option<Arc<[u8]>>,
+    decompression_context: DecompressionContext,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
     space_usage: StoreSpaceUsage,
@@ -139,7 +140,7 @@ impl StoreReader {
         Ok(StoreReader {
             decompressor: footer.decompressor,
             dictionary_used: footer.dictionary_used(),
-            dictionary,
+            decompression_context: DecompressionContext::new(dictionary),
             data: data_file,
             cache: BlockCache {
                 cache: NonZeroUsize::new(cache_num_blocks)
@@ -200,7 +201,7 @@ impl StoreReader {
         let compressed_block = self.get_compressed_block(checkpoint)?;
         let decompressed_block = OwnedBytes::new(
             self.decompressor
-                .decompress(compressed_block.as_ref(), self.dictionary.as_deref())?,
+                .decompress(compressed_block.as_ref(), &self.decompression_context)?,
         );
 
         self.cache
@@ -375,7 +376,7 @@ impl StoreReader {
 
         let decompressed_block = OwnedBytes::new(
             self.decompressor
-                .decompress(compressed_block.as_ref(), self.dictionary.as_deref())?,
+                .decompress(compressed_block.as_ref(), &self.decompression_context)?,
         );
 
         self.cache

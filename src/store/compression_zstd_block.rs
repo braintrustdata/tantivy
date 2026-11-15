@@ -1,6 +1,8 @@
 use std::io;
 
-use zstd::bulk::{compress_to_buffer, decompress_to_buffer, Compressor, Decompressor};
+use zstd::bulk::{compress_to_buffer, Compressor};
+use zstd::dict::DecoderDictionary;
+use zstd::zstd_safe::DCtx;
 use zstd::DEFAULT_COMPRESSION_LEVEL;
 
 #[inline]
@@ -51,7 +53,8 @@ pub fn decompress_whole(bytes: &[u8]) -> io::Result<Vec<u8>> {
 pub fn decompress(
     compressed: &[u8],
     decompressed: &mut Vec<u8>,
-    dictionary: Option<&[u8]>,
+    decompressor: &mut DCtx<'_>,
+    dictionary: Option<&DecoderDictionary<'_>>,
 ) -> io::Result<()> {
     let count_size = std::mem::size_of::<u32>();
     let uncompressed_size = u32::from_le_bytes(
@@ -65,12 +68,15 @@ pub fn decompress(
     decompressed.clear();
     decompressed.resize(uncompressed_size, 0);
 
-    let decompressed_size = if let Some(dict) = dictionary {
-        Decompressor::with_dictionary(dict)?
-            .decompress_to_buffer(&compressed[count_size..], decompressed)?
-    } else {
-        decompress_to_buffer(&compressed[count_size..], decompressed)?
-    };
+    let decompressed_size = match dictionary {
+        Some(dictionary) => decompressor.decompress_using_ddict(
+            decompressed.as_mut_slice(),
+            &compressed[count_size..],
+            dictionary.as_ddict(),
+        ),
+        None => decompressor.decompress(decompressed.as_mut_slice(), &compressed[count_size..]),
+    }
+    .map_err(|code| io::Error::new(io::ErrorKind::Other, zstd::zstd_safe::get_error_name(code)))?;
 
     if decompressed_size != uncompressed_size {
         return Err(io::Error::new(
