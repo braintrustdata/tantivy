@@ -30,6 +30,8 @@
 //! - at the index level, the [`Searcher::doc()`](crate::Searcher::doc) method
 
 mod compressors;
+mod encoder_parameters;
+pub use self::encoder_parameters::{ZstdEncoderParameters, ZstdStrategy};
 mod decompressors;
 #[cfg(feature = "zstd-compression")]
 mod dictionary_cache;

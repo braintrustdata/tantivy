@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::io;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, HasLen, OwnedBytes};
@@ -21,7 +21,7 @@ const COMMON_INPUTS_INV: [u8; 64] = [
 pub(crate) struct LazyFstIndex {
     fst_file: FileSlice,
     meta: LazyFstMeta,
-    pages: Arc<Mutex<PageCache>>,
+    pages: Arc<[CachedPage]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,9 +30,10 @@ struct LazyFstMeta {
     root_addr: usize,
 }
 
-#[derive(Debug)]
-struct PageCache {
-    pages: HashMap<usize, OwnedBytes>,
+#[derive(Debug, Default)]
+struct CachedPage {
+    bytes: OnceLock<OwnedBytes>,
+    loading: Mutex<()>,
 }
 
 impl LazyFstIndex {
@@ -49,8 +50,8 @@ impl LazyFstIndex {
 
         let mut footer = fst_file.read_bytes_slice(fst_file.len() - 16..fst_file.len())?;
         let _len = u64::deserialize(&mut footer)?;
-        let root_addr = usize::try_from(u64::deserialize(&mut footer)?)
-            .map_err(|_| corruption_error())?;
+        let root_addr =
+            usize::try_from(u64::deserialize(&mut footer)?).map_err(|_| corruption_error())?;
 
         if (root_addr == EMPTY_ADDRESS && fst_file.len() != 32)
             || (root_addr != EMPTY_ADDRESS && root_addr + 17 != fst_file.len())
@@ -58,12 +59,13 @@ impl LazyFstIndex {
             return Err(corruption_error());
         }
 
+        let pages = (0..fst_file.len().div_ceil(PAGE_SIZE))
+            .map(|_| CachedPage::default())
+            .collect();
         Ok(LazyFstIndex {
             fst_file,
             meta: LazyFstMeta { version, root_addr },
-            pages: Arc::new(Mutex::new(PageCache {
-                pages: HashMap::new(),
-            })),
+            pages,
         })
     }
 
@@ -223,24 +225,29 @@ impl LazyFstIndex {
 
     fn read_byte(&self, pos: usize) -> io::Result<u8> {
         let bytes = self.read_range(pos..pos + 1)?;
-        Ok(bytes.as_slice()[0])
+        Ok(bytes[0])
     }
 
     fn unpack_uint(&self, range: Range<usize>) -> io::Result<u64> {
         let bytes = self.read_range(range)?;
-        Ok(unpack_uint(bytes.as_slice()))
+        Ok(unpack_uint(&bytes))
     }
 
-    fn read_range(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+    fn read_range(&self, range: Range<usize>) -> io::Result<Cow<'_, [u8]>> {
         if range.end > self.fst_file.len() || range.start > range.end {
             return Err(corruption_error());
+        }
+        if range.is_empty() {
+            return Ok(Cow::Borrowed(&[]));
         }
         let start_page = range.start / PAGE_SIZE;
         let end_page = (range.end.saturating_sub(1)) / PAGE_SIZE;
         if start_page == end_page {
             let page = self.page(start_page)?;
             let page_start = start_page * PAGE_SIZE;
-            return Ok(page.slice(range.start - page_start..range.end - page_start));
+            return Ok(Cow::Borrowed(
+                &page.as_slice()[range.start - page_start..range.end - page_start],
+            ));
         }
 
         let mut bytes = Vec::with_capacity(range.end - range.start);
@@ -251,22 +258,25 @@ impl LazyFstIndex {
             let end = (range.end - page_start).min(page.len());
             bytes.extend_from_slice(&page.as_slice()[start..end]);
         }
-        Ok(OwnedBytes::new(bytes))
+        Ok(Cow::Owned(bytes))
     }
 
-    fn page(&self, page_id: usize) -> io::Result<OwnedBytes> {
-        let mut cache = self
-            .pages
+    fn page(&self, page_id: usize) -> io::Result<&OwnedBytes> {
+        let page = self.pages.get(page_id).ok_or_else(corruption_error)?;
+        if let Some(bytes) = page.bytes.get() {
+            return Ok(bytes);
+        }
+        let _loading = page
+            .loading
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "FST page cache poisoned"))?;
-        if let Some(page) = cache.pages.get(&page_id) {
-            return Ok(page.clone());
+        if let Some(bytes) = page.bytes.get() {
+            return Ok(bytes);
         }
         let start = page_id * PAGE_SIZE;
         let end = (start + PAGE_SIZE).min(self.fst_file.len());
-        let page = self.fst_file.read_bytes_slice(start..end)?;
-        cache.pages.insert(page_id, page.clone());
-        Ok(page)
+        let bytes = self.fst_file.read_bytes_slice(start..end)?;
+        Ok(page.bytes.get_or_init(|| bytes))
     }
 }
 
@@ -348,7 +358,6 @@ impl LazyNode {
                 )?;
                 let inputs = index.read_range(inputs_start..inputs_start + self.ntrans)?;
                 Ok(inputs
-                    .as_slice()
                     .iter()
                     .position(|&candidate| candidate == input)
                     .map(|i| self.ntrans - i - 1))
@@ -556,4 +565,108 @@ fn checked_sub(left: usize, right: usize) -> io::Result<usize> {
 
 fn corruption_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "FST data is corrupted")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use common::file_slice::FileHandle;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestFile {
+        bytes: OwnedBytes,
+        reads: AtomicUsize,
+        fail_next: AtomicBool,
+    }
+
+    impl HasLen for TestFile {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl FileHandle for TestFile {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "test read failure",
+                ));
+            }
+            Ok(self.bytes.slice(range))
+        }
+    }
+
+    fn fixture() -> (LazyFstIndex, Arc<TestFile>) {
+        let mut builder = crate::SSTableIndexBuilder::default();
+        let mut keys: Vec<_> = (0..4096u64)
+            .map(|i| format!("{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15)))
+            .collect();
+        keys.sort_unstable();
+        for (i, key) in keys.iter().enumerate() {
+            builder.add_block(key.as_bytes(), i * 10..i * 10 + 10, i as u64);
+        }
+        let mut bytes = Vec::new();
+        let fst_len = builder.serialize(&mut bytes).unwrap() as usize;
+        assert!(fst_len > PAGE_SIZE * 2);
+        bytes.truncate(fst_len);
+        let file = Arc::new(TestFile {
+            bytes: OwnedBytes::new(bytes),
+            reads: AtomicUsize::new(0),
+            fail_next: AtomicBool::new(false),
+        });
+        let index = LazyFstIndex::open(FileSlice::new(file.clone())).unwrap();
+        file.reads.store(0, Ordering::SeqCst);
+        (index, file)
+    }
+
+    #[test]
+    fn test_lazy_fst_page_reads_borrow_and_cross_boundaries() {
+        let (index, file) = fixture();
+        let bytes = index.read_range(PAGE_SIZE - 4..PAGE_SIZE + 4).unwrap();
+        assert_eq!(&*bytes, &file.bytes[PAGE_SIZE - 4..PAGE_SIZE + 4]);
+        assert_eq!(file.reads.load(Ordering::SeqCst), 2);
+        let bytes = index.read_range(PAGE_SIZE..PAGE_SIZE + 4).unwrap();
+        assert!(matches!(bytes, Cow::Borrowed(_)));
+        assert_eq!(&*bytes, &file.bytes[PAGE_SIZE..PAGE_SIZE + 4]);
+        assert_eq!(file.reads.load(Ordering::SeqCst), 2);
+        assert!(index.read_range(file.len()..file.len()).unwrap().is_empty());
+        assert!(index.read_range(file.len()..file.len() + 1).is_err());
+        assert!(index.read_range(Range { start: 2, end: 1 }).is_err());
+    }
+
+    #[test]
+    fn test_lazy_fst_failed_page_read_can_retry() {
+        let (index, file) = fixture();
+        file.fail_next.store(true, Ordering::SeqCst);
+        assert_eq!(
+            index.read_byte(PAGE_SIZE).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(index.read_byte(PAGE_SIZE).unwrap(), file.bytes[PAGE_SIZE]);
+        assert_eq!(file.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(index.read_byte(PAGE_SIZE).unwrap(), file.bytes[PAGE_SIZE]);
+        assert_eq!(file.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_lazy_fst_concurrent_cold_page_is_loaded_once() {
+        let (index, file) = fixture();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        assert_eq!(index.read_byte(PAGE_SIZE).unwrap(), file.bytes[PAGE_SIZE]);
+                    }
+                });
+            }
+        });
+        assert_eq!(file.reads.load(Ordering::SeqCst), 1);
+    }
 }

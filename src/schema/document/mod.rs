@@ -163,10 +163,10 @@ mod value;
 use std::collections::BTreeMap;
 use std::mem;
 
-pub(crate) use self::de::BinaryDocumentDeserializer;
 pub use self::de::{
-    ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
-    ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
+    ArrayAccess, BinaryDocumentDeserializer, BinaryValueDeserializer, DeserializeError,
+    DocumentDeserialize, DocumentDeserializer, ObjectAccess, ValueDeserialize, ValueDeserializeSeed,
+    ValueDeserializer, ValueType, ValueVisitor,
 };
 pub use self::default_document::{DocParsingError, TantivyDocument};
 pub use self::owned_value::OwnedValue;

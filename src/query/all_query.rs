@@ -54,6 +54,17 @@ impl DocSet for AllScorer {
         self.doc
     }
 
+    #[inline(always)]
+    fn seek(&mut self, target: DocId) -> DocId {
+        let target = self.doc.max(target);
+        self.doc = if target >= self.max_doc {
+            TERMINATED
+        } else {
+            target
+        };
+        self.doc
+    }
+
     fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         if self.doc() == TERMINATED {
             return 0;
@@ -97,7 +108,9 @@ impl Scorer for AllScorer {
 mod tests {
     use super::AllQuery;
     use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
-    use crate::query::{AllScorer, EnableScoring, Query};
+    use crate::query::{
+        intersect_scorers, AllScorer, ConstScorer, EnableScoring, Query, VecDocSet,
+    };
     use crate::schema::{Schema, TEXT};
     use crate::{Index, IndexWriter};
 
@@ -156,6 +169,55 @@ mod tests {
             assert_eq!(scorer.score(), 1.5);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_seek() {
+        let mut scorer = AllScorer {
+            doc: 0,
+            max_doc: 100,
+        };
+        for target in [0, 1, 42, 42, 98] {
+            assert_eq!(scorer.seek(target), target);
+            assert_eq!(scorer.doc(), target);
+        }
+        assert_eq!(scorer.advance(), 99);
+        assert_eq!(scorer.seek(100), TERMINATED);
+        assert_eq!(scorer.seek(0), TERMINATED);
+        assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+    }
+
+    #[test]
+    fn test_seek_boundaries() {
+        for max_doc in [0, 1, 100, TERMINATED] {
+            for target in [max_doc, TERMINATED] {
+                let mut scorer = AllScorer { doc: 0, max_doc };
+                assert_eq!(scorer.seek(target), TERMINATED);
+                assert_eq!(scorer.doc(), TERMINATED);
+            }
+            if max_doc > 0 {
+                let mut scorer = AllScorer { doc: 0, max_doc };
+                assert_eq!(scorer.seek(max_doc - 1), max_doc - 1);
+                assert_eq!(scorer.seek(max_doc), TERMINATED);
+            }
+        }
+    }
+
+    #[test]
+    fn test_seek_sparse_intersection() {
+        let mut scorer = intersect_scorers(vec![
+            Box::new(AllScorer {
+                doc: 0,
+                max_doc: TERMINATED,
+            }),
+            Box::new(ConstScorer::new(
+                VecDocSet::from(vec![1_000_000_000, 2_000_000_000]),
+                1.0,
+            )),
+        ]);
+        assert_eq!(scorer.doc(), 1_000_000_000);
+        assert_eq!(scorer.seek(1_500_000_000), 2_000_000_000);
+        assert_eq!(scorer.advance(), TERMINATED);
     }
 
     #[test]

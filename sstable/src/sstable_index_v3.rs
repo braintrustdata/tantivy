@@ -999,6 +999,58 @@ mod tests {
     }
 
     #[test]
+    fn test_sstable_index_lazy_fst_concurrent_locate_matches_eager() {
+        let mut keys: Vec<_> = (0..4096u64)
+            .map(|i| format!("{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15)).into_bytes())
+            .collect();
+        keys.sort_unstable();
+        let mut builder = SSTableIndexBuilder::default();
+        for (i, key) in keys.iter().enumerate() {
+            builder.add_block(key, i * 10..i * 10 + 10, i as u64);
+        }
+        let mut bytes = Vec::new();
+        let fst_len = builder.serialize(&mut bytes).unwrap();
+        assert!(fst_len > 32 * 1024);
+        let bytes = OwnedBytes::new(bytes);
+        let eager = SSTableIndexV3::load(bytes.clone(), fst_len).unwrap();
+        let (fst, blocks) = bytes.split(fst_len as usize);
+        let lazy = SSTableIndexV3::load_lazy(
+            FileSlice::new(Arc::new(fst)),
+            FileSlice::new(Arc::new(blocks)),
+        )
+        .unwrap();
+        let mut queries = vec![Vec::new(), vec![0xff]];
+        for key in keys {
+            let mut absent = key.clone();
+            absent.push(0);
+            queries.push(key);
+            queries.push(absent);
+        }
+        let expected: Vec<_> = queries
+            .iter()
+            .map(|key| eager.locate_with_key_result(key).unwrap())
+            .collect();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for worker in 0..16 {
+                let queries = &queries;
+                let expected = &expected;
+                let lazy = &lazy;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in (worker..queries.len()).step_by(16) {
+                        assert_eq!(
+                            lazy.locate_with_key_result(&queries[i]).unwrap(),
+                            expected[i]
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn test_sstable_with_corrupted_data() {
         let mut sstable_builder = SSTableIndexBuilder::default();
         sstable_builder.add_block(b"aaa", 10..20, 0u64);

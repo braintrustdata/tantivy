@@ -163,8 +163,11 @@ mod tests {
         super::super::compression_zstd_block::compress(
             &data,
             &mut compressed,
-            Some(3),
-            Some(dictionary),
+            &mut super::super::compression_zstd_block::new_compressor(
+                Some(3),
+                Some(dictionary),
+                &Default::default(),
+            )?,
         )?;
         assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
         Ok(())
@@ -189,8 +192,11 @@ mod tests {
         super::super::compression_zstd_block::compress(
             &data,
             &mut compressed,
-            Some(3),
-            Some(dictionary),
+            &mut super::super::compression_zstd_block::new_compressor(
+                Some(3),
+                Some(dictionary),
+                &Default::default(),
+            )?,
         )?;
         assert_eq!(Decompressor::Zstd.decompress(&compressed, &first)?, data);
         directory.delete(std::path::Path::new(&path)).unwrap();
@@ -227,8 +233,11 @@ mod tests {
                 super::super::compression_zstd_block::compress(
                     &data,
                     &mut compressed,
-                    Some(3),
-                    dictionary,
+                    &mut super::super::compression_zstd_block::new_compressor(
+                        Some(3),
+                        dictionary,
+                        &Default::default(),
+                    )?,
                 )?;
                 assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
                 assert!(Decompressor::Zstd
@@ -262,8 +271,11 @@ mod tests {
                 super::super::compression_zstd_block::compress(
                     data.as_bytes(),
                     &mut compressed,
-                    Some(3),
-                    Some(dictionary),
+                    &mut super::super::compression_zstd_block::new_compressor(
+                        Some(3),
+                        Some(dictionary),
+                        &Default::default(),
+                    )?,
                 )?;
                 Ok((data, compressed))
             })

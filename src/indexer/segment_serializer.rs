@@ -52,12 +52,13 @@ impl SegmentSerializer {
             let dictionary = settings
                 .docstore_compression
                 .resolve_dictionary(segment.index().directory())?;
-            StoreWriter::new(
+            StoreWriter::new_with_zstd_parameters(
                 store_write,
                 settings.docstore_compression,
                 settings.docstore_blocksize,
                 settings.docstore_compress_dedicated_thread,
                 dictionary,
+                segment.index().docstore_zstd_parameters(),
             )?
         };
 

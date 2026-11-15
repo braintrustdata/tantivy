@@ -39,8 +39,33 @@ impl StoreWriter {
         dedicated_thread: bool,
         dictionary: Option<Arc<[u8]>>,
     ) -> io::Result<StoreWriter> {
-        let block_compressor =
-            BlockCompressor::new(compressor.clone(), writer, dedicated_thread, dictionary)?;
+        Self::new_with_zstd_parameters(
+            writer,
+            compressor,
+            block_size,
+            dedicated_thread,
+            dictionary,
+            &Default::default(),
+        )
+    }
+
+    /// Creates a writer with runtime encoder overrides, without changing store metadata.
+    /// Invalid Zstd parameters are returned as errors during compressor construction.
+    pub fn new_with_zstd_parameters(
+        writer: WritePtr,
+        compressor: Compressor,
+        block_size: usize,
+        dedicated_thread: bool,
+        dictionary: Option<Arc<[u8]>>,
+        parameters: &super::ZstdEncoderParameters,
+    ) -> io::Result<StoreWriter> {
+        let block_compressor = BlockCompressor::new(
+            compressor.clone(),
+            writer,
+            dedicated_thread,
+            dictionary,
+            parameters,
+        )?;
         Ok(StoreWriter {
             compressor,
             block_size,
