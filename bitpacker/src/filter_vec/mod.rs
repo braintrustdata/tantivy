@@ -46,6 +46,7 @@ impl FilterImplPerInstructionSet {
     }
 
     #[inline]
+    #[cfg(test)]
     fn filter_vec_in_place(self, range: RangeInclusive<u32>, offset: u32, output: &mut Vec<u32>) {
         match self {
             #[cfg(target_arch = "x86_64")]
@@ -74,8 +75,16 @@ fn get_best_available_instruction_set() -> FilterImplPerInstructionSet {
     FilterImplPerInstructionSet::from(instruction_set_byte)
 }
 
-pub fn filter_vec_in_place(range: RangeInclusive<u32>, offset: u32, output: &mut Vec<u32>) {
-    get_best_available_instruction_set().filter_vec_in_place(range, offset, output)
+pub(crate) fn filter_slice_in_place(
+    range: RangeInclusive<u32>,
+    offset: u32,
+    output: &mut [u32],
+) -> usize {
+    match get_best_available_instruction_set() {
+        #[cfg(target_arch = "x86_64")]
+        FilterImplPerInstructionSet::AVX2 => avx2::filter_slice_in_place(range, offset, output),
+        FilterImplPerInstructionSet::Scalar => scalar::filter_slice_in_place(range, offset, output),
+    }
 }
 
 #[cfg(test)]

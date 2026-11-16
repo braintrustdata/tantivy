@@ -6,16 +6,27 @@ use common::{BinarySerializable, OwnedBytes};
 use fastdivide::DividerU64;
 use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
 
+use crate::column_values::u64_based::paged::ColumnData;
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::{ColumnValues, RowId};
 
 /// Depending on the field type, a different
 /// fast field is required.
 #[derive(Clone)]
-pub struct BitpackedReader {
-    data: OwnedBytes,
+pub struct BitpackedReader<D = OwnedBytes> {
+    data: D,
     bit_unpacker: BitUnpacker,
     stats: ColumnStats,
+}
+
+impl<D> BitpackedReader<D> {
+    pub(crate) fn new(stats: ColumnStats, data: D) -> Self {
+        BitpackedReader {
+            data,
+            bit_unpacker: BitUnpacker::new(num_bits(&stats)),
+            stats,
+        }
+    }
 }
 
 #[inline(always)]
@@ -58,10 +69,10 @@ fn transform_range_before_linear_transformation(
     Some(start_before_gcd_multiplication..=end_before_gcd_multiplication)
 }
 
-impl ColumnValues for BitpackedReader {
+impl<D: ColumnData> ColumnValues for BitpackedReader<D> {
     #[inline(always)]
     fn get_val(&self, doc: u32) -> u64 {
-        self.stats.min_value + self.stats.gcd.get() * self.bit_unpacker.get(doc, &self.data)
+        self.stats.min_value + self.stats.gcd.get() * self.data.get_bits(&self.bit_unpacker, 0, doc)
     }
     #[inline]
     fn min_value(&self) -> u64 {
@@ -88,10 +99,10 @@ impl ColumnValues for BitpackedReader {
             positions.clear();
             return;
         };
-        self.bit_unpacker.get_ids_for_value_range(
+        self.data.get_ids_for_value_range(
+            &self.bit_unpacker,
             transformed_range,
             doc_id_range,
-            &self.data,
             positions,
         );
     }
@@ -139,13 +150,7 @@ impl ColumnCodec for BitpackedCodec {
     /// Opens a fast field given a file.
     fn load(mut data: OwnedBytes) -> io::Result<Self::ColumnValues> {
         let stats = ColumnStats::deserialize(&mut data)?;
-        let num_bits = num_bits(&stats);
-        let bit_unpacker = BitUnpacker::new(num_bits);
-        Ok(BitpackedReader {
-            data,
-            bit_unpacker,
-            stats,
-        })
+        Ok(BitpackedReader::new(stats, data))
     }
 }
 

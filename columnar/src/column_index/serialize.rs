@@ -1,7 +1,7 @@
 use std::io;
 use std::io::Write;
 
-use common::{CountingWriter, OwnedBytes};
+use common::{ChunkedBytes, CountingWriter};
 
 use crate::column_index::multivalued_index::serialize_multivalued_index;
 use crate::column_index::optional_index::serialize_optional_index;
@@ -53,16 +53,16 @@ pub fn serialize_column_index(
 }
 
 /// Open a serialized column index.
-pub fn open_column_index(mut bytes: OwnedBytes) -> io::Result<ColumnIndex> {
-    if bytes.is_empty() {
+pub fn open_column_index(bytes: impl Into<ChunkedBytes>) -> io::Result<ColumnIndex> {
+    let bytes = bytes.into();
+    let Some(&[cardinality_code]) = bytes.contiguous_slice(0..1.min(bytes.len())) else {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "Failed to deserialize column index. Empty buffer.",
         ));
-    }
-    let cardinality_code = bytes[0];
+    };
     let cardinality = Cardinality::try_from_code(cardinality_code)?;
-    bytes.advance(1);
+    let bytes = bytes.slice(1..bytes.len());
     match cardinality {
         Cardinality::Full => Ok(ColumnIndex::Full),
         Cardinality::Optional => {

@@ -2,13 +2,14 @@ mod bitpacked;
 mod blockwise_linear;
 mod line;
 mod linear;
+mod paged;
 mod stats_collector;
 
 use std::io;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::sync::Arc;
 
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, ChunkedBytes, OwnedBytes};
 
 use crate::column_values::monotonic_mapping::{
     StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
@@ -198,6 +199,82 @@ pub fn load_u64_based_column_values<T: MonotonicallyMappableToU64>(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Failed to read codec type"))?;
     bytes.advance(1);
     codec_type.load(bytes)
+}
+
+macro_rules! paged_or_contiguous {
+    ($data:expr, |$bytes:ident| $open:expr) => {
+        match paged::PagedBytes::new($data) {
+            Ok($bytes) => typed($open),
+            Err($bytes) => {
+                let $bytes = $bytes.into_contiguous();
+                typed($open)
+            }
+        }
+    };
+}
+
+/// Load u64-based column values from chunks, such as cached pages.
+///
+/// The values are read from the pages in place when they are split into equal pages, and are
+/// copied into one buffer otherwise.
+/// Small columns are also copied when their bytes occupy less than a quarter of a backing
+/// buffer, so opening them does not retain oversized cache pages.
+pub fn load_u64_based_column_values_from_chunks<T: MonotonicallyMappableToU64>(
+    bytes: ChunkedBytes,
+) -> io::Result<Arc<dyn ColumnValues<T>>> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
+    let codec_type = bytes
+        .contiguous_slice(0..1.min(bytes.len()))
+        .and_then(|first| first.first().copied())
+        .and_then(CodecType::try_from_code)
+        .ok_or_else(|| invalid("Failed to read codec type"))?;
+    let mut header = bytes.slice(1..bytes.len()).into_reader();
+    let stats = ColumnStats::deserialize(&mut header)?;
+    match codec_type {
+        CodecType::Bitpacked => {
+            let data = bytes.slice(1 + header.stream_position()? as usize..bytes.len());
+            Ok(paged_or_contiguous!(data, |data| {
+                bitpacked::BitpackedReader::new(stats, data)
+            }))
+        }
+        CodecType::Linear => {
+            let params = linear::LinearParams::deserialize(&mut header)?;
+            let data = bytes.slice(1 + header.stream_position()? as usize..bytes.len());
+            Ok(paged_or_contiguous!(data, |data| {
+                linear::LinearReader::new(stats, params, data)
+            }))
+        }
+        CodecType::BlockwiseLinear => {
+            let start = 1 + header.stream_position()? as usize;
+            let footer_len_start = bytes
+                .len()
+                .checked_sub(4)
+                .ok_or_else(|| invalid("Missing blockwise linear footer"))?;
+            let footer_len =
+                u32::deserialize(&mut bytes.slice(footer_len_start..bytes.len()).into_reader())?
+                    as usize;
+            let footer_start = footer_len_start
+                .checked_sub(footer_len)
+                .filter(|footer_start| *footer_start >= start)
+                .ok_or_else(|| invalid("Invalid blockwise linear footer"))?;
+            let footer = bytes
+                .slice(footer_start..footer_len_start)
+                .into_contiguous();
+            let data = bytes.slice(start..footer_start);
+            Ok(paged_or_contiguous!(data, |data| {
+                blockwise_linear::BlockwiseLinearReader::new(stats, footer.as_slice(), data)?
+            }))
+        }
+    }
+}
+
+fn typed<T: MonotonicallyMappableToU64>(
+    reader: impl ColumnValues<u64> + 'static,
+) -> Arc<dyn ColumnValues<T>> {
+    Arc::new(monotonic_map_column(
+        reader,
+        StrictlyMonotonicMappingInverter::from(StrictlyMonotonicMappingToInternal::<T>::new()),
+    ))
 }
 
 /// Helper function to serialize a column (autodetect from all codecs) and then open it
