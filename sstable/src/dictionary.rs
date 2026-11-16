@@ -407,7 +407,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
-    pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> StreamerBuilder<'a, TSSTable, A>
+    pub fn search<'a, A: Automaton + 'a>(
+        &'a self,
+        automaton: A,
+    ) -> StreamerBuilder<'a, TSSTable, A>
     where
         A::State: Clone,
     {
@@ -469,12 +472,13 @@ mod tests {
             let always_allowed_range = self.always_allowed_range.lock().unwrap();
             let allowed =
                 allowed_range.contains(&range.start) && allowed_range.contains(&(range.end - 1));
-            let always_allowed = always_allowed_range
-                .as_ref()
-                .is_some_and(|always_allowed_range| {
-                    always_allowed_range.contains(&range.start)
-                        && always_allowed_range.contains(&(range.end - 1))
-                });
+            let always_allowed =
+                always_allowed_range
+                    .as_ref()
+                    .is_some_and(|always_allowed_range| {
+                        always_allowed_range.contains(&range.start)
+                            && always_allowed_range.contains(&(range.end - 1))
+                    });
             if !allowed && !always_allowed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,

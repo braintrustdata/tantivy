@@ -257,7 +257,10 @@ impl SegmentReader {
         //
         // Only the path is captured here; the bytes are read on first doc store access (see
         // `store_dictionary`), so opening a segment stays free of dictionary I/O.
-        let store_dictionary_path = segment.meta().docstore_dictionary_path().map(str::to_string);
+        let store_dictionary_path = segment
+            .meta()
+            .docstore_dictionary_path()
+            .map(str::to_string);
         let store_directory: Arc<dyn Directory> = Arc::new(segment.index().directory().clone());
 
         Ok(SegmentReader {
