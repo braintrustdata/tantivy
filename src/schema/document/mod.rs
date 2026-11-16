@@ -87,6 +87,8 @@
 //!         Some((*field, value))
 //!     }
 //! }
+//! let document = MyCustomDocument { fields: BTreeMap::new() };
+//! assert_eq!(document.iter_fields_and_values().count(), 0);
 //! ```
 //!
 //! You may have noticed in this example that we haven't needed to implement any custom value types,
@@ -165,8 +167,8 @@ use std::mem;
 
 pub use self::de::{
     ArrayAccess, BinaryDocumentDeserializer, BinaryValueDeserializer, DeserializeError,
-    DocumentDeserialize, DocumentDeserializer, ObjectAccess, ValueDeserialize, ValueDeserializeSeed,
-    ValueDeserializer, ValueType, ValueVisitor,
+    DocumentDeserialize, DocumentDeserializer, ObjectAccess, ValueDeserialize,
+    ValueDeserializeSeed, ValueDeserializer, ValueType, ValueVisitor,
 };
 pub use self::default_document::{DocParsingError, TantivyDocument};
 pub use self::owned_value::OwnedValue;

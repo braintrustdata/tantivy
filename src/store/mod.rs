@@ -39,12 +39,12 @@ mod footer;
 mod index;
 mod reader;
 mod writer;
-pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
 pub(crate) use self::compressors::resolve_segment_dictionary;
-#[cfg(all(feature = "zstd-compression", test))]
-pub(crate) use self::dictionary_cache::clear_for_test as clear_dictionary_cache_for_test;
+pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
 pub(crate) use self::decompressors::DecompressionContext;
 pub use self::decompressors::Decompressor;
+#[cfg(all(feature = "zstd-compression", test))]
+pub(crate) use self::dictionary_cache::clear_for_test as clear_dictionary_cache_for_test;
 pub(crate) use self::reader::DOCSTORE_CACHE_CAPACITY;
 pub use self::reader::{CacheStats, StoreReader};
 pub use self::writer::StoreWriter;
@@ -274,9 +274,7 @@ pub mod tests {
     #[test]
     fn test_store_zstd_dictionary_mismatch_errors() -> crate::Result<()> {
         let dictionary: Arc<[u8]> = LOREM.as_bytes().to_vec().into();
-        let wrong_dictionary: Arc<[u8]> = b"not the right dictionary bytes at all"
-            .to_vec()
-            .into();
+        let wrong_dictionary: Arc<[u8]> = b"not the right dictionary bytes at all".to_vec().into();
         let path = Path::new("store");
         let directory = RamDirectory::create();
         let store_wrt = directory.open_write(path)?;
@@ -522,7 +520,9 @@ pub mod tests {
         // `Err` deliberately panics inside a rayon worker instead of surfacing a `Result`
         // (`segment_updater.rs`'s `if cfg!(test) { panic!(...) }`), which is orthogonal to what
         // this test wants to observe.
-        let segments = index.searchable_segments().expect("Searchable segments failed.");
+        let segments = index
+            .searchable_segments()
+            .expect("Searchable segments failed.");
         let merger = crate::indexer::merger::IndexMerger::open(
             index.schema(),
             index.settings().clone(),
@@ -535,16 +535,16 @@ pub mod tests {
         let merge_result = merger.write(segment_serializer, None);
         assert!(
             merge_result.is_ok(),
-            "merge should succeed -- decompressing each segment with its own recorded \
-             dictionary and recompressing under the new one is a correct migration, not \
-             corruption; got {merge_result:?}"
+            "merge should succeed -- decompressing each segment with its own recorded dictionary \
+             and recompressing under the new one is a correct migration, not corruption; got \
+             {merge_result:?}"
         );
         assert_eq!(
             crate::indexer::merger::take_stacked_segments_for_test(),
             0,
-            "correctness here depends entirely on the recompress path actually running -- \
-             neither segment may take the raw-copy stacking shortcut when its recorded \
-             dictionary doesn't match the target's"
+            "correctness here depends entirely on the recompress path actually running -- neither \
+             segment may take the raw-copy stacking shortcut when its recorded dictionary doesn't \
+             match the target's"
         );
         Ok(())
     }
@@ -612,7 +612,9 @@ pub mod tests {
 
         // Drive the merge directly through `IndexMerger`/`SegmentSerializer`; see the rotation
         // test above for why this bypasses `IndexWriter::merge`'s scheduling.
-        let segments = index.searchable_segments().expect("Searchable segments failed.");
+        let segments = index
+            .searchable_segments()
+            .expect("Searchable segments failed.");
         let merger = crate::indexer::merger::IndexMerger::open(
             index.schema(),
             index.settings().clone(),
@@ -625,16 +627,16 @@ pub mod tests {
         let merge_result = merger.write(segment_serializer, None);
         assert!(
             merge_result.is_ok(),
-            "merge should succeed -- decompressing each segment with its own recorded \
-             dict_a and recompressing with no dictionary is a correct migration, not \
-             corruption; got {merge_result:?}"
+            "merge should succeed -- decompressing each segment with its own recorded dict_a and \
+             recompressing with no dictionary is a correct migration, not corruption; got \
+             {merge_result:?}"
         );
         assert_eq!(
             crate::indexer::merger::take_stacked_segments_for_test(),
             0,
-            "correctness here depends entirely on the recompress path actually running -- \
-             neither segment may take the raw-copy stacking shortcut when its recorded \
-             dictionary doesn't match the target's"
+            "correctness here depends entirely on the recompress path actually running -- neither \
+             segment may take the raw-copy stacking shortcut when its recorded dictionary doesn't \
+             match the target's"
         );
         Ok(())
     }
@@ -689,7 +691,9 @@ pub mod tests {
         }
 
         // Dictionary setting is untouched -- both segments and the merge target agree.
-        let segments = index.searchable_segments().expect("Searchable segments failed.");
+        let segments = index
+            .searchable_segments()
+            .expect("Searchable segments failed.");
         assert_eq!(segments.len(), 2);
         let merger = crate::indexer::merger::IndexMerger::open(
             index.schema(),
@@ -845,8 +849,8 @@ pub mod tests {
 
     #[cfg(feature = "zstd-compression")]
     #[test]
-    fn test_dictionary_written_through_managed_directory_survives_post_commit_gc()
-    -> crate::Result<()> {
+    fn test_dictionary_written_through_managed_directory_survives_post_commit_gc(
+    ) -> crate::Result<()> {
         // Regression test for a managed-directory GC hazard: seeding the dictionary blob via
         // `Index::directory()` -- a `ManagedDirectory`, and the natural, public way to write a
         // sibling asset once you hold an open `Index` -- registers the file for garbage
@@ -857,9 +861,10 @@ pub mod tests {
         // runs `garbage_collect_files` unconditionally after every commit, so a dictionary
         // written this way is deleted out from under the index on the very next commit.
         //
-        // Contrast with `test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently`
-        // above, which deliberately writes its dictionaries to the *raw*, unwrapped directory to
-        // dodge exactly this hazard.
+        // Contrast with
+        // `test_merge_with_rotated_dictionary_fails_loud_instead_of_stacking_silently` above, which
+        // deliberately writes its dictionaries to the *raw*, unwrapped directory to dodge exactly
+        // this hazard.
         let mut schema_builder = schema::Schema::builder();
         let text_field = schema_builder.add_text_field("text_field", TEXT | STORED);
         let schema = schema_builder.build();
@@ -1002,8 +1007,8 @@ pub mod tests {
         );
         assert!(
             index.directory().exists(Path::new(&dict_a_path))?,
-            "dict_a was garbage collected while a live, not-yet-merged segment still recorded \
-             it as its own dictionary"
+            "dict_a was garbage collected while a live, not-yet-merged segment still recorded it \
+             as its own dictionary"
         );
 
         Ok(())

@@ -17,8 +17,7 @@ use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_L
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN};
-use crate::indexer::segment_updater::save_metas;
-use crate::indexer::segment_updater::DEFAULT_NUM_MERGE_THREADS;
+use crate::indexer::segment_updater::{save_metas, DEFAULT_NUM_MERGE_THREADS};
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;

@@ -396,15 +396,13 @@ impl From<serde_json::Value> for OwnedValue {
             serde_json::Value::String(text) => {
                 if can_be_rfc3339_date_time(&text) {
                     match OffsetDateTime::parse(&text, &Rfc3339) {
-                        Ok(dt) => {
-                            match dt.checked_to_offset(time::UtcOffset::UTC) {
-                                Some(dt_utc) => Self::Date(DateTime::from_utc(dt_utc)),
-                                None => {
-                                    warn!("Failed to convert datetime {} to UTC", text);
-                                    Self::Str(text)
-                                }
+                        Ok(dt) => match dt.checked_to_offset(time::UtcOffset::UTC) {
+                            Some(dt_utc) => Self::Date(DateTime::from_utc(dt_utc)),
+                            None => {
+                                warn!("Failed to convert datetime {} to UTC", text);
+                                Self::Str(text)
                             }
-                        }
+                        },
                         Err(_) => Self::Str(text),
                     }
                 } else {
