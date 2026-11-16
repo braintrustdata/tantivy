@@ -501,10 +501,11 @@ mod reuse_tests {
 
 #[cfg(test)]
 mod owner_reuse_tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::schema::{OwnedValue, Schema, STRING, TEXT};
     use crate::{DocSet, Index, IndexWriter, Postings, TantivyDocument, TERMINATED};
-    use std::collections::BTreeMap;
 
     #[test]
     fn reused_postings_match_fresh_across_terms_fields_and_blocks() -> crate::Result<()> {
