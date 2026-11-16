@@ -157,6 +157,67 @@ pub fn write_u32_vint<W: io::Write>(val: u32, writer: &mut W) -> io::Result<()> 
     writer.write_all(data)
 }
 
+/// Encodes a stop-bit VInt, speculatively writing ten bytes.
+///
+/// # Safety
+/// `dst` must be valid for ten writable bytes. Only the returned prefix belongs
+/// to the encoded value; the remaining bytes are overwritten as well.
+#[inline]
+pub unsafe fn encode_vint_branchless(v: u64, dst: *mut u8) -> usize {
+    let bit_width = 64 - (v | 1).leading_zeros() as usize;
+    let len = (bit_width * 9 + 64) >> 6;
+    let lo_data = (v & 0x7f)
+        | ((v & (0x7f << 7)) << 1)
+        | ((v & (0x7f << 14)) << 2)
+        | ((v & (0x7f << 21)) << 3)
+        | ((v & (0x7f << 28)) << 4)
+        | ((v & (0x7f << 35)) << 5)
+        | ((v & (0x7f << 42)) << 6)
+        | ((v & (0x7f << 49)) << 7);
+    let hi_data = (((v >> 56) & 0x7f) | (((v >> 63) & 1) << 8)) as u16;
+    let stop_lo = if len <= 8 {
+        0x80u64 << ((len - 1) * 8)
+    } else {
+        0
+    };
+    let stop_hi = if len > 8 {
+        0x80u16 << ((len - 9) * 8)
+    } else {
+        0
+    };
+    dst.cast::<u64>()
+        .write_unaligned((lo_data | stop_lo).to_le());
+    dst.add(8)
+        .cast::<u16>()
+        .write_unaligned((hi_data | stop_hi).to_le());
+    len
+}
+
+/// Encodes a stop-bit VInt and advances past its logical bytes.
+///
+/// # Safety
+/// `dst` must be valid for ten writable bytes, including speculative writes
+/// beyond the returned pointer.
+#[inline(always)]
+pub unsafe fn write_vint_branchless(v: u64, dst: *mut u8) -> *mut u8 {
+    dst.add(encode_vint_branchless(v, dst))
+}
+
+/// Encodes a stop-bit VInt with a one-byte fast path.
+///
+/// # Safety
+/// `dst` must be valid for ten writable bytes, including speculative writes
+/// beyond the returned pointer.
+#[inline(always)]
+pub unsafe fn write_vint_raw(v: u64, dst: *mut u8) -> *mut u8 {
+    if v < u64::from(STOP_BIT) {
+        dst.write(v as u8 | STOP_BIT);
+        dst.add(1)
+    } else {
+        write_vint_branchless(v, dst)
+    }
+}
+
 impl VInt {
     pub fn val(&self) -> u64 {
         self.0
@@ -166,10 +227,37 @@ impl VInt {
         VInt::deserialize(reader).map(|vint| vint.0)
     }
 
+    #[inline]
     pub fn serialize_into_vec(&self, output: &mut Vec<u8>) {
-        let mut buffer = [0u8; 10];
-        let num_bytes = self.serialize_into(&mut buffer);
-        output.extend(&buffer[0..num_bytes]);
+        if self.0 < u64::from(STOP_BIT) {
+            output.push(self.0 as u8 | STOP_BIT);
+            return;
+        }
+        self.serialize_into_vec_slow(output);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn serialize_into_vec_slow(&self, output: &mut Vec<u8>) {
+        if output.capacity() - output.len() < 10 {
+            output.reserve(10);
+        }
+        let len = output.len();
+        unsafe {
+            let written = encode_vint_branchless(self.0, output.as_mut_ptr().add(len));
+            output.set_len(len + written);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn serialize_slow<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        let mut buffer = std::mem::MaybeUninit::<[u8; 10]>::uninit();
+        unsafe {
+            let ptr = buffer.as_mut_ptr().cast::<u8>();
+            let len = encode_vint_branchless(self.0, ptr);
+            writer.write_all(std::slice::from_raw_parts(ptr, len))
+        }
     }
 
     pub fn serialize_into(&self, buffer: &mut [u8; 10]) -> usize {
@@ -189,10 +277,13 @@ impl VInt {
 }
 
 impl BinarySerializable for VInt {
+    #[inline]
     fn serialize<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        let mut buffer = [0u8; 10];
-        let num_bytes = self.serialize_into(&mut buffer);
-        writer.write_all(&buffer[0..num_bytes])
+        if self.0 < u64::from(STOP_BIT) {
+            let byte = self.0 as u8 | STOP_BIT;
+            return writer.write_all(std::slice::from_ref(&byte));
+        }
+        self.serialize_slow(writer)
     }
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
@@ -276,5 +367,131 @@ mod tests {
             aux_test_serialize_vint_u32(power_of_128 + 1u32);
         }
         aux_test_serialize_vint_u32(u32::MAX);
+    }
+
+    #[test]
+    fn test_vint_writer_fast_paths_match_existing_encoding() {
+        let mut values: Vec<u64> = (0..=u16::MAX).map(u64::from).collect();
+        for bits in (7..64).step_by(7) {
+            values.extend([(1u64 << bits) - 1, 1u64 << bits, (1u64 << bits) + 1]);
+        }
+        values.push(u64::MAX);
+        let mut random = 0x627261696e73746fu64;
+        for _ in 0..10_000 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            values.push(random);
+        }
+        let mut vector = Vec::with_capacity(16);
+        let mut writer = Vec::with_capacity(16);
+        for value in values {
+            let mut expected = [0; 10];
+            let len = VInt(value).serialize_into(&mut expected);
+            vector.clear();
+            writer.clear();
+            vector.push(0xa5);
+            writer.push(0xa5);
+            VInt(value).serialize_into_vec(&mut vector);
+            VInt(value).serialize(&mut writer).unwrap();
+            assert_eq!(vector[0], 0xa5);
+            assert_eq!(&vector[1..], &expected[..len], "value={value}");
+            assert_eq!(writer, vector, "value={value}");
+            assert_eq!(VInt::deserialize(&mut &vector[1..]).unwrap().0, value);
+        }
+        for value in [0, 1, 127] {
+            let mut bytes = Vec::new();
+            VInt(value).serialize_into_vec(&mut bytes);
+            assert_eq!(bytes, [value as u8 | 0x80]);
+        }
+    }
+
+    #[test]
+    fn test_vint_vec_growth_preserves_existing_bytes() {
+        for value in [0, 127, 128, 16_383, 16_384, u64::MAX] {
+            let mut expected = [0; 10];
+            let len = VInt(value).serialize_into(&mut expected);
+            for prefix_len in [0, 1, 7, 31] {
+                for spare in [0, 1, 9, 10, 16] {
+                    let mut bytes = Vec::with_capacity(prefix_len + spare);
+                    bytes.resize(prefix_len, 0xa5);
+                    VInt(value).serialize_into_vec(&mut bytes);
+                    assert!(bytes[..prefix_len].iter().all(|&byte| byte == 0xa5));
+                    assert_eq!(&bytes[prefix_len..], &expected[..len]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_vint_writer_handles_short_writes_and_errors() {
+        struct ShortWriter(Vec<u8>);
+        impl std::io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let len = bytes.len().min(1);
+                self.0.extend_from_slice(&bytes[..len]);
+                Ok(len)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for value in [0, 127, 128, 16_384, u64::MAX] {
+            let mut expected = [0; 10];
+            let len = VInt(value).serialize_into(&mut expected);
+            let mut writer = ShortWriter(Vec::new());
+            VInt(value)
+                .serialize(&mut writer as &mut dyn std::io::Write)
+                .unwrap();
+            assert_eq!(writer.0, expected[..len]);
+            assert_eq!(
+                VInt(value)
+                    .serialize(&mut FailingWriter)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[test]
+    fn test_branchless_encoder_matches_reference_and_bounds() {
+        let mut values: Vec<u64> = (0..=u16::MAX).map(u64::from).collect();
+        for bits in 1..64 {
+            values.extend([(1u64 << bits) - 1, 1u64 << bits, (1u64 << bits) + 1]);
+        }
+        values.push(u64::MAX);
+        for value in values {
+            let mut reference = [0; 10];
+            let len = VInt(value).serialize_into(&mut reference);
+            let mut bytes = [0xa5; 13];
+            let actual_len =
+                unsafe { super::encode_vint_branchless(value, bytes.as_mut_ptr().add(1)) };
+            assert_eq!(actual_len, len, "value={value}");
+            assert_eq!(&bytes[1..1 + len], &reference[..len]);
+            assert_eq!(bytes[0], 0xa5);
+            assert_eq!(&bytes[11..], &[0xa5; 2]);
+            for write in [
+                super::write_vint_raw as unsafe fn(u64, *mut u8) -> *mut u8,
+                super::write_vint_branchless,
+            ] {
+                let mut bytes = [0xa5; 13];
+                let base = unsafe { bytes.as_mut_ptr().add(1) };
+                let end = unsafe { write(value, base) };
+                assert_eq!(unsafe { end.offset_from(base) }, len as isize);
+                assert_eq!(&bytes[1..1 + len], &reference[..len]);
+                assert_eq!(bytes[0], 0xa5);
+                assert_eq!(&bytes[11..], &[0xa5; 2]);
+            }
+        }
     }
 }

@@ -93,40 +93,6 @@ fn split_into_skips_and_postings(
     Ok((Some(skip_data), postings_data))
 }
 
-#[inline(always)]
-fn open_postings_data(
-    doc_freq: u32,
-    bytes: OwnedBytes,
-    mut record_option: IndexRecordOption,
-    requested_option: IndexRecordOption,
-) -> io::Result<(OwnedBytes, SkipReader, FreqReadingOption)> {
-    let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
-    let skip_reader = match skip_data_opt {
-        Some(skip_data) => {
-            let block_count = doc_freq as usize / COMPRESSION_BLOCK_SIZE;
-            // 8 is the minimum size of a block with frequency (can be more if pos are stored
-            // too)
-            if skip_data.len() < 8 * block_count {
-                // the field might be encoded with frequency, but this term in particular isn't.
-                // This can happen for JSON field with term frequencies:
-                // - text terms are encoded with term freqs.
-                // - numerical terms are encoded without term freqs.
-                record_option = IndexRecordOption::Basic;
-            }
-            SkipReader::new(skip_data, doc_freq, record_option)
-        }
-        None => SkipReader::new(OwnedBytes::empty(), doc_freq, record_option),
-    };
-
-    let freq_reading_option = match (record_option, requested_option) {
-        (IndexRecordOption::Basic, _) => FreqReadingOption::NoFreq,
-        (_, IndexRecordOption::Basic) => FreqReadingOption::SkipFreq,
-        (_, _) => FreqReadingOption::ReadFreq,
-    };
-
-    Ok((postings_data, skip_reader, freq_reading_option))
-}
-
 impl BlockSegmentPostings {
     /// Opens a `BlockSegmentPostings`.
     /// `doc_freq` is the number of documents in the posting list.
@@ -180,23 +146,38 @@ impl BlockSegmentPostings {
         Ok(block_segment_postings)
     }
 
-    pub(crate) fn reset_with_options(
+    pub(crate) fn reset_from_file(
         &mut self,
+        file: &FileSlice,
+        range: std::ops::Range<usize>,
         doc_freq: u32,
-        bytes: OwnedBytes,
-        record_option: IndexRecordOption,
+        mut record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<()> {
-        let (postings_data, skip_reader, freq_reading_option) =
-            open_postings_data(doc_freq, bytes, record_option, requested_option)?;
-        if freq_reading_option != FreqReadingOption::ReadFreq && self.freqs_dirty {
+        file.read_bytes_slice_into(range, &mut self.data)?;
+        let skip_len = if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
+            VInt::deserialize_u64(&mut self.data)? as usize
+        } else {
+            0
+        };
+        if doc_freq >= COMPRESSION_BLOCK_SIZE as u32
+            && skip_len < 8 * (doc_freq as usize / COMPRESSION_BLOCK_SIZE)
+        {
+            record_option = IndexRecordOption::Basic;
+        }
+        self.skip_reader
+            .reset_slice(&self.data, 0..skip_len, doc_freq, record_option);
+        self.data.advance(skip_len);
+        self.freq_reading_option = match (record_option, requested_option) {
+            (IndexRecordOption::Basic, _) => FreqReadingOption::NoFreq,
+            (_, IndexRecordOption::Basic) => FreqReadingOption::SkipFreq,
+            (_, _) => FreqReadingOption::ReadFreq,
+        };
+        if self.freq_reading_option != FreqReadingOption::ReadFreq && self.freqs_dirty {
             self.freq_decoder.fill(1);
             self.freqs_dirty = false;
         }
         self.doc_freq = doc_freq;
-        self.data = postings_data;
-        self.skip_reader = skip_reader;
-        self.freq_reading_option = freq_reading_option;
         self.block_max_score_cache = None;
         self.block_loaded = false;
         self.load_block();

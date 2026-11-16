@@ -2,7 +2,7 @@ use std::io;
 
 use common::HasLen;
 
-use crate::directory::OwnedBytes;
+use crate::directory::FileSlice;
 use crate::docset::DocSet;
 use crate::fastfield::AliveBitSet;
 use crate::positions::PositionReader;
@@ -34,13 +34,16 @@ impl SegmentPostings {
         }
     }
 
-    pub(crate) fn reset(&mut self, positions_data: Option<OwnedBytes>) -> io::Result<()> {
+    pub(crate) fn reset(
+        &mut self,
+        positions_data: Option<(&FileSlice, std::ops::Range<usize>)>,
+    ) -> io::Result<()> {
         self.cur = 0;
         self.positions_enabled = false;
-        if let Some(positions_data) = positions_data {
+        if let Some((file, range)) = positions_data {
             self.position_reader
                 .get_or_insert_with(PositionReader::empty)
-                .reset_data(positions_data)?;
+                .reset_from_file(file, range)?;
             self.positions_enabled = true;
         }
         Ok(())

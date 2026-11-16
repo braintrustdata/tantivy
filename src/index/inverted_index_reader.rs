@@ -156,18 +156,16 @@ impl InvertedIndexReader {
         requested_option: IndexRecordOption,
         out: &mut BlockSegmentPostings,
     ) -> io::Result<()> {
-        let bytes = self
-            .postings_file_slice
-            .read_bytes_slice(term_info.postings_range.clone())?;
-        out.reset_with_options(
+        out.reset_from_file(
+            &self.postings_file_slice,
+            term_info.postings_range.clone(),
             term_info.doc_freq,
-            bytes,
             self.record_option,
             requested_option,
         )
     }
 
-    /// Reopens a postings cursor in place, preserving its decoding buffers.
+    /// Reopens a postings cursor in place, preserving its decoding buffers and byte owners.
     pub fn read_postings_from_terminfo_into(
         &self,
         term_info: &TermInfo,
@@ -176,15 +174,14 @@ impl InvertedIndexReader {
     ) -> io::Result<()> {
         let option = option.downgrade(self.record_option);
         self.read_block_postings_from_terminfo_into(term_info, option, &mut out.block_cursor)?;
-        let positions_data = if option.has_positions() {
-            Some(
-                self.positions_file_slice
-                    .read_bytes_slice(term_info.positions_range.clone())?,
-            )
+        out.reset(if option.has_positions() {
+            Some((
+                &self.positions_file_slice,
+                term_info.positions_range.clone(),
+            ))
         } else {
             None
-        };
-        out.reset(positions_data)
+        })
     }
 
     /// Returns a posting object given a `term_info`.
@@ -498,6 +495,81 @@ mod reuse_tests {
         assert_eq!(postings.doc(), 0);
         postings.positions(&mut actual_positions);
         assert_eq!(actual_positions, [0, 1, 2]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod owner_reuse_tests {
+    use super::*;
+    use crate::schema::{OwnedValue, Schema, STRING, TEXT};
+    use crate::{DocSet, Index, IndexWriter, Postings, TantivyDocument, TERMINATED};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn reused_postings_match_fresh_across_terms_fields_and_blocks() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let json = schema.add_json_field("json", TEXT);
+        let basic = schema.add_text_field("basic", STRING);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+        for doc in 0..260 {
+            let mut document = TantivyDocument::default();
+            document.add_object(
+                json,
+                BTreeMap::from([
+                    (
+                        "mixed".to_owned(),
+                        OwnedValue::Array(vec![
+                            OwnedValue::U64((doc % 2) as u64),
+                            OwnedValue::Str(format!("shared shared rare{doc}")),
+                        ]),
+                    ),
+                    ("number".to_owned(), OwnedValue::U64((doc % 2) as u64)),
+                ]),
+            );
+            document.add_text(basic, if doc % 2 == 0 { "even" } else { "odd" });
+            writer.add_document(document)?;
+        }
+        writer.commit()?;
+        writer.wait_merging_threads()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let mut reused = SegmentPostings::empty();
+        for _ in 0..2 {
+            for field in [json, basic, json] {
+                let inverted = searcher.segment_readers()[0].inverted_index(field)?;
+                let mut stream = inverted.terms().stream()?;
+                while stream.advance() {
+                    let mut fresh = inverted.read_postings_from_terminfo(
+                        stream.value(),
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )?;
+                    inverted.read_postings_from_terminfo_into(
+                        stream.value(),
+                        IndexRecordOption::WithFreqsAndPositions,
+                        &mut reused,
+                    )?;
+                    assert_eq!(fresh.doc_freq(), reused.doc_freq());
+                    let has_freq = !fresh.block_cursor.freqs().is_empty();
+                    assert_eq!(has_freq, !reused.block_cursor.freqs().is_empty());
+                    while fresh.doc() != TERMINATED {
+                        assert_eq!(fresh.doc(), reused.doc());
+                        assert_eq!(fresh.term_freq(), reused.term_freq());
+                        if field == json && has_freq {
+                            let mut expected = Vec::new();
+                            let mut actual = Vec::new();
+                            fresh.positions(&mut expected);
+                            reused.positions(&mut actual);
+                            assert_eq!(actual, expected);
+                        }
+                        fresh.advance();
+                        reused.advance();
+                    }
+                    assert_eq!(reused.doc(), TERMINATED);
+                }
+            }
+        }
         Ok(())
     }
 }

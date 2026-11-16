@@ -4,7 +4,7 @@ mod merger;
 
 use std::iter::ExactSizeIterator;
 
-use common::VInt;
+use common::{write_vint_branchless, VInt};
 use sstable::value::{ValueReader, ValueWriter};
 use sstable::SSTable;
 use tantivy_fst::automaton::AlwaysMatch;
@@ -79,32 +79,56 @@ impl ValueReader for TermInfoValueReader {
 
 #[derive(Default)]
 pub struct TermInfoValueWriter {
-    term_infos: Vec<TermInfo>,
+    buffer: Vec<u8>,
+    num_terms: u32,
 }
 
 impl ValueWriter for TermInfoValueWriter {
     type Value = TermInfo;
 
+    #[inline(always)]
     fn write(&mut self, term_info: &TermInfo) {
-        self.term_infos.push(term_info.clone());
+        if self.buffer.capacity() - self.buffer.len() < 56 {
+            self.buffer.reserve(1024);
+        }
+        unsafe {
+            let base = self.buffer.as_mut_ptr();
+            let mut ptr = base.add(self.buffer.len());
+            if self.num_terms == 0 {
+                ptr = write_vint_branchless(term_info.postings_range.start as u64, ptr);
+                ptr = write_vint_branchless(term_info.positions_range.start as u64, ptr);
+            }
+            let df = u64::from(term_info.doc_freq);
+            let post_len = term_info.postings_range.len() as u64;
+            let pos_len = term_info.positions_range.len() as u64;
+            if (df | post_len | pos_len) < 128 {
+                let packed =
+                    df as u32 | ((post_len as u32) << 8) | ((pos_len as u32) << 16) | 0x0080_8080;
+                ptr.cast::<u32>().write_unaligned(packed.to_le());
+                ptr = ptr.add(3);
+            } else {
+                ptr = write_vint_branchless(df, ptr);
+                ptr = write_vint_branchless(post_len, ptr);
+                ptr = write_vint_branchless(pos_len, ptr);
+            }
+            self.buffer.set_len(ptr.offset_from(base) as usize);
+        }
+        self.num_terms = self
+            .num_terms
+            .checked_add(1)
+            .expect("Too many terms in block");
     }
 
-    fn serialize_block(&self, buffer: &mut Vec<u8>) {
-        VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
-        if self.term_infos.is_empty() {
-            return;
-        }
-        VInt(self.term_infos[0].postings_range.start as u64).serialize_into_vec(buffer);
-        VInt(self.term_infos[0].positions_range.start as u64).serialize_into_vec(buffer);
-        for term_info in &self.term_infos {
-            VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
-            VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
-            VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
-        }
+    #[inline(always)]
+    fn serialize_block(&self, output: &mut Vec<u8>) {
+        VInt(u64::from(self.num_terms)).serialize_into_vec(output);
+        output.extend_from_slice(&self.buffer);
     }
 
+    #[inline(always)]
     fn clear(&mut self) {
-        self.term_infos.clear();
+        self.buffer.clear();
+        self.num_terms = 0;
     }
 }
 
@@ -146,5 +170,51 @@ mod tests {
             }
         );
         assert_eq!(buffer.len(), num_bytes);
+    }
+
+    #[test]
+    fn test_preencoded_term_info_matches_original_bytes() {
+        fn append(value: u64, out: &mut Vec<u8>) {
+            let mut bytes = [0; 10];
+            let len = common::VInt(value).serialize_into(&mut bytes);
+            out.extend_from_slice(&bytes[..len]);
+        }
+        let mut writer = super::TermInfoValueWriter::default();
+        for start in [0, 127, 128, 16_384, 1u64 << 56, 1u64 << 63]
+            .into_iter()
+            .filter_map(|start| usize::try_from(start).ok())
+        {
+            for count in [0, 1, 127, 128, 1024] {
+                writer.clear();
+                let mut expected = vec![0xa5];
+                append(count as u64, &mut expected);
+                if count > 0 {
+                    append(start as u64, &mut expected);
+                    append(start as u64, &mut expected);
+                }
+                let mut post = start;
+                let mut pos = start;
+                for i in 0..count {
+                    let df = [0, 1, 127, 128, 16_383, 16_384, u32::MAX][i % 7];
+                    let post_len = [0, 1, 7, 127, 128, 16_384, 1 << 21][i % 7];
+                    let pos_len = [0, 1, 127, 128, 16_384, 1 << 21, 1 << 22][i % 7];
+                    writer.write(&TermInfo {
+                        doc_freq: df,
+                        postings_range: post..post + post_len,
+                        positions_range: pos..pos + pos_len,
+                    });
+                    append(u64::from(df), &mut expected);
+                    append(post_len as u64, &mut expected);
+                    append(pos_len as u64, &mut expected);
+                    post += post_len;
+                    pos += pos_len;
+                }
+                for _ in 0..2 {
+                    let mut actual = vec![0xa5];
+                    writer.serialize_block(&mut actual);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 }

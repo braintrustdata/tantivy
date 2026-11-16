@@ -24,6 +24,12 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     /// This method may panic if the range requested is invalid.
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
 
+    /// Reads into an existing owned view, allowing memory-backed handles to reuse ownership.
+    fn read_bytes_into(&self, range: Range<usize>, output: &mut OwnedBytes) -> io::Result<()> {
+        *output = self.read_bytes(range)?;
+        Ok(())
+    }
+
     #[doc(hidden)]
     async fn read_bytes_async(&self, _byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         Err(io::Error::new(
@@ -102,7 +108,8 @@ impl FileHandle for &'static [u8] {
 }
 
 impl<B> From<B> for FileSlice
-where B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync
+where
+    B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync,
 {
     fn from(bytes: B) -> FileSlice {
         FileSlice::new(Arc::new(OwnedBytes::new(bytes)))
@@ -242,6 +249,20 @@ impl FileSlice {
             .read_bytes(self.range.start + range.start..self.range.start + range.end)
     }
 
+    /// Reads a range into an existing owned view.
+    #[inline]
+    pub fn read_bytes_slice_into(
+        &self,
+        range: Range<usize>,
+        output: &mut OwnedBytes,
+    ) -> io::Result<()> {
+        assert!(range.start <= range.end && range.end <= self.len());
+        self.data.read_bytes_into(
+            self.range.start + range.start..self.range.start + range.end,
+            output,
+        )
+    }
+
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         assert!(
@@ -310,6 +331,10 @@ impl FileHandle for FileSlice {
         self.read_bytes_slice(range)
     }
 
+    fn read_bytes_into(&self, range: Range<usize>, output: &mut OwnedBytes) -> io::Result<()> {
+        self.read_bytes_slice_into(range, output)
+    }
+
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         self.read_bytes_slice_async(byte_range).await
     }
@@ -325,6 +350,11 @@ impl HasLen for FileSlice {
 impl FileHandle for OwnedBytes {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         Ok(self.slice(range))
+    }
+
+    fn read_bytes_into(&self, range: Range<usize>, output: &mut OwnedBytes) -> io::Result<()> {
+        output.reset_slice(self, range);
+        Ok(())
     }
 
     async fn read_bytes_async(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
