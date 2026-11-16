@@ -1,7 +1,8 @@
+use std::collections::HashMap;
+
 use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
 use itertools::Itertools;
-use std::collections::HashMap;
 use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
@@ -522,8 +523,8 @@ fn remap_and_write(
             serializer
                 .segment()
                 .open_read(SegmentComponent::TempStore)?,
-            1, /* The docstore is configured to have one doc per block, and each doc is accessed
-                * only once: we don't need caching. */
+            1,    /* The docstore is configured to have one doc per block, and each doc is
+                   * accessed only once: we don't need caching. */
             None, // TempStore is always written with Compressor::None, no dictionary.
         )?;
         for old_doc_id in doc_id_map.iter_old_doc_ids() {
