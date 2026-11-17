@@ -261,8 +261,16 @@ where
             "Keys should be increasing. ({:?} > {key:?})",
             self.previous_key
         );
-        self.previous_key.resize(key.len(), 0u8);
-        self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
+        self.previous_key.truncate(keep_len);
+        self.previous_key.reserve(add_len);
+        unsafe {
+            delta::copy_short_nonoverlapping(
+                key.as_ptr().add(keep_len),
+                self.previous_key.as_mut_ptr().add(keep_len),
+                add_len,
+            );
+            self.previous_key.set_len(key.len());
+        }
         self.delta_writer.write_suffix(keep_len, &key[keep_len..]);
         Ok(())
     }

@@ -1,7 +1,7 @@
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 
-use common::{CountingWriter, OwnedBytes};
+use common::{CountingWriter, OwnedBytes, MAX_VINT_BYTES};
 use zstd::bulk::Compressor;
 
 use super::value::ValueWriter;
@@ -9,7 +9,40 @@ use super::{value, vint, BlockReader};
 
 const FOUR_BIT_LIMITS: usize = 1 << 4;
 const VINT_MODE: u8 = 1u8;
+// The header is either one packed keep/add byte, or one VINT_MODE byte
+// followed by both self-delimiting lengths. That single escape selects the
+// format for the whole pair; neither length needs another escape tag.
+const MAX_KEY_HEADER_BYTES: usize = 1 + 2 * MAX_VINT_BYTES;
 const BLOCK_LEN: usize = 4_000;
+
+#[inline(always)]
+unsafe fn write_key_vint(mut value: u64, mut dst: *mut u8) -> *mut u8 {
+    while value >= 128 {
+        dst.write(value as u8 | 0x80);
+        dst = dst.add(1);
+        value >>= 7;
+    }
+    dst.write(value as u8);
+    dst.add(1)
+}
+
+#[inline(always)]
+pub(crate) unsafe fn copy_short_nonoverlapping(src: *const u8, dst: *mut u8, len: usize) {
+    if len <= 8 {
+        if len >= 4 {
+            let head = src.cast::<u32>().read_unaligned();
+            let tail = src.add(len - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(len - 4).cast::<u32>().write_unaligned(tail);
+        } else if len > 0 {
+            dst.write(src.read());
+            dst.add(len >> 1).write(src.add(len >> 1).read());
+            dst.add(len - 1).write(src.add(len - 1).read());
+        }
+    } else {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    }
+}
 
 pub struct DeltaWriter<W, TValueWriter>
 where W: io::Write
@@ -87,23 +120,29 @@ where
         Ok(Some(start_offset..end_offset))
     }
 
-    fn encode_keep_add(&mut self, keep_len: usize, add_len: usize) {
-        if keep_len < FOUR_BIT_LIMITS && add_len < FOUR_BIT_LIMITS {
-            let b = (keep_len | add_len << 4) as u8;
-            self.block.extend_from_slice(&[b])
-        } else {
-            let mut buf = [VINT_MODE; 20];
-            let mut len = 1 + vint::serialize(keep_len as u64, &mut buf[1..]);
-            len += vint::serialize(add_len as u64, &mut buf[len..]);
-            self.block.extend_from_slice(&buf[..len])
+    pub(crate) fn write_suffix(&mut self, keep_len: usize, suffix: &[u8]) {
+        let needed = suffix
+            .len()
+            .checked_add(MAX_KEY_HEADER_BYTES)
+            .expect("SSTable key too long");
+        if self.block.capacity() - self.block.len() < needed {
+            self.block.reserve(needed.max(1024));
         }
-    }
-
-    pub(crate) fn write_suffix(&mut self, common_prefix_len: usize, suffix: &[u8]) {
-        let keep_len = common_prefix_len;
-        let add_len = suffix.len();
-        self.encode_keep_add(keep_len, add_len);
-        self.block.extend_from_slice(suffix);
+        unsafe {
+            let base = self.block.as_mut_ptr();
+            let mut ptr = base.add(self.block.len());
+            if keep_len < FOUR_BIT_LIMITS && suffix.len() < FOUR_BIT_LIMITS {
+                ptr.write((keep_len | suffix.len() << 4) as u8);
+                ptr = ptr.add(1);
+            } else {
+                ptr.write(VINT_MODE);
+                ptr = write_key_vint(keep_len as u64, ptr.add(1));
+                ptr = write_key_vint(suffix.len() as u64, ptr);
+            }
+            copy_short_nonoverlapping(suffix.as_ptr(), ptr, suffix.len());
+            ptr = ptr.add(suffix.len());
+            self.block.set_len(ptr.offset_from(base) as usize);
+        }
     }
 
     pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) {
@@ -314,5 +353,55 @@ mod tests {
     fn test_empty() {
         let mut delta_reader: DeltaReader<U64MonotonicValueReader> = DeltaReader::empty();
         assert!(!delta_reader.advance().unwrap());
+    }
+
+    #[test]
+    fn test_fused_key_encoding_matches_original_bytes() {
+        use super::{DeltaWriter, FOUR_BIT_LIMITS, VINT_MODE};
+        use crate::value::U64MonotonicValueWriter;
+        let mut writer = DeltaWriter::<_, U64MonotonicValueWriter>::new(Vec::new());
+        for keep in [0, 1, 7, 14, 15, 16, 127, 128, 16_383, 16_384, usize::MAX] {
+            for len in (0..=20).chain([127, 128, 16_383, 16_384]) {
+                let suffix: Vec<_> = (0..len).map(|i| i as u8).collect();
+                let mut expected = vec![0xa5];
+                if keep < FOUR_BIT_LIMITS && len < FOUR_BIT_LIMITS {
+                    expected.push((keep | len << 4) as u8);
+                } else {
+                    expected.push(VINT_MODE);
+                    for val in [keep, len] {
+                        let mut bytes = [0; 10];
+                        let written = crate::vint::serialize(val as u64, &mut bytes);
+                        expected.extend_from_slice(&bytes[..written]);
+                    }
+                }
+                expected.extend_from_slice(&suffix);
+                writer.block.clear();
+                writer.block.push(0xa5);
+                writer.write_suffix(keep, &suffix);
+                assert_eq!(writer.block, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_short_copies_respect_source_and_destination_bounds() {
+        for len in 0..=65 {
+            for offset in 0..8 {
+                let input: Vec<_> = (0..len).map(|i| i as u8).collect();
+                let mut output = vec![0xa5; len + offset + 8];
+                unsafe {
+                    super::copy_short_nonoverlapping(
+                        input.as_ptr(),
+                        output.as_mut_ptr().add(offset),
+                        len,
+                    );
+                }
+                assert_eq!(&output[offset..offset + len], input);
+                assert!(output[..offset]
+                    .iter()
+                    .chain(output[offset + len..].iter())
+                    .all(|&b| b == 0xa5));
+            }
+        }
     }
 }

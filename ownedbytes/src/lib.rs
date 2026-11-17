@@ -43,6 +43,16 @@ impl OwnedBytes {
         }
     }
 
+    /// Replaces this view while retaining its owner when the backing allocation matches.
+    #[inline]
+    pub fn reset_slice(&mut self, source: &Self, range: Range<usize>) {
+        let data = &source.data[range];
+        if !Arc::ptr_eq(&self.box_stable_deref, &source.box_stable_deref) {
+            self.box_stable_deref = source.box_stable_deref.clone();
+        }
+        self.data = data;
+    }
+
     /// Returns the underlying slice of data.
     /// `Deref` and `AsRef` are also available.
     #[inline]
@@ -354,5 +364,20 @@ mod tests {
         assert_eq!(data, "ab");
         assert_eq!(data.split_off(1), "b");
         assert_eq!(data, "a");
+    }
+    #[test]
+    fn test_reset_slice_retains_and_replaces_owner() {
+        let source = OwnedBytes::new(vec![0, 1, 2, 3, 4, 5]);
+        let mut view = source.slice(0..1);
+        for range in [2..5, 0..0, 0..6, 5..6] {
+            view.reset_slice(&source, range.clone());
+            assert_eq!(view.as_slice(), &source.as_slice()[range]);
+            assert_eq!(std::sync::Arc::strong_count(&source.box_stable_deref), 2);
+        }
+        let other = OwnedBytes::new(vec![8, 9, 10]);
+        view.reset_slice(&other, 1..3);
+        assert_eq!(std::sync::Arc::strong_count(&source.box_stable_deref), 1);
+        drop(other);
+        assert_eq!(view.as_slice(), &[9, 10]);
     }
 }

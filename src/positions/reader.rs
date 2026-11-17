@@ -2,7 +2,7 @@ use std::io;
 
 use common::{BinarySerializable, VInt};
 
-use crate::directory::OwnedBytes;
+use crate::directory::{FileSlice, OwnedBytes};
 use crate::positions::COMPRESSION_BLOCK_SIZE;
 use crate::postings::compression::{BlockDecoder, VIntDecoder};
 
@@ -66,24 +66,41 @@ impl PositionReader {
         }
     }
 
-    pub(crate) fn reset_data(&mut self, mut positions_data: OwnedBytes) -> io::Result<()> {
-        let num_blocks = VInt::deserialize(&mut positions_data)?.0;
+    #[cfg(test)]
+    pub(crate) fn reset_data(&mut self, positions_data: OwnedBytes) -> io::Result<()> {
+        self.original_positions = positions_data;
+        self.reset_current_data()
+    }
+
+    pub(crate) fn reset_from_file(
+        &mut self,
+        file: &FileSlice,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<()> {
+        file.read_bytes_slice_into(range, &mut self.original_positions)?;
+        self.reset_current_data()
+    }
+
+    fn reset_current_data(&mut self) -> io::Result<()> {
+        let num_blocks = VInt::deserialize(&mut self.original_positions)?.0;
         let num_blocks = usize::try_from(num_blocks)
             .ok()
-            .filter(|&count| count <= positions_data.len())
+            .filter(|&count| count <= self.original_positions.len())
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "Invalid position block count")
             })?;
-        let (bit_widths, positions) = positions_data.split(num_blocks);
-        self.original_bit_widths = bit_widths;
-        self.original_positions = positions;
+        self.original_bit_widths
+            .reset_slice(&self.original_positions, 0..num_blocks);
+        self.original_positions.advance(num_blocks);
         self.reset();
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.positions = self.original_positions.clone();
-        self.bit_widths = self.original_bit_widths.clone();
+        self.positions
+            .reset_slice(&self.original_positions, 0..self.original_positions.len());
+        self.bit_widths
+            .reset_slice(&self.original_bit_widths, 0..self.original_bit_widths.len());
         self.block_offset = i64::MAX as u64;
         self.anchor_offset = 0u64;
     }

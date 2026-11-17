@@ -139,13 +139,29 @@ impl SkipReader {
     }
 
     pub fn reset(&mut self, data: OwnedBytes, doc_freq: u32) {
+        self.owned_read = data;
+        self.reset_state(doc_freq);
+    }
+
+    pub(crate) fn reset_slice(
+        &mut self,
+        data: &OwnedBytes,
+        range: std::ops::Range<usize>,
+        doc_freq: u32,
+        skip_info: IndexRecordOption,
+    ) {
+        self.owned_read.reset_slice(data, range);
+        self.skip_info = skip_info;
+        self.reset_state(doc_freq);
+    }
+
+    fn reset_state(&mut self, doc_freq: u32) {
         self.last_doc_in_block = if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
             0
         } else {
             TERMINATED
         };
         self.last_doc_in_previous_block = 0u32;
-        self.owned_read = data;
         self.block_info = BlockInfo::VInt { num_docs: doc_freq };
         self.byte_offset = 0;
         self.remaining_docs = doc_freq;
