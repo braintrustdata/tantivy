@@ -4,13 +4,17 @@ mod merger;
 
 use std::iter::ExactSizeIterator;
 
-use common::{write_vint_branchless, VInt};
+use common::{write_vint_branchless, VInt, MAX_VINT_BYTES};
 use sstable::value::{ValueReader, ValueWriter};
 use sstable::SSTable;
 use tantivy_fst::automaton::AlwaysMatch;
 
 pub use self::merger::TermMerger;
 use crate::postings::TermInfo;
+
+// Two initial stream offsets plus three per-term values. Each encoder can
+// speculatively write MAX_VINT_BYTES; the packed four-byte path also fits.
+const MAX_TERM_INFO_WRITE_BYTES: usize = 5 * MAX_VINT_BYTES;
 
 /// The term dictionary contains all of the terms in
 /// `tantivy index` in a sorted manner.
@@ -88,7 +92,7 @@ impl ValueWriter for TermInfoValueWriter {
 
     #[inline(always)]
     fn write(&mut self, term_info: &TermInfo) {
-        if self.buffer.capacity() - self.buffer.len() < 56 {
+        if self.buffer.capacity() - self.buffer.len() < MAX_TERM_INFO_WRITE_BYTES {
             self.buffer.reserve(1024);
         }
         unsafe {

@@ -22,7 +22,7 @@ pub use ownedbytes::{OwnedBytes, StableDeref};
 pub use serialize::{BinarySerializable, DeserializeFrom, FixedSize};
 pub use vint::{
     encode_vint_branchless, read_u32_vint, read_u32_vint_no_advance, serialize_vint_u32,
-    write_u32_vint, write_vint_branchless, write_vint_raw, VInt, VIntU128,
+    write_u32_vint, write_vint_branchless, write_vint_raw, VInt, VIntU128, MAX_VINT_BYTES,
 };
 pub use writer::{AntiCallToken, CountingWriter, TerminatingWrite};
 

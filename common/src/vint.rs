@@ -157,6 +157,9 @@ pub fn write_u32_vint<W: io::Write>(val: u32, writer: &mut W) -> io::Result<()> 
     writer.write_all(data)
 }
 
+/// Maximum encoded length of a u64: ceil(64 / 7) seven-bit payload groups.
+pub const MAX_VINT_BYTES: usize = 10;
+
 /// Encodes a stop-bit VInt, speculatively writing ten bytes.
 ///
 /// # Safety
@@ -239,8 +242,8 @@ impl VInt {
     #[cold]
     #[inline(never)]
     fn serialize_into_vec_slow(&self, output: &mut Vec<u8>) {
-        if output.capacity() - output.len() < 10 {
-            output.reserve(10);
+        if output.capacity() - output.len() < MAX_VINT_BYTES {
+            output.reserve(MAX_VINT_BYTES);
         }
         let len = output.len();
         unsafe {
@@ -252,7 +255,7 @@ impl VInt {
     #[cold]
     #[inline(never)]
     fn serialize_slow<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        let mut buffer = std::mem::MaybeUninit::<[u8; 10]>::uninit();
+        let mut buffer = std::mem::MaybeUninit::<[u8; MAX_VINT_BYTES]>::uninit();
         unsafe {
             let ptr = buffer.as_mut_ptr().cast::<u8>();
             let len = encode_vint_branchless(self.0, ptr);

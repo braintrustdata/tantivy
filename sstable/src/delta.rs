@@ -1,7 +1,7 @@
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 
-use common::{CountingWriter, OwnedBytes};
+use common::{CountingWriter, OwnedBytes, MAX_VINT_BYTES};
 use zstd::bulk::Compressor;
 
 use super::value::ValueWriter;
@@ -9,6 +9,10 @@ use super::{value, vint, BlockReader};
 
 const FOUR_BIT_LIMITS: usize = 1 << 4;
 const VINT_MODE: u8 = 1u8;
+// The header is either one packed keep/add byte, or one VINT_MODE byte
+// followed by both self-delimiting lengths. That single escape selects the
+// format for the whole pair; neither length needs another escape tag.
+const MAX_KEY_HEADER_BYTES: usize = 1 + 2 * MAX_VINT_BYTES;
 const BLOCK_LEN: usize = 4_000;
 
 #[inline(always)]
@@ -117,7 +121,10 @@ where
     }
 
     pub(crate) fn write_suffix(&mut self, keep_len: usize, suffix: &[u8]) {
-        let needed = suffix.len().checked_add(21).expect("SSTable key too long");
+        let needed = suffix
+            .len()
+            .checked_add(MAX_KEY_HEADER_BYTES)
+            .expect("SSTable key too long");
         if self.block.capacity() - self.block.len() < needed {
             self.block.reserve(needed.max(1024));
         }
