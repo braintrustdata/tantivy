@@ -1,6 +1,6 @@
 use std::io;
-use std::sync::Arc;
 
+pub(crate) use context::DecompressionContext;
 use serde::{Deserialize, Serialize};
 
 use super::Compressor;
@@ -27,57 +27,6 @@ impl From<Compressor> for Decompressor {
             #[cfg(feature = "zstd-compression")]
             Compressor::Zstd(_) => Decompressor::Zstd,
         }
-    }
-}
-
-pub(crate) struct DecompressionContext {
-    #[cfg(feature = "zstd-compression")]
-    zstd: std::sync::Mutex<Vec<zstd::zstd_safe::DCtx<'static>>>,
-    #[cfg(feature = "zstd-compression")]
-    prepared_dictionary: Option<zstd::dict::DecoderDictionary<'static>>,
-}
-
-impl DecompressionContext {
-    pub(crate) fn load(
-        directory: &dyn crate::Directory,
-        path: Option<&str>,
-    ) -> io::Result<Arc<Self>> {
-        #[cfg(feature = "zstd-compression")]
-        if let Some(context) = path.and_then(super::dictionary_cache::get_context) {
-            return Ok(context);
-        }
-        let dictionary = super::resolve_segment_dictionary(directory, path)?;
-        let context = Arc::new(Self::new(dictionary));
-        #[cfg(feature = "zstd-compression")]
-        if let Some(path) = path {
-            return Ok(super::dictionary_cache::insert_context(path, context));
-        }
-        Ok(context)
-    }
-
-    pub(crate) fn new(_dictionary: Option<Arc<[u8]>>) -> Self {
-        Self {
-            #[cfg(feature = "zstd-compression")]
-            prepared_dictionary: _dictionary
-                .as_deref()
-                .map(zstd::dict::DecoderDictionary::copy),
-            #[cfg(feature = "zstd-compression")]
-            zstd: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    #[cfg(feature = "zstd-compression")]
-    fn decompress_zstd(&self, compressed: &[u8], decompressed: &mut Vec<u8>) -> io::Result<()> {
-        let context = self.zstd.lock().unwrap().pop();
-        let mut context = context.unwrap_or_else(zstd::zstd_safe::DCtx::create);
-        let result = super::compression_zstd_block::decompress(
-            compressed,
-            decompressed,
-            &mut context,
-            self.prepared_dictionary.as_ref(),
-        );
-        self.zstd.lock().unwrap().push(context);
-        result
     }
 }
 
@@ -134,177 +83,259 @@ impl Decompressor {
     }
 }
 
+#[cfg(feature = "zstd-compression")]
+mod context {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use zstd::dict::DecoderDictionary;
+    use zstd::zstd_safe::DCtx;
+
+    use crate::store::{compression_zstd_block, dictionary_cache};
+
+    pub(crate) struct DecompressionContext {
+        zstd: Mutex<Vec<DCtx<'static>>>,
+        prepared_dictionary: Option<DecoderDictionary<'static>>,
+    }
+
+    impl DecompressionContext {
+        pub(crate) fn load(
+            directory: &dyn crate::Directory,
+            path: Option<&str>,
+        ) -> io::Result<Arc<Self>> {
+            if let Some(context) = path.and_then(dictionary_cache::get_context) {
+                return Ok(context);
+            }
+            let dictionary = crate::store::resolve_segment_dictionary(directory, path)?;
+            let context = Arc::new(Self::new(dictionary));
+            if let Some(path) = path {
+                return Ok(dictionary_cache::insert_context(path, context));
+            }
+            Ok(context)
+        }
+
+        pub(crate) fn new(dictionary: Option<Arc<[u8]>>) -> Self {
+            Self {
+                prepared_dictionary: dictionary.as_deref().map(DecoderDictionary::copy),
+                zstd: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(super) fn decompress_zstd(
+            &self,
+            compressed: &[u8],
+            decompressed: &mut Vec<u8>,
+        ) -> io::Result<()> {
+            let context = self.zstd.lock().unwrap().pop();
+            let mut context = context.unwrap_or_else(DCtx::create);
+            let result = compression_zstd_block::decompress(
+                compressed,
+                decompressed,
+                &mut context,
+                self.prepared_dictionary.as_ref(),
+            );
+            self.zstd.lock().unwrap().push(context);
+            result
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::store::Decompressor;
+
+        #[test]
+        fn prepared_cache_trusts_content_addressed_names() -> io::Result<()> {
+            use crate::directory::RamDirectory;
+            use crate::store::ZstdDictionary;
+            use crate::Directory;
+
+            let directory = RamDirectory::create();
+            let path = ZstdDictionary::seed(
+                &directory,
+                Arc::from(b"prepared dictionary filename trust fixture".as_slice()),
+            )?
+            .path()
+            .to_string();
+            let dictionary = b"dictionary bytes that do not match the filename hash";
+            directory.atomic_write(
+                std::path::Path::new(&path),
+                &compression_zstd_block::compress_whole(dictionary)?,
+            )?;
+            let context = DecompressionContext::load(&directory, Some(&path))?;
+            let data = dictionary.repeat(100);
+            let mut compressed = Vec::new();
+            compression_zstd_block::compress(
+                &data,
+                &mut compressed,
+                &mut compression_zstd_block::new_compressor(
+                    Some(3),
+                    Some(dictionary),
+                    &Default::default(),
+                )?,
+            )?;
+            assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
+            Ok(())
+        }
+
+        #[test]
+        fn later_readers_reuse_prepared_dictionary_after_raw_bytes_are_released() -> io::Result<()>
+        {
+            use crate::directory::RamDirectory;
+            use crate::store::ZstdDictionary;
+            use crate::Directory;
+
+            let directory = RamDirectory::create();
+            let dictionary = b"dictionary unique to prepared-context cache lifetime test";
+            let path = ZstdDictionary::seed(&directory, Arc::from(dictionary.as_slice()))?
+                .path()
+                .to_string();
+            let first = DecompressionContext::load(&directory, Some(&path))?;
+            assert!(dictionary_cache::get(&path).is_none());
+            let data = dictionary.repeat(1000);
+            let mut compressed = Vec::new();
+            compression_zstd_block::compress(
+                &data,
+                &mut compressed,
+                &mut compression_zstd_block::new_compressor(
+                    Some(3),
+                    Some(dictionary),
+                    &Default::default(),
+                )?,
+            )?;
+            assert_eq!(Decompressor::Zstd.decompress(&compressed, &first)?, data);
+            directory.delete(std::path::Path::new(&path)).unwrap();
+            let later = DecompressionContext::load(&directory, Some(&path))?;
+            assert!(Arc::ptr_eq(&first, &later));
+            drop(first);
+            assert_eq!(Decompressor::Zstd.decompress(&compressed, &later)?, data);
+            let weak = Arc::downgrade(&later);
+            drop(later);
+            assert!(weak.upgrade().is_none());
+            let result = DecompressionContext::load(&directory, Some(&path));
+            assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound));
+            Ok(())
+        }
+
+        #[test]
+        fn reused_zstd_context_handles_independent_blocks_and_errors() -> io::Result<()> {
+            let dictionary = b"shared dictionary with repeated words and values";
+            for dictionary in [None, Some(dictionary.as_slice())] {
+                let dictionary_bytes = dictionary.map(Arc::<[u8]>::from);
+                let weak_dictionary = dictionary_bytes.as_ref().map(Arc::downgrade);
+                let context = DecompressionContext::new(dictionary_bytes);
+                if let Some(dictionary) = &weak_dictionary {
+                    assert!(dictionary.upgrade().is_none());
+                }
+                let mut compressed = Vec::new();
+                for data in [
+                    b"shared dictionary with repeated words and values".repeat(1000),
+                    b"different block contents".repeat(17),
+                    Vec::new(),
+                    b"shared dictionary with repeated words and values".repeat(2000),
+                ] {
+                    compression_zstd_block::compress(
+                        &data,
+                        &mut compressed,
+                        &mut compression_zstd_block::new_compressor(
+                            Some(3),
+                            dictionary,
+                            &Default::default(),
+                        )?,
+                    )?;
+                    assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
+                    assert!(Decompressor::Zstd
+                        .decompress(&compressed[..3], &context)
+                        .is_err());
+                    let mut corrupt = compressed.clone();
+                    corrupt[4] ^= 0xff;
+                    assert!(Decompressor::Zstd.decompress(&corrupt, &context).is_err());
+                    if dictionary.is_some() {
+                        corrupt.copy_from_slice(&compressed);
+                        *corrupt.last_mut().unwrap() ^= 1;
+                        assert!(Decompressor::Zstd.decompress(&corrupt, &context).is_err());
+                    }
+                    assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
+                    assert_eq!(context.zstd.lock().unwrap().len(), 1);
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn shared_zstd_context_supports_parallel_blocks() -> io::Result<()> {
+            let dictionary = b"shared dictionary with repeated words and values";
+            let context = DecompressionContext::new(Some(Arc::from(dictionary.as_slice())));
+            let blocks = (0..8)
+                .map(|i| {
+                    let data = format!("shared dictionary with repeated words and values {i}")
+                        .repeat(1000);
+                    let mut compressed = Vec::new();
+                    compression_zstd_block::compress(
+                        data.as_bytes(),
+                        &mut compressed,
+                        &mut compression_zstd_block::new_compressor(
+                            Some(3),
+                            Some(dictionary),
+                            &Default::default(),
+                        )?,
+                    )?;
+                    Ok((data, compressed))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let barrier = std::sync::Barrier::new(blocks.len());
+            std::thread::scope(|scope| {
+                let handles = blocks
+                    .iter()
+                    .map(|(data, compressed)| {
+                        let context = &context;
+                        let barrier = &barrier;
+                        scope.spawn(move || -> io::Result<()> {
+                            barrier.wait();
+                            for _ in 0..100 {
+                                assert_eq!(
+                                    Decompressor::Zstd.decompress(compressed, context)?,
+                                    data.as_bytes()
+                                );
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for handle in handles {
+                    handle.join().unwrap()?;
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "zstd-compression"))]
+mod context {
+    use std::io;
+    use std::sync::Arc;
+
+    pub(crate) struct DecompressionContext;
+
+    impl DecompressionContext {
+        pub(crate) fn load(
+            directory: &dyn crate::Directory,
+            path: Option<&str>,
+        ) -> io::Result<Arc<Self>> {
+            crate::store::resolve_segment_dictionary(directory, path)?;
+            Ok(Arc::new(Self))
+        }
+
+        pub(crate) fn new(_dictionary: Option<Arc<[u8]>>) -> Self {
+            Self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "zstd-compression")]
-    #[test]
-    fn prepared_cache_trusts_content_addressed_names() -> io::Result<()> {
-        use crate::directory::RamDirectory;
-        use crate::store::ZstdDictionary;
-        use crate::Directory;
-
-        let directory = RamDirectory::create();
-        let path = ZstdDictionary::seed(
-            &directory,
-            Arc::from(b"prepared dictionary filename trust fixture".as_slice()),
-        )?
-        .path()
-        .to_string();
-        let dictionary = b"dictionary bytes that do not match the filename hash";
-        directory.atomic_write(
-            std::path::Path::new(&path),
-            &super::super::compression_zstd_block::compress_whole(dictionary)?,
-        )?;
-        let context = DecompressionContext::load(&directory, Some(&path))?;
-        let data = dictionary.repeat(100);
-        let mut compressed = Vec::new();
-        super::super::compression_zstd_block::compress(
-            &data,
-            &mut compressed,
-            &mut super::super::compression_zstd_block::new_compressor(
-                Some(3),
-                Some(dictionary),
-                &Default::default(),
-            )?,
-        )?;
-        assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
-        Ok(())
-    }
-
-    #[cfg(feature = "zstd-compression")]
-    #[test]
-    fn later_readers_reuse_prepared_dictionary_after_raw_bytes_are_released() -> io::Result<()> {
-        use crate::directory::RamDirectory;
-        use crate::store::ZstdDictionary;
-        use crate::Directory;
-
-        let directory = RamDirectory::create();
-        let dictionary = b"dictionary unique to prepared-context cache lifetime test";
-        let path = ZstdDictionary::seed(&directory, Arc::from(dictionary.as_slice()))?
-            .path()
-            .to_string();
-        let first = DecompressionContext::load(&directory, Some(&path))?;
-        assert!(super::super::dictionary_cache::get(&path).is_none());
-        let data = dictionary.repeat(1000);
-        let mut compressed = Vec::new();
-        super::super::compression_zstd_block::compress(
-            &data,
-            &mut compressed,
-            &mut super::super::compression_zstd_block::new_compressor(
-                Some(3),
-                Some(dictionary),
-                &Default::default(),
-            )?,
-        )?;
-        assert_eq!(Decompressor::Zstd.decompress(&compressed, &first)?, data);
-        directory.delete(std::path::Path::new(&path)).unwrap();
-        let later = DecompressionContext::load(&directory, Some(&path))?;
-        assert!(Arc::ptr_eq(&first, &later));
-        drop(first);
-        assert_eq!(Decompressor::Zstd.decompress(&compressed, &later)?, data);
-        let weak = Arc::downgrade(&later);
-        drop(later);
-        assert!(weak.upgrade().is_none());
-        let result = DecompressionContext::load(&directory, Some(&path));
-        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound));
-        Ok(())
-    }
-
-    #[cfg(feature = "zstd-compression")]
-    #[test]
-    fn reused_zstd_context_handles_independent_blocks_and_errors() -> io::Result<()> {
-        let dictionary = b"shared dictionary with repeated words and values";
-        for dictionary in [None, Some(dictionary.as_slice())] {
-            let dictionary_bytes = dictionary.map(Arc::<[u8]>::from);
-            let weak_dictionary = dictionary_bytes.as_ref().map(Arc::downgrade);
-            let context = DecompressionContext::new(dictionary_bytes);
-            if let Some(dictionary) = &weak_dictionary {
-                assert!(dictionary.upgrade().is_none());
-            }
-            let mut compressed = Vec::new();
-            for data in [
-                b"shared dictionary with repeated words and values".repeat(1000),
-                b"different block contents".repeat(17),
-                Vec::new(),
-                b"shared dictionary with repeated words and values".repeat(2000),
-            ] {
-                super::super::compression_zstd_block::compress(
-                    &data,
-                    &mut compressed,
-                    &mut super::super::compression_zstd_block::new_compressor(
-                        Some(3),
-                        dictionary,
-                        &Default::default(),
-                    )?,
-                )?;
-                assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
-                assert!(Decompressor::Zstd
-                    .decompress(&compressed[..3], &context)
-                    .is_err());
-                let mut corrupt = compressed.clone();
-                corrupt[4] ^= 0xff;
-                assert!(Decompressor::Zstd.decompress(&corrupt, &context).is_err());
-                if dictionary.is_some() {
-                    corrupt.copy_from_slice(&compressed);
-                    *corrupt.last_mut().unwrap() ^= 1;
-                    assert!(Decompressor::Zstd.decompress(&corrupt, &context).is_err());
-                }
-                assert_eq!(Decompressor::Zstd.decompress(&compressed, &context)?, data);
-                assert_eq!(context.zstd.lock().unwrap().len(), 1);
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "zstd-compression")]
-    #[test]
-    fn shared_zstd_context_supports_parallel_blocks() -> io::Result<()> {
-        let dictionary = b"shared dictionary with repeated words and values";
-        let context = DecompressionContext::new(Some(Arc::from(dictionary.as_slice())));
-        let blocks = (0..8)
-            .map(|i| {
-                let data =
-                    format!("shared dictionary with repeated words and values {i}").repeat(1000);
-                let mut compressed = Vec::new();
-                super::super::compression_zstd_block::compress(
-                    data.as_bytes(),
-                    &mut compressed,
-                    &mut super::super::compression_zstd_block::new_compressor(
-                        Some(3),
-                        Some(dictionary),
-                        &Default::default(),
-                    )?,
-                )?;
-                Ok((data, compressed))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let barrier = std::sync::Barrier::new(blocks.len());
-        std::thread::scope(|scope| {
-            let handles = blocks
-                .iter()
-                .map(|(data, compressed)| {
-                    let context = &context;
-                    let barrier = &barrier;
-                    scope.spawn(move || -> io::Result<()> {
-                        barrier.wait();
-                        for _ in 0..100 {
-                            assert_eq!(
-                                Decompressor::Zstd.decompress(compressed, context)?,
-                                data.as_bytes()
-                            );
-                        }
-                        Ok(())
-                    })
-                })
-                .collect::<Vec<_>>();
-            for handle in handles {
-                handle.join().unwrap()?;
-            }
-            Ok(())
-        })
-    }
 
     #[test]
     fn compressor_decompressor_id_test() {
