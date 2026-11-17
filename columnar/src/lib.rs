@@ -131,3 +131,6 @@ impl Cardinality {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(fuzzing)]
+pub use columnar::merge_columnar_for_fuzzing;

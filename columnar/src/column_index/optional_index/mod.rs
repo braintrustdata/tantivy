@@ -250,7 +250,104 @@ impl Set<RowId> for OptionalIndex {
     }
 }
 
+pub(crate) struct OptionalIndexCursor<'a> {
+    index: &'a OptionalIndex,
+    block_id: Option<u16>,
+    block: Block<'a>,
+    rank_offset: RowId,
+    rank: u16,
+}
+
+impl<'a> OptionalIndexCursor<'a> {
+    #[inline]
+    fn load_block(&mut self, block_id: u16) -> bool {
+        let Some(previous) = self.block_id else {
+            return false;
+        };
+        if block_id < previous {
+            self.block_id = None;
+            return false;
+        }
+        debug_assert!(
+            (block_id as usize) < self.index.block_metas.len(),
+            "optional cursor requires metadata for every in-range block"
+        );
+        let meta = self.index.block_metas[block_id as usize];
+        self.block = self.index.block(meta);
+        self.block_id = Some(block_id);
+        self.rank_offset = meta.non_null_rows_before_block;
+        self.rank = 0;
+        true
+    }
+
+    #[inline]
+    pub(crate) fn contains(&mut self, row_id: RowId) -> bool {
+        if row_id >= self.index.num_rows {
+            return false;
+        }
+        let addr = row_addr_from_row_id(row_id);
+        if self.block_id != Some(addr.block_id) && !self.load_block(addr.block_id) {
+            return self.index.contains(row_id);
+        }
+        match self.block {
+            Block::Dense(block) => block.contains(addr.in_block_row_id),
+            Block::Sparse(block) => block
+                .rank_if_exists_with_cursor(
+                    addr.in_block_row_id,
+                    &mut self.rank,
+                    &mut self.block_id,
+                )
+                .is_some(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn rank_if_exists(&mut self, row_id: RowId) -> Option<RowId> {
+        if row_id >= self.index.num_rows {
+            return None;
+        }
+        let addr = row_addr_from_row_id(row_id);
+        if self.block_id != Some(addr.block_id) && !self.load_block(addr.block_id) {
+            return self.index.rank_if_exists(row_id);
+        }
+        let rank = match self.block {
+            Block::Dense(block) => block.rank_if_exists(addr.in_block_row_id),
+            Block::Sparse(block) => block.rank_if_exists_with_cursor(
+                addr.in_block_row_id,
+                &mut self.rank,
+                &mut self.block_id,
+            ),
+        }?;
+        Some(self.rank_offset + u32::from(rank))
+    }
+}
+
 impl OptionalIndex {
+    pub(crate) fn cursor_for_sparse_blocks(&self) -> Option<OptionalIndexCursor<'_>> {
+        self.block_metas.iter().any(|meta| matches!(meta.block_variant, BlockVariant::Sparse { num_vals } if num_vals > 0)).then(|| self.cursor())
+    }
+
+    pub(crate) fn cursor(&self) -> OptionalIndexCursor<'_> {
+        debug_assert_eq!(
+            self.block_metas.len(),
+            ((u64::from(self.num_rows) + u64::from(ELEMENTS_PER_BLOCK) - 1)
+                / u64::from(ELEMENTS_PER_BLOCK)) as usize,
+            "optional index metadata must include trailing empty blocks"
+        );
+        let meta = self.block_metas.first().copied();
+        OptionalIndexCursor {
+            index: self,
+            block_id: Some(0),
+            block: meta
+                .map(|meta| self.block(meta))
+                .unwrap_or_else(|| Block::Sparse(SparseBlockCodec::open(b""))),
+            rank_offset: meta
+                .map(|meta| meta.non_null_rows_before_block)
+                .unwrap_or(0),
+            rank: 0,
+        }
+    }
+
     pub fn for_test(num_rows: RowId, row_ids: &[RowId]) -> OptionalIndex {
         assert!(row_ids
             .last()
@@ -529,3 +626,154 @@ pub fn open_optional_index(bytes: OwnedBytes) -> io::Result<OptionalIndex> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cursor_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn block_transitions_and_bounds() {
+        let rows: Vec<u32> = (0..100)
+            .chain(65536..65536 + 6000)
+            .chain(131072..131072 + 5119)
+            .chain(196608..196608 + 5120)
+            .chain(327680..327780)
+            .collect();
+        let index = OptionalIndex::for_test(400000, &rows);
+        assert_eq!(index.block_metas.len(), 7);
+        let mut cursor = index.cursor();
+        let mut independent = index.cursor();
+        let queries = [
+            u32::MAX,
+            400000,
+            399999,
+            327700,
+            262200,
+            50,
+            70000,
+            131100,
+            80000,
+            50,
+            65534,
+            65535,
+            65536,
+            65537,
+            65537,
+            65536,
+            65535,
+            65534,
+        ];
+        for row in queries
+            .into_iter()
+            .chain(rows.iter().copied())
+            .chain(rows.iter().rev().copied())
+        {
+            assert_eq!(cursor.rank_if_exists(row), index.rank_if_exists(row));
+            assert_eq!(cursor.contains(row), index.rank_if_exists(row).is_some());
+            assert_eq!(
+                independent.contains(row),
+                index.rank_if_exists(row).is_some()
+            );
+            assert_eq!(independent.rank_if_exists(row), index.rank_if_exists(row));
+        }
+        let empty = OptionalIndex::for_test(0, &[]);
+        assert_eq!(empty.cursor().rank_if_exists(0), None);
+    }
+
+    #[test]
+    fn trailing_empty_blocks_are_materialized() {
+        for rows in [&[50][..], &[][..]] {
+            let index = OptionalIndex::for_test(100000, rows);
+            assert_eq!(index.block_metas.len(), 2);
+            assert!(matches!(
+                index.block_metas[1].block_variant,
+                BlockVariant::Sparse { num_vals: 0 }
+            ));
+            let mut rank_cursor = index.cursor();
+            let mut contains_cursor = index.cursor();
+            for row in [50, 70000, 99999, 50, 70000] {
+                let expected = rows.binary_search(&row).ok().map(|rank| rank as u32);
+                assert_eq!(rank_cursor.rank_if_exists(row), expected);
+                assert_eq!(contains_cursor.contains(row), expected.is_some());
+            }
+            assert!(rank_cursor.block_id.is_none());
+            assert!(contains_cursor.block_id.is_none());
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "optional index metadata must include trailing empty blocks")]
+    fn cursor_rejects_unpadded_metadata() {
+        let mut index = OptionalIndex::for_test(100000, &[50]);
+        index.block_metas = Arc::from(&index.block_metas[..1]);
+        let _ = index.cursor();
+    }
+
+    #[test]
+    fn backward_seeks_switch_to_stateless() {
+        let rows: Vec<_> = (0..100)
+            .chain(65536..71536)
+            .chain([131073, 131080])
+            .collect();
+        let index = OptionalIndex::for_test(132000, &rows);
+        let mut cursor = index.cursor();
+        assert_eq!(cursor.rank_if_exists(50), Some(50));
+        assert_eq!(cursor.rank_if_exists(65540), Some(104));
+        assert_eq!(cursor.rank_if_exists(131073), Some(6100));
+        assert_eq!(cursor.rank_if_exists(131073), Some(6100));
+        assert_eq!(cursor.rank_if_exists(131080), Some(6101));
+        assert_eq!(cursor.rank_if_exists(131080), Some(6101));
+        assert!(cursor.block_id.is_some());
+        assert_eq!(cursor.rank_if_exists(131073), Some(6100));
+        assert!(cursor.block_id.is_none());
+        assert_eq!(cursor.rank_if_exists(65540), Some(104));
+        assert_eq!(cursor.rank_if_exists(0), Some(0));
+        assert!(!cursor.contains(u32::MAX));
+        assert_eq!(cursor.rank_if_exists(u32::MAX), None);
+        let mut cursor = index.cursor();
+        assert!(cursor.contains(70000));
+        assert!(cursor.block_id.is_some());
+        assert!(cursor.contains(50));
+        assert!(cursor.block_id.is_none());
+    }
+
+    #[test]
+    fn sparse_cursor_selection() {
+        let sparse: Vec<_> = (0..5119).collect();
+        let dense: Vec<_> = (0..5120).collect();
+        assert!(OptionalIndex::for_test(65536, &sparse)
+            .cursor_for_sparse_blocks()
+            .is_some());
+        assert!(OptionalIndex::for_test(65536, &dense)
+            .cursor_for_sparse_blocks()
+            .is_none());
+        let mixed: Vec<_> = dense.into_iter().chain([65536]).collect();
+        assert!(OptionalIndex::for_test(65537, &mixed)
+            .cursor_for_sparse_blocks()
+            .is_some());
+        assert!(OptionalIndex::for_test(65536, &[])
+            .cursor_for_sparse_blocks()
+            .is_none());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn wrapper_matches_stateless(
+            rows in proptest::collection::btree_set(0u32..200000, 0..1000),
+            queries in proptest::collection::vec(0u32..250000, 0..1000),
+        ) {
+            let rows: Vec<_> = rows.into_iter().collect();
+            let index = OptionalIndex::for_test(200000, &rows);
+            let mut cursor = index.cursor();
+            for row in queries.into_iter().chain(rows.iter().copied()).chain(rows.iter().rev().copied()) {
+                let expected = index.rank_if_exists(row);
+                prop_assert_eq!(cursor.contains(row), expected.is_some());
+                prop_assert_eq!(cursor.rank_if_exists(row), expected);
+            }
+        }
+    }
+}

@@ -1,6 +1,6 @@
 use std::iter;
 
-use crate::column_index::{SerializableColumnIndex, Set};
+use crate::column_index::SerializableColumnIndex;
 use crate::iterable::Iterable;
 use crate::{Cardinality, ColumnIndex, RowId, StackMergeOrder};
 
@@ -77,10 +77,19 @@ fn convert_column_opt_to_multivalued_index<'a>(
         ColumnIndex::Empty { .. } => Box::new(iter::repeat(0u32).take(num_rows as usize + 1)),
         ColumnIndex::Full => Box::new(0..num_rows + 1),
         ColumnIndex::Optional(optional_index) => {
+            let mut rows = optional_index.iter_rows();
+            let mut next = rows.next();
+            let mut rank = 0;
             Box::new(
                 (0..num_rows)
-                    // TODO optimize
-                    .map(|row_id| optional_index.rank(row_id))
+                    .map(move |row| {
+                        let start_offset = rank;
+                        if next == Some(row) {
+                            rank += 1;
+                            next = rows.next();
+                        }
+                        start_offset
+                    })
                     .chain(std::iter::once(optional_index.num_non_nulls())),
             )
         }
@@ -144,5 +153,81 @@ mod tests {
         .into_iter();
         let start_offsets: Vec<RowId> = super::stack_multivalued_indexes(columns).collect();
         assert_eq!(start_offsets, &[0, 0, 1, 1, 4, 7, 9, 13]);
+    }
+}
+
+#[cfg(test)]
+mod sparse_offset_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::column_index::{OptionalIndex, Set};
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+        #[test]
+        fn offsets_match_rank(num_docs in 0u32..2048, rows in proptest::collection::btree_set(0u32..2048, 0..256)) {
+            let rows: Vec<_> = rows.into_iter().filter(|&row| row < num_docs).collect();
+            let index = OptionalIndex::for_test(num_docs, &rows);
+            let column = ColumnIndex::Optional(index.clone());
+            let actual: Vec<_> = convert_column_opt_to_multivalued_index(&column, num_docs).collect();
+            let expected: Vec<_> = (0..=num_docs).map(|row| index.rank(row)).collect();
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn empty_and_block_boundaries_keep_sentinel() {
+        for num_docs in [0, 1, 65536, 131080] {
+            let rows: Vec<_> = [0, 65535, 65536, 131079]
+                .into_iter()
+                .filter(|&row| row < num_docs)
+                .collect();
+            let index = OptionalIndex::for_test(num_docs, &rows);
+            let column = ColumnIndex::Optional(index.clone());
+            let actual: Vec<_> =
+                convert_column_opt_to_multivalued_index(&column, num_docs).collect();
+            assert_eq!(actual.len(), num_docs as usize + 1);
+            assert_eq!(
+                actual,
+                (0..=num_docs)
+                    .map(|row| index.rank(row))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn stacked_offsets_skip_empty_iterators_and_preserve_sentinel() {
+        for inputs in [
+            vec![],
+            vec![vec![]],
+            vec![
+                vec![0u32, 2],
+                vec![],
+                vec![],
+                vec![0],
+                vec![0, 0, 3],
+                vec![],
+            ],
+        ] {
+            let expected = if inputs.len() > 1 {
+                vec![0, 2, 2, 5]
+            } else {
+                vec![]
+            };
+            let mut merged = stack_multivalued_indexes(
+                inputs
+                    .iter()
+                    .map(|v| Box::new(v.iter().copied()) as Box<dyn Iterator<Item = u32>>),
+            );
+            assert_eq!(merged.by_ref().collect::<Vec<_>>(), expected);
+            assert_eq!(merged.next(), None);
+        }
     }
 }
