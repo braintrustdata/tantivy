@@ -309,6 +309,7 @@ impl BitSet {
 pub struct ReadOnlyBitSet {
     data: OwnedBytes,
     max_value: u32,
+    len: usize,
 }
 
 pub fn intersect_bitsets(left: &ReadOnlyBitSet, other: &ReadOnlyBitSet) -> ReadOnlyBitSet {
@@ -319,12 +320,15 @@ pub fn intersect_bitsets(left: &ReadOnlyBitSet, other: &ReadOnlyBitSet) -> ReadO
         .zip(other.iter_tinysets())
         .map(|(left_tinyset, right_tinyset)| left_tinyset.intersect(right_tinyset));
     let mut output_dataset: Vec<u8> = Vec::with_capacity(left.data.len());
+    let mut len = 0;
     for tinyset in union_tinyset_it {
+        len += tinyset.len() as usize;
         output_dataset.extend_from_slice(&tinyset.into_bytes());
     }
     ReadOnlyBitSet {
         data: OwnedBytes::new(output_dataset),
         max_value: left.max_value(),
+        len,
     }
 }
 
@@ -333,15 +337,22 @@ impl ReadOnlyBitSet {
         let (max_value_data, data) = data.split(4);
         assert_eq!(data.len() % 8, 0);
         let max_value: u32 = u32::from_le_bytes(max_value_data.as_ref().try_into().unwrap());
-        ReadOnlyBitSet { data, max_value }
+        let mut bitset = ReadOnlyBitSet {
+            data,
+            max_value,
+            len: 0,
+        };
+        bitset.len = bitset
+            .iter_tinysets()
+            .map(|tinyset| tinyset.len() as usize)
+            .sum();
+        bitset
     }
 
     /// Number of elements in the bitset.
     #[inline]
     pub fn len(&self) -> usize {
-        self.iter_tinysets()
-            .map(|tinyset| tinyset.len() as usize)
-            .sum()
+        self.len
     }
 
     /// Iterate the tinyset on the fly from serialized data.
@@ -413,6 +424,25 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::{BitSet, ReadOnlyBitSet, TinySet};
+
+    #[test]
+    fn test_readonly_bitset_cached_len() {
+        for max_value in [0, 1, 63, 64, 65, 127, 128, 129, 65_537] {
+            let mut source = BitSet::with_max_value_and_full(max_value);
+            for value in (0..max_value).step_by(2) {
+                source.remove(value);
+            }
+            let bitset = ReadOnlyBitSet::from(&source);
+            let full = ReadOnlyBitSet::from(&BitSet::with_max_value_and_full(max_value));
+            let empty = ReadOnlyBitSet::from(&BitSet::with_max_value(max_value));
+            assert_eq!(bitset.len(), source.len());
+            for other in [&bitset, &full, &empty] {
+                let intersection = super::intersect_bitsets(&bitset, other);
+                assert_eq!(intersection.len(), intersection.iter().count());
+                assert_eq!(intersection.clone().len(), intersection.len());
+            }
+        }
+    }
 
     #[test]
     fn test_read_serialized_bitset_full_multi() {
