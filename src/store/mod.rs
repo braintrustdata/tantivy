@@ -41,6 +41,7 @@ mod reader;
 mod writer;
 pub(crate) use self::compressors::resolve_segment_dictionary;
 pub use self::compressors::{Compressor, ZstdCompressor, ZstdDictionary};
+pub(crate) use self::decompressors::DecompressionContext;
 pub use self::decompressors::Decompressor;
 #[cfg(all(feature = "zstd-compression", test))]
 pub(crate) use self::dictionary_cache::clear_for_test as clear_dictionary_cache_for_test;

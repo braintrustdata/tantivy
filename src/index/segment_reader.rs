@@ -55,7 +55,7 @@ pub struct SegmentReader {
     /// reasoning as `inv_idx_reader_cache` above). A failed load is not memoized -- `OnceCell`
     /// only fills on success -- so a transient directory error is retried by the next reader
     /// rather than poisoning this segment for the life of the searcher.
-    store_dictionary: Arc<OnceCell<Option<Arc<[u8]>>>>,
+    store_dictionary: Arc<OnceCell<Arc<crate::store::DecompressionContext>>>,
     store_dictionary_path: Option<String>,
     /// Held solely to resolve `store_dictionary` above, long after `open` has returned. This is
     /// the one segment file whose bytes aren't reachable through an already-opened `FileSlice`:
@@ -183,15 +183,15 @@ impl SegmentReader {
     /// missing or corrupted dictionary file.
     pub fn get_store_reader(&self, cache_num_blocks: usize) -> io::Result<StoreReader> {
         let dictionary = self.store_dictionary()?;
-        StoreReader::open(self.store_file.clone(), cache_num_blocks, dictionary)
+        StoreReader::open_with_context(self.store_file.clone(), cache_num_blocks, dictionary)
     }
 
-    /// This segment's doc store dictionary bytes, loading them on first use. See
+    /// This segment's shared decompression context, loading its dictionary on first use. See
     /// `store_dictionary`'s own comment for why this is deferred rather than done in `open`.
-    fn store_dictionary(&self) -> io::Result<Option<Arc<[u8]>>> {
+    fn store_dictionary(&self) -> io::Result<Arc<crate::store::DecompressionContext>> {
         self.store_dictionary
             .get_or_try_init(|| {
-                crate::store::resolve_segment_dictionary(
+                crate::store::DecompressionContext::load(
                     &*self.store_directory,
                     self.store_dictionary_path.as_deref(),
                 )
