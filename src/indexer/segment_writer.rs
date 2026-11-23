@@ -414,6 +414,7 @@ impl SegmentWriter {
             document,
             opstamp,
             artifacts,
+            stored_document,
         } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
@@ -424,7 +425,7 @@ impl SegmentWriter {
             }
         }
         let doc_writer = self.segment_serializer.get_store_writer();
-        doc_writer.store(&document, &self.schema)?;
+        doc_writer.store(stored_document.as_ref().unwrap_or(&document), &self.schema)?;
         self.max_doc += 1;
         Ok(())
     }
