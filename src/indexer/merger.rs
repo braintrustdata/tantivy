@@ -17,7 +17,7 @@ use crate::directory::{Directory, WritePtr};
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
-use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
+use crate::fieldnorm::{FieldNormReader, FieldNormsSerializer, FieldNormsWriter};
 use crate::index::{Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
@@ -28,8 +28,7 @@ use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::{
-    DocAddress, DocId, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
-    SegmentComponent, SegmentOrdinal,
+    DocAddress, DocId, IndexSettings, IndexSortByField, InvertedIndexReader, Order, SegmentOrdinal,
 };
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
@@ -96,7 +95,7 @@ fn estimate_total_num_tokens_in_single_segment(
 
     // When there are deletes, we use an approximation either
     // by using the fieldnorm.
-    if let Some(fieldnorm_reader) = reader.fieldnorms_readers().get_field(field)? {
+    if let Some(fieldnorm_reader) = reader.fieldnorms_readers()?.get_field(field)? {
         let mut count: [usize; 256] = [0; 256];
         for doc in reader.doc_ids_alive() {
             let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
@@ -1042,19 +1041,11 @@ impl IndexMerger {
         );
         let _enter = write_span.enter();
         debug!("write-fieldnorms");
-        if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
+        let fieldnorm_readers = serializer.write_fieldnorms(|writer| {
             tracing::debug_span!("write_fieldnorms")
-                .in_scope(|| self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping))?;
-        }
+                .in_scope(|| self.write_fieldnorms(writer, &doc_id_mapping))
+        })?;
         debug!("write-postings");
-        let fieldnorm_readers = tracing::debug_span!("open_fieldnorm_readers").in_scope(
-            || -> crate::Result<FieldNormReaders> {
-                let fieldnorm_data = serializer
-                    .segment()
-                    .open_read(SegmentComponent::FieldNorms)?;
-                FieldNormReaders::open(fieldnorm_data)
-            },
-        )?;
         let SegmentSerializerParts {
             mut segment,
             store_writer,

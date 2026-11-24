@@ -194,6 +194,9 @@ impl BlockSegmentPostings {
         fieldnorm_reader: &FieldNormReader,
         bm25_weight: &Bm25Weight,
     ) -> Score {
+        if fieldnorm_reader.is_constant() {
+            return bm25_weight.max_score();
+        }
         if let Some(score) = self.block_max_score_cache {
             return score;
         }

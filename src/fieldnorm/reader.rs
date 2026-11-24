@@ -26,6 +26,12 @@ impl FieldNormReaders {
         })
     }
 
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: Arc::new(CompositeFile::empty()),
+        }
+    }
+
     /// Returns the FieldNormReader for a specific field.
     pub fn get_field(&self, field: Field) -> crate::Result<Option<FieldNormReader>> {
         if let Some(file) = self.data.open_read(field) {
@@ -71,6 +77,10 @@ enum ReaderImplEnum {
 }
 
 impl FieldNormReader {
+    pub(crate) fn is_constant(&self) -> bool {
+        matches!(self.0, ReaderImplEnum::Const { .. })
+    }
+
     /// Creates a `FieldNormReader` with a constant fieldnorm.
     ///
     /// The fieldnorm will be subjected to compression as if it was coming

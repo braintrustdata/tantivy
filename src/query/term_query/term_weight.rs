@@ -118,7 +118,7 @@ impl TermWeight {
         let field = self.term.field();
         let inverted_index = reader.inverted_index(field)?;
         let fieldnorm_reader_opt = if self.scoring_enabled {
-            reader.fieldnorms_readers().get_field(field)?
+            reader.fieldnorms_readers()?.get_field(field)?
         } else {
             None
         };

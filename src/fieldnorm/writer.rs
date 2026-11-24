@@ -11,6 +11,7 @@ use crate::DocId;
 ///
 /// `FieldNormsWriter` stores a `Vec<u8>` for each tracked field, using a
 /// byte per document per field.
+#[derive(Default)]
 pub struct FieldNormsWriter {
     fieldnorms_buffers: Vec<Option<Vec<u8>>>,
 }

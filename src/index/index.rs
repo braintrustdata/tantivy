@@ -286,6 +286,7 @@ pub struct Index {
     schema: Schema,
     settings: IndexSettings,
     docstore_zstd_parameters: crate::store::ZstdEncoderParameters,
+    write_fieldnorms: bool,
     executor: Arc<Executor>,
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
@@ -409,6 +410,7 @@ impl Index {
         Index {
             settings: metas.index_settings.clone(),
             docstore_zstd_parameters: Default::default(),
+            write_fieldnorms: true,
             directory,
             schema,
             tokenizers: TokenizerManager::default(),
@@ -431,6 +433,16 @@ impl Index {
     /// Returns this handle's runtime docstore encoder overrides.
     pub fn docstore_zstd_parameters(&self) -> &crate::store::ZstdEncoderParameters {
         &self.docstore_zstd_parameters
+    }
+
+    /// Controls whether future writers from this handle record and write field norms.
+    /// Field norms are enabled by default, and this option is not persisted.
+    pub fn set_write_fieldnorms(&mut self, write_fieldnorms: bool) {
+        self.write_fieldnorms = write_fieldnorms;
+    }
+
+    pub(crate) fn write_fieldnorms(&self) -> bool {
+        self.write_fieldnorms
     }
 
     /// Setter for the tokenizer manager.
@@ -766,8 +778,14 @@ impl Index {
 
         let mut damaged_files = HashSet::new();
         for path in active_existing_files {
-            if !self.directory.validate_checksum(path)? {
-                damaged_files.insert((*path).clone());
+            match self.directory.validate_checksum(path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    damaged_files.insert((*path).clone());
+                }
+                Err(OpenReadError::FileDoesNotExist(_))
+                    if path.extension().is_some_and(|ext| ext == "fieldnorm") => {}
+                Err(err) => return Err(err.into()),
             }
         }
         Ok(damaged_files)

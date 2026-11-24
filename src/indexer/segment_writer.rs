@@ -10,7 +10,7 @@ use super::operation::AddOperation;
 use crate::artifact::{SegmentArtifactProvider, SegmentArtifactWriter};
 use crate::core::json_utils::index_json_values;
 use crate::fastfield::FastFieldsWriter;
-use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
+use crate::fieldnorm::FieldNormsWriter;
 use crate::index::Segment;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::postings::{
@@ -95,6 +95,11 @@ impl SegmentWriter {
         let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let artifact_providers = segment.index().segment_artifact_providers();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
+        let fieldnorms_writer = if segment.index().write_fieldnorms() {
+            FieldNormsWriter::for_schema(&schema)
+        } else {
+            FieldNormsWriter::default()
+        };
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
@@ -123,7 +128,7 @@ impl SegmentWriter {
             max_doc: 0,
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
-            fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
+            fieldnorms_writer,
             json_path_writer: JsonPathWriter::default(),
             segment_serializer,
             fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
@@ -189,6 +194,7 @@ impl SegmentWriter {
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.max_doc;
+        let write_fieldnorms = self.segment_serializer.segment().index().write_fieldnorms();
 
         // TODO: Can this be optimised a bit?
         let vals_grouped_by_field = doc
@@ -211,6 +217,7 @@ impl SegmentWriter {
                 continue;
             }
 
+            let record_fieldnorm = write_fieldnorms && field_entry.has_fieldnorms();
             let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
             let postings_writer: &mut dyn PostingsWriter =
                 self.per_field_postings_writers.get_for_field_mut(field);
@@ -261,7 +268,7 @@ impl SegmentWriter {
                             &mut indexing_position,
                         );
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer
                             .record(doc_id, field, indexing_position.num_tokens);
                     }
@@ -277,7 +284,7 @@ impl SegmentWriter {
                         term_buffer.set_u64(u64_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -294,7 +301,7 @@ impl SegmentWriter {
                             .set_u64(date_val.truncate(DATE_TIME_PRECISION_INDEXED).to_u64());
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -309,7 +316,7 @@ impl SegmentWriter {
                         term_buffer.set_i64(i64_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -324,7 +331,7 @@ impl SegmentWriter {
                         term_buffer.set_f64(f64_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -339,7 +346,7 @@ impl SegmentWriter {
                         term_buffer.set_bool(bool_val);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -354,7 +361,7 @@ impl SegmentWriter {
                         term_buffer.set_bytes(bytes);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -393,7 +400,7 @@ impl SegmentWriter {
                         term_buffer.set_ip_addr(ip_addr);
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
-                    if field_entry.has_fieldnorms() {
+                    if record_fieldnorm {
                         self.fieldnorms_writer.record(doc_id, field, num_vals);
                     }
                 }
@@ -468,13 +475,11 @@ fn remap_and_write(
     max_doc: DocId,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
-    if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
-        fieldnorms_writer.serialize(fieldnorms_serializer, doc_id_map)?;
-    }
-    let fieldnorm_data = serializer
-        .segment()
-        .open_read(SegmentComponent::FieldNorms)?;
-    let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+    let fieldnorm_readers = serializer.write_fieldnorms(|writer| {
+        fieldnorms_writer
+            .serialize(writer, doc_id_map)
+            .map_err(Into::into)
+    })?;
     serialize_postings(
         ctx,
         schema,
