@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ops::BitOrAssign;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::{fmt, io};
 
@@ -7,6 +8,7 @@ use fnv::FnvHashMap;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 
+use crate::directory::error::OpenReadError;
 use crate::directory::{CompositeFile, Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
@@ -43,7 +45,8 @@ pub struct SegmentReader {
     postings_composite: CompositeFile,
     positions_composite: CompositeFile,
     fast_fields_readers: FastFieldReaders,
-    fieldnorm_readers: FieldNormReaders,
+    fieldnorm_readers: Arc<OnceCell<FieldNormReaders>>,
+    fieldnorm_path: PathBuf,
 
     store_file: FileSlice,
     /// Resolved lazily, on the first `get_store_reader` call -- never at open time. Dictionaries
@@ -57,11 +60,7 @@ pub struct SegmentReader {
     /// rather than poisoning this segment for the life of the searcher.
     store_dictionary: Arc<OnceCell<Arc<crate::store::DecompressionContext>>>,
     store_dictionary_path: Option<String>,
-    /// Held solely to resolve `store_dictionary` above, long after `open` has returned. This is
-    /// the one segment file whose bytes aren't reachable through an already-opened `FileSlice`:
-    /// the dictionary is an index-level sibling file, named by a path recorded in this segment's
-    /// own `SegmentMeta`, so opening it lazily means keeping the directory it lives in.
-    store_directory: Arc<dyn Directory>,
+    directory: Arc<dyn Directory>,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
 }
@@ -141,7 +140,7 @@ impl SegmentReader {
     /// They are simply stored as a fast field, serialized in
     /// the `.fieldnorm` file of the segment.
     pub fn get_fieldnorms_reader(&self, field: Field) -> crate::Result<FieldNormReader> {
-        self.fieldnorm_readers.get_field(field)?.ok_or_else(|| {
+        self.fieldnorms_readers()?.get_field(field)?.ok_or_else(|| {
             let field_name = self.schema.get_field_name(field);
             let err_msg = format!(
                 "Field norm not found for field {field_name:?}. Was the field set to record norm \
@@ -158,7 +157,7 @@ impl SegmentReader {
     /// segment. This is useful for merging segments where a field was added after some segments
     /// were already created.
     pub fn get_fieldnorms_reader_or_default(&self, field: Field) -> crate::Result<FieldNormReader> {
-        match self.fieldnorm_readers.get_field(field)? {
+        match self.fieldnorms_readers()?.get_field(field)? {
             Some(reader) => Ok(reader),
             None => {
                 // Return a constant fieldnorm reader with fieldnorm 0 for all documents.
@@ -169,8 +168,14 @@ impl SegmentReader {
     }
 
     #[doc(hidden)]
-    pub fn fieldnorms_readers(&self) -> &FieldNormReaders {
-        &self.fieldnorm_readers
+    pub fn fieldnorms_readers(&self) -> crate::Result<&FieldNormReaders> {
+        self.fieldnorm_readers.get_or_try_init(|| {
+            match self.directory.open_read(&self.fieldnorm_path) {
+                Ok(data) => FieldNormReaders::open(data),
+                Err(OpenReadError::FileDoesNotExist(_)) => Ok(FieldNormReaders::empty()),
+                Err(err) => Err(err.into()),
+            }
+        })
     }
 
     /// Accessor to the segment's [`StoreReader`](crate::store::StoreReader).
@@ -192,7 +197,7 @@ impl SegmentReader {
         self.store_dictionary
             .get_or_try_init(|| {
                 crate::store::DecompressionContext::load(
-                    &*self.store_directory,
+                    &*self.directory,
                     self.store_dictionary_path.as_deref(),
                 )
             })
@@ -231,8 +236,6 @@ impl SegmentReader {
 
         let fast_fields_data = segment.open_read(SegmentComponent::FastFields)?;
         let fast_fields_readers = FastFieldReaders::open(fast_fields_data, schema.clone())?;
-        let fieldnorm_data = segment.open_read(SegmentComponent::FieldNorms)?;
-        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
 
         let original_bitset = if segment.meta().has_deletes() {
             let alive_doc_file_slice = segment.open_read(SegmentComponent::Delete)?;
@@ -261,7 +264,6 @@ impl SegmentReader {
             .meta()
             .docstore_dictionary_path()
             .map(str::to_string);
-        let store_directory: Arc<dyn Directory> = Arc::new(segment.index().directory().clone());
 
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
@@ -270,13 +272,14 @@ impl SegmentReader {
             termdict_composite,
             postings_composite,
             fast_fields_readers,
-            fieldnorm_readers,
+            fieldnorm_readers: Default::default(),
+            fieldnorm_path: segment.relative_path(SegmentComponent::FieldNorms),
             segment_id: segment.id(),
             delete_opstamp: segment.meta().delete_opstamp(),
             store_file,
             store_dictionary: Arc::new(OnceCell::new()),
             store_dictionary_path,
-            store_directory,
+            directory: Arc::new(segment.index().directory().clone()),
             alive_bitset_opt,
             positions_composite,
             schema,
@@ -513,7 +516,9 @@ impl SegmentReader {
             self.postings_composite.space_usage(),
             self.positions_composite.space_usage(),
             self.fast_fields_readers.space_usage(self.schema())?,
-            self.fieldnorm_readers.space_usage(),
+            self.fieldnorms_readers()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+                .space_usage(),
             self.get_store_reader(0)?.space_usage(),
             self.alive_bitset_opt
                 .as_ref()
@@ -631,6 +636,62 @@ mod test {
     use crate::index::Index;
     use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
     use crate::IndexWriter;
+
+    #[test]
+    fn test_fieldnorms_are_lazy_and_optional() -> crate::Result<()> {
+        use crate::collector::Count;
+        use crate::indexer::NoMergePolicy;
+        use crate::query::QueryParser;
+
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        for body in ["quick brown fox", "quick brown dog"] {
+            writer.add_document(doc!(text => body))?;
+            writer.commit()?;
+        }
+
+        let segments = index.searchable_segments()?;
+        assert_eq!(segments.len(), 2);
+        let missing_segment = &segments[0];
+        let fieldnorm_path = missing_segment.relative_path(SegmentComponent::FieldNorms);
+        assert!(index.directory().exists(&fieldnorm_path)?);
+        index.directory().delete(&fieldnorm_path).unwrap();
+        assert!(index.validate_checksum()?.is_empty());
+
+        let searcher = index.reader()?.searcher();
+        let parser = QueryParser::for_index(&index, vec![text]);
+        let phrase = parser.parse_query(r#""quick brown""#)?;
+        let term = parser.parse_query("quick")?;
+        assert_eq!(searcher.search(&*phrase, &Count)?, 2);
+        assert_eq!(searcher.search(&*term, &Count)?, 2);
+        assert!(searcher
+            .segment_readers()
+            .iter()
+            .all(|reader| reader.fieldnorm_readers.get().is_none()));
+
+        let reader = SegmentReader::open(&segments[1])?;
+        assert_eq!(reader.get_fieldnorms_reader(text)?.fieldnorm(0), 3);
+        let reader = SegmentReader::open(missing_segment)?;
+        assert!(reader.fieldnorms_readers()?.get_field(text)?.is_none());
+        assert_eq!(
+            reader.get_fieldnorms_reader_or_default(text)?.fieldnorm(0),
+            0
+        );
+
+        let segment_ids: Vec<_> = segments.iter().map(Segment::id).collect();
+        let merged = writer.merge(&segment_ids).wait()?.unwrap();
+        assert!(index
+            .directory()
+            .exists(&merged.relative_path(SegmentComponent::FieldNorms))?);
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert_eq!(searcher.search(&*phrase, &Count)?, 2);
+        Ok(())
+    }
 
     #[test]
     fn test_merge_field_meta_data_same() {

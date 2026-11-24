@@ -1,7 +1,7 @@
 use common::TerminatingWrite;
 
 use crate::directory::WritePtr;
-use crate::fieldnorm::FieldNormsSerializer;
+use crate::fieldnorm::{FieldNormReaders, FieldNormsSerializer};
 use crate::index::{Segment, SegmentComponent};
 use crate::postings::InvertedIndexSerializer;
 use crate::store::StoreWriter;
@@ -64,15 +64,19 @@ impl SegmentSerializer {
 
         let fast_field_write = segment.open_write(SegmentComponent::FastFields)?;
 
-        let fieldnorms_write = segment.open_write(SegmentComponent::FieldNorms)?;
-        let fieldnorms_serializer = FieldNormsSerializer::from_write(fieldnorms_write)?;
+        let fieldnorms_serializer = if segment.index().write_fieldnorms() {
+            let fieldnorms_write = segment.open_write(SegmentComponent::FieldNorms)?;
+            Some(FieldNormsSerializer::from_write(fieldnorms_write)?)
+        } else {
+            None
+        };
 
         let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
         Ok(SegmentSerializer {
             segment,
             store_writer,
             fast_field_write,
-            fieldnorms_serializer: Some(fieldnorms_serializer),
+            fieldnorms_serializer,
             postings_serializer,
         })
     }
@@ -105,6 +109,17 @@ impl SegmentSerializer {
     /// Note the fieldnorms serializer can only be extracted once.
     pub fn extract_fieldnorms_serializer(&mut self) -> Option<FieldNormsSerializer> {
         self.fieldnorms_serializer.take()
+    }
+
+    pub(crate) fn write_fieldnorms(
+        &mut self,
+        write: impl FnOnce(FieldNormsSerializer) -> crate::Result<()>,
+    ) -> crate::Result<FieldNormReaders> {
+        let Some(serializer) = self.extract_fieldnorms_serializer() else {
+            return Ok(FieldNormReaders::empty());
+        };
+        write(serializer)?;
+        FieldNormReaders::open(self.segment.open_read(SegmentComponent::FieldNorms)?)
     }
 
     /// Accessor to the `StoreWriter`.
